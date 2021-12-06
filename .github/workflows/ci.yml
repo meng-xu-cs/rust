@@ -242,7 +242,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [ calculate_matrix, job ]
     # !cancelled() executes the job regardless of whether the previous jobs passed or failed
-    if: ${{ !cancelled() && contains(fromJSON('["auto", "try"]'), needs.calculate_matrix.outputs.run_type) }}
+    if: ${{ !cancelled() && contains(fromJSON('["auto", "try"]'), needs.calculate_matrix.outputs.run_type) }
     steps:
       - name: checkout the source code
         uses: actions/checkout@v4
