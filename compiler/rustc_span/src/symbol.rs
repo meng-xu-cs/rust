@@ -1768,6 +1768,7 @@ symbols! {
         saturating_sub,
         search_unbox,
         select_unpredictable,
+        sbf_target_feature,
         self_in_typedefs,
         self_struct_ctor,
         semitransparent,

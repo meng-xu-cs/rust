@@ -302,7 +302,7 @@ target | std | host | notes
 [`hexagon-unknown-none-elf`](platform-support/hexagon-unknown-none-elf.md)| * | | Bare Hexagon (v60+, HVX)
 [`hexagon-unknown-linux-musl`](platform-support/hexagon-unknown-linux-musl.md) | ✓ | | Hexagon Linux with musl 1.2.3
 [`i386-apple-ios`](platform-support/apple-ios.md) | ✓ |  | 32-bit x86 iOS [^x86_32-floats-return-ABI]
-[`bpfel-unknown-unknown`] | ✓ |  | BPF
+`bpfel-unknown-unknown` | ✓ |  | BPF
 [`i586-pc-nto-qnx700`](platform-support/nto-qnx.md) | * |  | 32-bit x86 QNX Neutrino 7.0 RTOS  [^x86_32-floats-return-ABI]
 [`i586-unknown-netbsd`](platform-support/netbsd.md) | ✓ |  | 32-bit x86, restricted to Pentium
 [`i686-apple-darwin`](platform-support/apple-darwin.md) | ✓ | ✓ | 32-bit macOS (10.12+, Sierra+) [^x86_32-floats-return-ABI]
@@ -369,6 +369,7 @@ target | std | host | notes
 [`riscv64-linux-android`](platform-support/android.md) |   |   | RISC-V 64-bit Android
 [`riscv64-wrs-vxworks`](platform-support/vxworks.md) | ✓ |  |
 [`s390x-unknown-linux-musl`](platform-support/s390x-unknown-linux-musl.md) |  |  | S390x Linux (kernel 3.2, musl 1.2.3)
+`sbf-solana-solana` | ✓ |  | SBF
 `sparc-unknown-linux-gnu` | ✓ |  | 32-bit SPARC Linux
 [`sparc-unknown-none-elf`](./platform-support/sparc-unknown-none-elf.md) | * |  | Bare 32-bit SPARC V7+
 [`sparc64-unknown-netbsd`](platform-support/netbsd.md) | ✓ | ✓ | NetBSD/sparc64
