@@ -1263,7 +1263,7 @@ impl ThreadId {
                         Err(id) => last = id,
                     }
                 }
-            } else {
+            } else if #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))] {
                 use crate::sync::{Mutex, PoisonError};
 
                 static COUNTER: Mutex<u64> = Mutex::new(0);
@@ -1279,6 +1279,11 @@ impl ThreadId {
                 *counter = id;
                 drop(counter);
                 ThreadId(NonZero::new(id).unwrap())
+            } else {
+                // threads are not supported in sbf, so this isn't actually used
+                // anywhere. This branch of the if is only to avoid creating static
+                // mutable data.
+                ThreadId(NonZero::new(1).unwrap())
             }
         }
     }

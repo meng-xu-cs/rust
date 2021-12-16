@@ -1,7 +1,6 @@
 //! Integer and floating-point number formatting
 
 use crate::mem::MaybeUninit;
-#[cfg(all(not(target_arch = "bpf"), not(target_arch = "sbf")))]
 use crate::num::fmt as numfmt;
 use crate::ops::{Div, Rem, Sub};
 use crate::{fmt, ptr, slice, str};
@@ -345,7 +344,6 @@ macro_rules! impl_Display {
     };
 }
 
-#[cfg(all(not(target_arch = "bpf"), not(target_arch = "sbf")))]
 macro_rules! impl_Exp {
     ($($t:ident),* as $u:ident via $conv_fn:ident named $name:ident) => {
         fn $name(
@@ -538,7 +536,6 @@ mod imp {
         ; as u64 via to_u64 named fmt_u64
     );
 
-    #[cfg(all(not(target_arch = "bpf"), not(target_arch = "sbf")))]
     impl_Exp!(
         i8, u8, i16, u16, i32, u32, i64, u64, usize, isize
             as u64 via to_u64 named exp_u64
@@ -567,7 +564,6 @@ mod imp {
     impl_Exp!(i64, u64 as u64 via to_u64 named exp_u64);
 }
 
-#[cfg(all(not(target_arch = "bpf"), not(target_arch = "sbf")))]
 impl_Exp!(i128, u128 as u128 via to_u128 named exp_u128);
 
 /// Helper function for writing a u64 into `buf` going from last to first, with `curr`.
