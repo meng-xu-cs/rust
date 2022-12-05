@@ -468,7 +468,7 @@ impl Builder {
         Ok(JoinHandle(unsafe { self.spawn_unchecked_(f, None) }?))
     }
 
-    #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
+    #[cfg(not(target_family = "solana"))]
     unsafe fn spawn_unchecked_<'scope, F, T>(
         self,
         f: F,
@@ -606,12 +606,11 @@ impl Builder {
     }
 
     /// SBF version of spawn_unchecked
-    #[unstable(feature = "thread_spawn_unchecked", issue = "55132")]
-    #[cfg(any(target_arch = "bpf", target_arch = "sbf"))]
+    #[cfg(target_family = "solana")]
     unsafe fn spawn_unchecked_<'a, 'scope, F, T>(
         self,
         _f: F,
-        scope_data: Option<&'scope scoped::ScopeData>,
+        scope_data: Option<Arc<scoped::ScopeData>>,
     ) -> io::Result<JoinInner<'scope, T>>
     where
         F: FnOnce() -> T,
@@ -625,15 +624,18 @@ impl Builder {
             CString::new(name).expect("thread name may not contain interior null bytes")
         }));
         let their_thread = my_thread.clone();
-        let my_packet: Arc<Packet<'scope, T>> =
-            Arc::new(Packet { scope: scope_data, result: UnsafeCell::new(None) });
+        let my_packet: Arc<Packet<'scope, T>> = Arc::new(Packet {
+            scope: scope_data,
+            result: UnsafeCell::new(None),
+            _marker: PhantomData,
+        });
         let main = move || {
             if let Some(name) = their_thread.cname() {
                 imp::Thread::set_name(name);
             }
         };
 
-        if let Some(scope_data) = scope_data {
+        if let Some(scope_data) = &my_packet.scope {
             scope_data.increment_num_running_threads();
         }
 
@@ -1272,7 +1274,7 @@ impl ThreadId {
                         Err(id) => last = id,
                     }
                 }
-            } else if #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))] {
+            } else if #[cfg(not(target_os = "solana"))] {
                 use crate::sync::{Mutex, PoisonError};
 
                 static COUNTER: Mutex<u64> = Mutex::new(0);
