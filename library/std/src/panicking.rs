@@ -11,7 +11,6 @@
 
 use core::panic::Location;
 #[cfg(not(target_os = "solana"))]
-use core::panic::PanicPayload;
 // make sure to use the stderr output configured
 // by libtest in the real copy of std
 #[cfg(all(test, not(target_family = "solana")))]
@@ -72,7 +71,7 @@ extern "C" fn __rust_foreign_exception() -> ! {
     rtabort!("Rust cannot catch foreign exceptions");
 }
 
-#[cfg(not(target_os = "solana"))]
+#[cfg(not(target_family = "solana"))]
 enum Hook {
     Default,
     Custom(Box<dyn Fn(&PanicHookInfo<'_>) + 'static + Sync + Send>),
@@ -89,7 +88,7 @@ impl Hook {
     }
 }
 
-#[cfg(not(target_os = "solana"))]
+#[cfg(not(target_family = "solana"))]
 impl Default for Hook {
     #[inline]
     fn default() -> Hook {
@@ -97,7 +96,7 @@ impl Default for Hook {
     }
 }
 
-#[cfg(not(target_os = "solana"))]
+#[cfg(not(target_family = "solana"))]
 static HOOK: RwLock<Hook> = RwLock::new(Hook::Default);
 
 /// Registers a custom panic hook, replacing the previously registered hook.
@@ -437,7 +436,7 @@ pub mod panic_count {
     //
     // This also updates thread-local state to keep track of whether a panic
     // hook is currently executing.
-    #[cfg(not(target_os = "solana"))]
+    #[cfg(not(target_family = "solana"))]
     pub fn increase(run_panic_hook: bool) -> Option<MustAbort> {
         let global_count = GLOBAL_PANIC_COUNT.fetch_add(1, Ordering::Relaxed);
         if global_count & ALWAYS_ABORT_FLAG != 0 {
@@ -505,7 +504,7 @@ pub mod panic_count {
 
     // Slow path is in a separate function to reduce the amount of code
     // inlined from `count_is_zero`.
-    #[cfg(not(target_os = "solana"))]
+    #[cfg(not(target_family = "solana"))]
     #[inline(never)]
     #[cold]
     fn is_zero_slow_path() -> bool {
