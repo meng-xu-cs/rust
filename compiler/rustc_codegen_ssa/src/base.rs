@@ -607,6 +607,27 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
         }
     }
 
+    // Hijack the process for collecting information for path-based fuzzing
+    match std::env::var_os("PAFL") {
+        None => (),
+        Some(val) => {
+            let outdir = std::path::PathBuf::from(val);
+            let prefix = match std::env::var_os("PAFL_TARGET_PREFIX") {
+                None => bug!("environment variable PAFL_TARGET_PREFIX not set"),
+                Some(v) => std::path::PathBuf::from(v),
+            };
+            match tcx.sess.local_crate_source_file() {
+                None => bug!("unable to locate local crate source file"),
+                Some(src) => {
+                    if src.starts_with(&prefix) {
+                        // we are compiling a target crate
+                        crate::pafl::dump(tcx, &outdir);
+                    }
+                }
+            }
+        }
+    };
+
     let metadata_module = need_metadata_module.then(|| {
         // Emit compressed metadata object.
         let metadata_cgu_name =
