@@ -579,6 +579,27 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
     metadata: EncodedMetadata,
     need_metadata_module: bool,
 ) -> OngoingCodegen<B> {
+    // entrypoint for path-based fuzzing
+    match std::env::var_os("PAFL") {
+        None => (),
+        Some(val) => {
+            let outdir = std::path::PathBuf::from(val);
+            let prefix = match std::env::var_os("PAFL_TARGET_PREFIX") {
+                None => panic!("environment variable PAFL_TARGET_PREFIX not set"),
+                Some(v) => std::path::PathBuf::from(v),
+            };
+            match tcx.sess.local_crate_source_file() {
+                None => panic!("unable to locate local crate source file"),
+                Some(src) => {
+                    if src.starts_with(&prefix) {
+                        // we are compiling a target crate
+                        crate::pafl::dump(tcx, &outdir);
+                    }
+                }
+            }
+        }
+    };
+
     // Skip crate items and just output metadata in -Z no-codegen mode.
     if tcx.sess.opts.unstable_opts.no_codegen || !tcx.sess.opts.output_types.should_codegen() {
         let ongoing_codegen = start_async_codegen(backend, tcx, target_cpu, metadata, None);
