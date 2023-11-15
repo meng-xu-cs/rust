@@ -1,52 +1,62 @@
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 
-use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LOCAL_CRATE;
+use rustc_middle::mir::mono::MonoItem;
 use rustc_middle::mir::{Body, MirPhase, RuntimePhase};
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::{InstanceDef, TyCtxt};
 use rustc_span::def_id::DefId;
+use rustc_span::Symbol;
 
 /// A complete dump of both the control-flow graph and the call graph of the compilation context
 pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
     // prepare directory
     fs::create_dir_all(outdir).expect("unable to create output directory");
 
-    // extract the mir for each function
-    let mut summary = CrateSummary { functions: Vec::new() };
-    for idx in tcx.mir_keys(()) {
-        let def_id = idx.to_def_id();
-        match tcx.def_kind(def_id) {
-            // constants do not really have a function body
-            DefKind::Const
-            | DefKind::AssocConst
-            | DefKind::AnonConst
-            | DefKind::InlineConst
-            | DefKind::Static(_) => {
-                continue;
-            }
-            DefKind::Ctor(..)
-            | DefKind::Fn
-            | DefKind::AssocFn
-            | DefKind::Closure
-            | DefKind::Coroutine => (),
-            dk => bug!("{:?} is not a MIR-ready node: {:?}", def_id, dk),
-        };
+    // extract the mir for each codegen unit
+    let mut summary = CrateSummary { natives: Vec::new(), functions: Vec::new() };
 
-        // sanity check
-        let body = tcx.optimized_mir(def_id);
-        let name = tcx.opt_item_name(def_id).map(|s| s.to_string());
-        if !matches!(body.phase, MirPhase::Runtime(RuntimePhase::Optimized)) {
-            bug!(
-                "{:?} - {} MIR is at phase {:?}",
-                def_id,
-                name.as_ref().map_or("<unnamed>", |n| n.as_str()),
-                body.phase,
-            );
+    let (_, units) = tcx.collect_and_partition_mono_items(());
+    for unit in units {
+        let name = unit.name();
+        for item in unit.items().keys() {
+            let instance = match item {
+                MonoItem::Fn(i) => i,
+                MonoItem::Static(_) => continue,
+                MonoItem::GlobalAsm(_) => bug!("unexpected assembly"),
+            };
+
+            // branch processing by instance type
+            match &instance.def {
+                InstanceDef::Item(id) => summary.functions.push(FunctionSummary::process(
+                    tcx,
+                    *id,
+                    name,
+                    tcx.optimized_mir(*id),
+                )),
+                InstanceDef::Intrinsic(id) => summary.natives.push(NativeSummary::process(
+                    tcx,
+                    *id,
+                    name,
+                    NativeKind::Intrinsic,
+                )),
+                InstanceDef::ClosureOnceShim { call_once: id, track_caller: _ } => {
+                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::Once))
+                }
+                InstanceDef::DropGlue(id, _) => {
+                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::Drop))
+                }
+                InstanceDef::CloneShim(id, _) => {
+                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::Clone))
+                }
+                InstanceDef::VTableShim(..)
+                | InstanceDef::ReifyShim(..)
+                | InstanceDef::Virtual(..)
+                | InstanceDef::FnPtrShim(..)
+                | InstanceDef::FnPtrAddrShim(..)
+                | InstanceDef::ThreadLocalShim(..) => (),
+            };
         }
-
-        // handle function definition
-        summary.functions.push(FunctionSummary::process(tcx, body));
     }
 
     // dump output
@@ -63,24 +73,50 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
 /// A struct containing serializable information about the entire crate
 #[derive(Encodable)]
 struct CrateSummary {
+    natives: Vec<NativeSummary>,
     functions: Vec<FunctionSummary>,
 }
 
-/// A struct containing serializable information about one function
+/// A struct containing serializable information about one native function
+#[derive(Encodable)]
+enum NativeKind {
+    Intrinsic,
+    Once,
+    Drop,
+    Clone,
+}
+
+/// A struct containing serializable information about one native function
+#[derive(Encodable)]
+struct NativeSummary {
+    id: DefId,
+    name: String,
+    kind: NativeKind,
+}
+
+impl NativeSummary {
+    /// Process an intrinsic instance
+    fn process<'tcx>(_tcx: TyCtxt<'tcx>, id: DefId, name: Symbol, kind: NativeKind) -> Self {
+        Self { id, name: name.to_string(), kind }
+    }
+}
+
+/// A struct containing serializable information about one user-defined function
 #[derive(Encodable)]
 struct FunctionSummary {
     id: DefId,
-    name: Option<String>,
+    name: String,
 }
 
 impl FunctionSummary {
     /// Process the mir body for one function
-    fn process<'tcx>(tcx: TyCtxt<'_>, body: &Body<'tcx>) -> Self {
-        // get the basics
-        let id = body.source.def_id();
-        let name = tcx.opt_item_name(id).map(|s| s.to_string());
+    fn process<'tcx>(_tcx: TyCtxt<'tcx>, id: DefId, name: Symbol, body: &Body<'tcx>) -> Self {
+        // sanity check
+        if !matches!(body.phase, MirPhase::Runtime(RuntimePhase::Optimized)) {
+            bug!("MIR for {} is at phase {:?}", name, body.phase);
+        }
 
         // done
-        FunctionSummary { id, name }
+        FunctionSummary { id, name: name.to_string() }
     }
 }
