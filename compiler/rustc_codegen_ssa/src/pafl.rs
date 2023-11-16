@@ -7,7 +7,7 @@ use serde::Serialize;
 use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::mir::mono::MonoItem;
-use rustc_middle::mir::{MirPhase, RuntimePhase};
+use rustc_middle::mir::{BasicBlock, BasicBlockData, MirPhase, RuntimePhase};
 use rustc_middle::ty::{InstanceDef, TyCtxt};
 use rustc_span::def_id::DefId;
 
@@ -137,6 +137,7 @@ impl NativeSummary {
 struct FunctionSummary {
     id: Ident,
     path: String,
+    blocks: Vec<BlockSummary>,
 }
 
 impl FunctionSummary {
@@ -162,7 +163,27 @@ impl FunctionSummary {
             );
         }
 
+        // iterate over each basic blocks
+        let mut blocks = vec![];
+        for blk_id in body.basic_blocks.reverse_postorder() {
+            let blk_data = body.basic_blocks.get(*blk_id).unwrap();
+            blocks.push(BlockSummary::process(tcx, *blk_id, blk_data));
+        }
+
         // done
-        FunctionSummary { id: id.into(), path }
+        FunctionSummary { id: id.into(), path, blocks }
+    }
+}
+
+/// A struct containing serializable information about a basic block
+#[derive(Serialize)]
+struct BlockSummary {
+    index: usize,
+}
+
+impl BlockSummary {
+    /// Process the mir for one basic block
+    fn process<'tcx>(_tcx: TyCtxt<'tcx>, id: BasicBlock, _data: &BasicBlockData<'tcx>) -> Self {
+        Self { index: id.as_usize() }
     }
 }
