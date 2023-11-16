@@ -7,10 +7,9 @@ use serde::Serialize;
 use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::mir::mono::MonoItem;
-use rustc_middle::mir::{Body, MirPhase, RuntimePhase};
+use rustc_middle::mir::{MirPhase, RuntimePhase};
 use rustc_middle::ty::{InstanceDef, TyCtxt};
 use rustc_span::def_id::DefId;
-use rustc_span::Symbol;
 
 /// A complete dump of both the control-flow graph and the call graph of the compilation context
 pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
@@ -22,7 +21,9 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
 
     let (_, units) = tcx.collect_and_partition_mono_items(());
     for unit in units {
-        let name = unit.name();
+        let hash = unit.name();
+        trace!("processing code unit {}", hash);
+
         for item in unit.items().keys() {
             let instance = match item {
                 MonoItem::Fn(i) => i,
@@ -33,48 +34,32 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
             // branch processing by instance type
             match &instance.def {
                 InstanceDef::Item(id) => {
-                    summary.functions.push(FunctionSummary::process(
-                        tcx,
-                        *id,
-                        name,
-                        tcx.optimized_mir(*id),
-                    ));
+                    summary.functions.push(FunctionSummary::process(tcx, *id));
                 }
                 InstanceDef::Intrinsic(id) => {
-                    summary.natives.push(NativeSummary::process(
-                        tcx,
-                        *id,
-                        name,
-                        NativeKind::Intrinsic,
-                    ));
+                    summary.natives.push(NativeSummary::process(tcx, *id, NativeKind::Intrinsic));
                 }
                 InstanceDef::ClosureOnceShim { call_once: id, track_caller: _ } => {
-                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::Once));
+                    summary.natives.push(NativeSummary::process(tcx, *id, NativeKind::Once));
                 }
                 InstanceDef::DropGlue(id, _) => {
-                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::Drop));
+                    summary.natives.push(NativeSummary::process(tcx, *id, NativeKind::Drop));
                 }
                 InstanceDef::CloneShim(id, _) => {
-                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::Clone));
+                    summary.natives.push(NativeSummary::process(tcx, *id, NativeKind::Clone));
                 }
                 InstanceDef::Virtual(id, index) => {
                     summary.natives.push(NativeSummary::process(
                         tcx,
                         *id,
-                        name,
                         NativeKind::Virtual(*index),
                     ));
                 }
                 InstanceDef::VTableShim(id) => {
-                    summary.natives.push(NativeSummary::process(
-                        tcx,
-                        *id,
-                        name,
-                        NativeKind::VTable,
-                    ));
+                    summary.natives.push(NativeSummary::process(tcx, *id, NativeKind::VTable));
                 }
                 InstanceDef::FnPtrShim(id, _) => {
-                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::FnPtr));
+                    summary.natives.push(NativeSummary::process(tcx, *id, NativeKind::FnPtr));
                 }
                 InstanceDef::ReifyShim(..)
                 | InstanceDef::FnPtrAddrShim(..)
@@ -135,14 +120,15 @@ enum NativeKind {
 #[derive(Serialize)]
 struct NativeSummary {
     id: Ident,
-    name: String,
+    path: String,
     kind: NativeKind,
 }
 
 impl NativeSummary {
     /// Process an intrinsic instance
-    fn process<'tcx>(_tcx: TyCtxt<'tcx>, id: DefId, name: Symbol, kind: NativeKind) -> Self {
-        Self { id: id.into(), name: name.to_string(), kind }
+    fn process<'tcx>(tcx: TyCtxt<'tcx>, id: DefId, kind: NativeKind) -> Self {
+        let path = tcx.def_path(id).to_string_no_crate_verbose();
+        Self { id: id.into(), path, kind }
     }
 }
 
@@ -150,12 +136,15 @@ impl NativeSummary {
 #[derive(Serialize)]
 struct FunctionSummary {
     id: Ident,
-    name: String,
+    path: String,
 }
 
 impl FunctionSummary {
     /// Process the mir body for one function
-    fn process<'tcx>(tcx: TyCtxt<'tcx>, id: DefId, name: Symbol, body: &Body<'tcx>) -> Self {
+    fn process<'tcx>(tcx: TyCtxt<'tcx>, id: DefId) -> Self {
+        let path = tcx.def_path(id).to_string_no_crate_verbose();
+        let body = tcx.optimized_mir(id);
+
         // sanity check
         let expected_phase = match tcx.def_kind(id) {
             DefKind::Ctor(_, CtorKind::Fn) => MirPhase::Built,
@@ -166,14 +155,14 @@ impl FunctionSummary {
         };
         if body.phase != expected_phase {
             bug!(
-                "MIR for '{}' with description {} is at an unexpected phase '{:?}'",
-                name,
+                "MIR for '{}' with description '{}' is at an unexpected phase '{:?}'",
+                path,
                 tcx.def_descr(id),
                 body.phase
             );
         }
 
         // done
-        FunctionSummary { id: id.into(), name: name.to_string() }
+        FunctionSummary { id: id.into(), path }
     }
 }
