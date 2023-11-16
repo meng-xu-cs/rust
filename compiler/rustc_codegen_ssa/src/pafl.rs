@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 
+use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::mir::mono::MonoItem;
 use rustc_middle::mir::{Body, MirPhase, RuntimePhase};
@@ -28,33 +29,55 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
 
             // branch processing by instance type
             match &instance.def {
-                InstanceDef::Item(id) => summary.functions.push(FunctionSummary::process(
-                    tcx,
-                    *id,
-                    name,
-                    tcx.optimized_mir(*id),
-                )),
-                InstanceDef::Intrinsic(id) => summary.natives.push(NativeSummary::process(
-                    tcx,
-                    *id,
-                    name,
-                    NativeKind::Intrinsic,
-                )),
+                InstanceDef::Item(id) => {
+                    summary.functions.push(FunctionSummary::process(
+                        tcx,
+                        *id,
+                        name,
+                        tcx.optimized_mir(*id),
+                    ));
+                }
+                InstanceDef::Intrinsic(id) => {
+                    summary.natives.push(NativeSummary::process(
+                        tcx,
+                        *id,
+                        name,
+                        NativeKind::Intrinsic,
+                    ));
+                }
                 InstanceDef::ClosureOnceShim { call_once: id, track_caller: _ } => {
-                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::Once))
+                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::Once));
                 }
                 InstanceDef::DropGlue(id, _) => {
-                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::Drop))
+                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::Drop));
                 }
                 InstanceDef::CloneShim(id, _) => {
-                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::Clone))
+                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::Clone));
                 }
-                InstanceDef::VTableShim(..)
-                | InstanceDef::ReifyShim(..)
-                | InstanceDef::Virtual(..)
-                | InstanceDef::FnPtrShim(..)
+                InstanceDef::Virtual(id, index) => {
+                    summary.natives.push(NativeSummary::process(
+                        tcx,
+                        *id,
+                        name,
+                        NativeKind::Virtual(*index),
+                    ));
+                }
+                InstanceDef::VTableShim(id) => {
+                    summary.natives.push(NativeSummary::process(
+                        tcx,
+                        *id,
+                        name,
+                        NativeKind::VTable,
+                    ));
+                }
+                InstanceDef::FnPtrShim(id, _) => {
+                    summary.natives.push(NativeSummary::process(tcx, *id, name, NativeKind::FnPtr));
+                }
+                InstanceDef::ReifyShim(..)
                 | InstanceDef::FnPtrAddrShim(..)
-                | InstanceDef::ThreadLocalShim(..) => (),
+                | InstanceDef::ThreadLocalShim(..) => {
+                    bug!("unusual calls are not supported yet: {}", instance);
+                }
             };
         }
     }
@@ -84,6 +107,9 @@ enum NativeKind {
     Once,
     Drop,
     Clone,
+    Virtual(usize),
+    VTable,
+    FnPtr,
 }
 
 /// A struct containing serializable information about one native function
@@ -110,10 +136,22 @@ struct FunctionSummary {
 
 impl FunctionSummary {
     /// Process the mir body for one function
-    fn process<'tcx>(_tcx: TyCtxt<'tcx>, id: DefId, name: Symbol, body: &Body<'tcx>) -> Self {
+    fn process<'tcx>(tcx: TyCtxt<'tcx>, id: DefId, name: Symbol, body: &Body<'tcx>) -> Self {
         // sanity check
-        if !matches!(body.phase, MirPhase::Runtime(RuntimePhase::Optimized)) {
-            bug!("MIR for {} is at phase {:?}", name, body.phase);
+        let expected_phase = match tcx.def_kind(id) {
+            DefKind::Ctor(_, CtorKind::Fn) => MirPhase::Built,
+            DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::Coroutine => {
+                MirPhase::Runtime(RuntimePhase::Optimized)
+            }
+            kind => bug!("unexpected def_kind: {}", kind.descr(id)),
+        };
+        if body.phase != expected_phase {
+            bug!(
+                "MIR for '{}' with description {} is at an unexpected phase '{:?}'",
+                name,
+                tcx.def_descr(id),
+                body.phase
+            );
         }
 
         // done
