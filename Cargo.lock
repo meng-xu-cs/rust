@@ -3627,6 +3627,7 @@ dependencies = [
  "rustc_symbol_mangling",
  "rustc_target",
  "rustc_type_ir",
+ "serde",
  "serde_json",
  "smallvec",
  "tempfile",

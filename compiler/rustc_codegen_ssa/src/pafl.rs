@@ -1,5 +1,8 @@
 use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
+
+use serde::Serialize;
 
 use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::LOCAL_CRATE;
@@ -83,25 +86,41 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
     }
 
     // dump output
+    let content =
+        serde_json::to_string_pretty(&summary).expect("unexpected failure on JSON encoding");
     let symbol = tcx.crate_name(LOCAL_CRATE);
     let crate_name = symbol.as_str();
     let output = outdir.join(crate_name).with_extension("json");
-    let _file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(output)
         .expect("unable to create output file");
+    file.write_all(content.as_bytes()).expect("unexpected failure on outputting to file");
+}
+
+/// Identifier mimicking `DefId`
+#[derive(Serialize)]
+struct Ident {
+    krate: usize,
+    index: usize,
+}
+
+impl From<DefId> for Ident {
+    fn from(id: DefId) -> Self {
+        Self { krate: id.krate.as_usize(), index: id.index.as_usize() }
+    }
 }
 
 /// A struct containing serializable information about the entire crate
-#[derive(Encodable)]
+#[derive(Serialize)]
 struct CrateSummary {
     natives: Vec<NativeSummary>,
     functions: Vec<FunctionSummary>,
 }
 
-/// A struct containing serializable information about one native function
-#[derive(Encodable)]
+/// Kinds of native constructs
+#[derive(Serialize)]
 enum NativeKind {
     Intrinsic,
     Once,
@@ -113,9 +132,9 @@ enum NativeKind {
 }
 
 /// A struct containing serializable information about one native function
-#[derive(Encodable)]
+#[derive(Serialize)]
 struct NativeSummary {
-    id: DefId,
+    id: Ident,
     name: String,
     kind: NativeKind,
 }
@@ -123,14 +142,14 @@ struct NativeSummary {
 impl NativeSummary {
     /// Process an intrinsic instance
     fn process<'tcx>(_tcx: TyCtxt<'tcx>, id: DefId, name: Symbol, kind: NativeKind) -> Self {
-        Self { id, name: name.to_string(), kind }
+        Self { id: id.into(), name: name.to_string(), kind }
     }
 }
 
 /// A struct containing serializable information about one user-defined function
-#[derive(Encodable)]
+#[derive(Serialize)]
 struct FunctionSummary {
-    id: DefId,
+    id: Ident,
     name: String,
 }
 
@@ -155,6 +174,6 @@ impl FunctionSummary {
         }
 
         // done
-        FunctionSummary { id, name: name.to_string() }
+        FunctionSummary { id: id.into(), name: name.to_string() }
     }
 }
