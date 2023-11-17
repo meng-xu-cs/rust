@@ -43,7 +43,6 @@ if [ ! -f config.toml ]; then
 fi
 
 # build, install, and (optionally) distribute
-./x build
 ./x install
 
 if [ "$X_DIST" -eq "1" ]; then

@@ -8,9 +8,10 @@ use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::mir::mono::MonoItem;
 use rustc_middle::mir::{
-    BasicBlock, BasicBlockData, MirPhase, RuntimePhase, TerminatorKind, UnwindAction,
+    BasicBlock, BasicBlockData, Const, MirPhase, Operand, RuntimePhase, TerminatorKind,
+    UnwindAction,
 };
-use rustc_middle::ty::{InstanceDef, TyCtxt};
+use rustc_middle::ty::{self, InstanceDef, TyCtxt};
 use rustc_span::def_id::DefId;
 
 /// A complete dump of both the control-flow graph and the call graph of the compilation context
@@ -189,6 +190,34 @@ impl From<BasicBlock> for BlkId {
     }
 }
 
+/// Kinds of callee
+#[derive(Serialize)]
+struct Callee {
+    id: Ident,
+}
+
+impl Callee {
+    /// Resolve the call target
+    fn process<'tcx>(_tcx: TyCtxt<'tcx>, callee: &Operand<'tcx>) -> Self {
+        match callee {
+            Operand::Move(_place) | Operand::Copy(_place) => {
+                // TODO (handle indirect calls)
+                Self { id: Ident { index: 0, krate: 0 } }
+            }
+            Operand::Constant(constant) => match &constant.const_ {
+                Const::Ty(ty) => match *ty.ty().kind() {
+                    ty::FnDef(def_id, _ty_args) => Self { id: def_id.into() },
+                    _ => bug!("unable to resolve callee from type constant: {:?}", ty),
+                },
+                Const::Unevaluated(..) | Const::Val(..) => {
+                    // TODO (handle indirect calls)
+                    Self { id: Ident { index: 0, krate: 0 } }
+                }
+            },
+        }
+    }
+}
+
 /// How unwind will work
 #[derive(Serialize)]
 enum UnwindRoute {
@@ -220,7 +249,7 @@ enum TermKind {
     UnwindFinish,
     Assert { target: BlkId, unwind: UnwindRoute },
     Drop { target: BlkId, unwind: UnwindRoute },
-    Call { target: Option<BlkId>, unwind: UnwindRoute },
+    Call { callee: Callee, target: Option<BlkId>, unwind: UnwindRoute },
 }
 
 /// A struct containing serializable information about a basic block
@@ -232,7 +261,7 @@ struct BlockSummary {
 
 impl BlockSummary {
     /// Process the mir for one basic block
-    fn process<'tcx>(_tcx: TyCtxt<'tcx>, id: BasicBlock, data: &BasicBlockData<'tcx>) -> Self {
+    fn process<'tcx>(tcx: TyCtxt<'tcx>, id: BasicBlock, data: &BasicBlockData<'tcx>) -> Self {
         let term = data.terminator();
 
         // match by the terminator
@@ -246,7 +275,7 @@ impl BlockSummary {
             TerminatorKind::Return => TermKind::Return,
             // call (which may unwind)
             TerminatorKind::Call {
-                func: _,
+                func,
                 args: _,
                 destination: _,
                 target,
@@ -254,6 +283,7 @@ impl BlockSummary {
                 call_source: _,
                 fn_span: _,
             } => TermKind::Call {
+                callee: Callee::process(tcx, func),
                 target: target.as_ref().map(|t| (*t).into()),
                 unwind: unwind.into(),
             },
