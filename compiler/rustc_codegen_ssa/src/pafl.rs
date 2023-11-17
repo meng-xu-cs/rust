@@ -7,7 +7,9 @@ use serde::Serialize;
 use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::mir::mono::MonoItem;
-use rustc_middle::mir::{BasicBlock, BasicBlockData, MirPhase, RuntimePhase};
+use rustc_middle::mir::{
+    BasicBlock, BasicBlockData, MirPhase, RuntimePhase, TerminatorKind, UnwindAction,
+};
 use rustc_middle::ty::{InstanceDef, TyCtxt};
 use rustc_span::def_id::DefId;
 
@@ -175,15 +177,109 @@ impl FunctionSummary {
     }
 }
 
+/// Identifier mimicking `DefId`
+#[derive(Serialize)]
+struct BlkId {
+    index: usize,
+}
+
+impl From<BasicBlock> for BlkId {
+    fn from(id: BasicBlock) -> Self {
+        Self { index: id.as_usize() }
+    }
+}
+
+/// How unwind will work
+#[derive(Serialize)]
+enum UnwindRoute {
+    Resume,
+    Terminate,
+    Unreachable,
+    Cleanup(BlkId),
+}
+
+impl From<&UnwindAction> for UnwindRoute {
+    fn from(action: &UnwindAction) -> Self {
+        match action {
+            UnwindAction::Continue => Self::Resume,
+            UnwindAction::Unreachable => Self::Unreachable,
+            UnwindAction::Terminate(..) => Self::Terminate,
+            UnwindAction::Cleanup(blk) => Self::Cleanup((*blk).into()),
+        }
+    }
+}
+
+/// Kinds of terminator instructions
+#[derive(Serialize)]
+enum TermKind {
+    Unreachable,
+    Goto(BlkId),
+    Switch(Vec<BlkId>),
+    Return,
+    UnwindResume,
+    UnwindFinish,
+    Assert { target: BlkId, unwind: UnwindRoute },
+    Drop { target: BlkId, unwind: UnwindRoute },
+    Call { target: Option<BlkId>, unwind: UnwindRoute },
+}
+
 /// A struct containing serializable information about a basic block
 #[derive(Serialize)]
 struct BlockSummary {
-    index: usize,
+    id: BlkId,
+    term: TermKind,
 }
 
 impl BlockSummary {
     /// Process the mir for one basic block
-    fn process<'tcx>(_tcx: TyCtxt<'tcx>, id: BasicBlock, _data: &BasicBlockData<'tcx>) -> Self {
-        Self { index: id.as_usize() }
+    fn process<'tcx>(_tcx: TyCtxt<'tcx>, id: BasicBlock, data: &BasicBlockData<'tcx>) -> Self {
+        let term = data.terminator();
+
+        // match by the terminator
+        let kind = match &term.kind {
+            // basics
+            TerminatorKind::Goto { target } => TermKind::Goto((*target).into()),
+            TerminatorKind::SwitchInt { discr: _, targets } => {
+                TermKind::Switch(targets.all_targets().iter().map(|b| (*b).into()).collect())
+            }
+            TerminatorKind::Unreachable => TermKind::Unreachable,
+            TerminatorKind::Return => TermKind::Return,
+            // call (which may unwind)
+            TerminatorKind::Call {
+                func: _,
+                args: _,
+                destination: _,
+                target,
+                unwind,
+                call_source: _,
+                fn_span: _,
+            } => TermKind::Call {
+                target: target.as_ref().map(|t| (*t).into()),
+                unwind: unwind.into(),
+            },
+            TerminatorKind::Drop { place: _, target, unwind, replace: _ } => {
+                TermKind::Drop { target: (*target).into(), unwind: unwind.into() }
+            }
+            TerminatorKind::Assert { cond: _, expected: _, msg: _, target, unwind } => {
+                TermKind::Assert { target: (*target).into(), unwind: unwind.into() }
+            }
+            // unwinding
+            TerminatorKind::UnwindResume => TermKind::UnwindResume,
+            TerminatorKind::UnwindTerminate(..) => TermKind::UnwindFinish,
+            // imaginary
+            TerminatorKind::FalseEdge { real_target, imaginary_target: _ }
+            | TerminatorKind::FalseUnwind { real_target, unwind: _ } => {
+                TermKind::Goto((*real_target).into())
+            }
+            // coroutine
+            TerminatorKind::Yield { .. } | TerminatorKind::CoroutineDrop => {
+                bug!("unexpected coroutine")
+            }
+            // assembly
+            TerminatorKind::InlineAsm { .. } => bug!("unexpected inline assembly"),
+        };
+
+        // done
+        Self { id: id.into(), term: kind }
     }
 }
