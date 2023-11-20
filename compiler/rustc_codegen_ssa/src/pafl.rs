@@ -16,8 +16,12 @@ use rustc_span::def_id::DefId;
 
 /// A complete dump of both the control-flow graph and the call graph of the compilation context
 pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
-    // prepare directory
+    // prepare directory layout
     fs::create_dir_all(outdir).expect("unable to create output directory");
+    let path_meta = outdir.join("meta");
+    fs::create_dir_all(&path_meta).expect("unable to create meta directory");
+    let path_data = outdir.join("data");
+    fs::create_dir_all(&path_data).expect("unable to create meta directory");
 
     // extract the mir for each codegen unit
     let mut summary = CrateSummary { natives: Vec::new(), functions: Vec::new() };
@@ -32,6 +36,46 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
                 MonoItem::Fn(i) => i,
                 MonoItem::Static(_) => continue,
                 MonoItem::GlobalAsm(_) => bug!("unexpected assembly"),
+            };
+
+            // ignore codegen units not in the current crate
+            let path = tcx.def_path(instance.def_id());
+            if path.krate != LOCAL_CRATE {
+                continue;
+            }
+
+            // create a place holder
+            let _index = loop {
+                let mut count: usize = 0;
+                for entry in fs::read_dir(&path_meta).expect("list meta directory") {
+                    let _ = entry.expect("iterate meta directory entry");
+                    count += 1;
+                }
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path_meta.join(count.to_string()))
+                {
+                    Ok(mut file) => {
+                        let kind = match instance.def {
+                            InstanceDef::Item(_) => "function",
+                            InstanceDef::VTableShim(_) => "shim(vtable)",
+                            InstanceDef::ReifyShim(_) => "shim(reify)",
+                            InstanceDef::ThreadLocalShim(_) => "shim(tls)",
+                            InstanceDef::Intrinsic(_) => "intrinsic",
+                            InstanceDef::Virtual(_, _) => "virtual",
+                            InstanceDef::FnPtrShim(_, _) => "shim(<fn>)",
+                            InstanceDef::ClosureOnceShim { .. } => "shim(once)",
+                            InstanceDef::DropGlue(_, _) => "shim(drop)",
+                            InstanceDef::CloneShim(_, _) => "shim(clone)",
+                            InstanceDef::FnPtrAddrShim(_, _) => "shim(&<fn>)",
+                        };
+                        let content = format!("[{}] {}", kind, path.to_string_no_crate_verbose());
+                        file.write_all(content.as_bytes()).expect("save meta content");
+                        break count;
+                    }
+                    Err(_) => continue,
+                }
             };
 
             // branch processing by instance type
