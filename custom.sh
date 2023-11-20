@@ -19,6 +19,8 @@ while test $# -gt 0; do
     case "$1" in
         -f)
             ./x clean
+            rm -rf build
+            rm -rf dist
             rm config.toml
             ;;
         -d)
@@ -35,7 +37,7 @@ done
 # configure
 if [ ! -f config.toml ]; then
     ./configure \
-        --tools="cargo,miri" \
+        --tools="cargo,miri,src,analysis" \
         --set install.prefix=${PREFIX} \
         --set install.sysconfdir=sysconf \
         --disable-docs \
@@ -47,14 +49,6 @@ fi
 
 if [ "$X_DIST" -eq "1" ]; then
     ./x dist
-
-    # install the rust-src component
-    cd build/dist
-    tar xvf rust-src-nightly.tar.gz
-    ./rust-src-nightly/install.sh \
-        --prefix=../../${PREFIX} \
-        --components=rust-src
-    cd -
 fi
 
 # setup the toolchain
