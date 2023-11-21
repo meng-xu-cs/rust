@@ -9,10 +9,9 @@ use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::mir::mono::MonoItem;
 use rustc_middle::mir::{
-    BasicBlock, BasicBlockData, Body, Const, MirPhase, Operand, RuntimePhase, TerminatorKind,
-    UnwindAction,
+    BasicBlock, BasicBlockData, Body, MirPhase, Operand, RuntimePhase, TerminatorKind, UnwindAction,
 };
-use rustc_middle::ty::{self, InstanceDef, TyCtxt};
+use rustc_middle::ty::{InstanceDef, TyCtxt};
 use rustc_span::def_id::DefId;
 
 /// A complete dump of both the control-flow graph and the call graph of the compilation context
@@ -205,24 +204,9 @@ impl Callee {
         body: &Body<'tcx>,
         prefix: &Path,
     ) -> Self {
-        let resolved = match callee {
-            Operand::Move(_place) | Operand::Copy(_place) => {
-                // TODO (handle indirect calls)
-                None
-            }
-            Operand::Constant(constant) => match &constant.const_ {
-                Const::Ty(ty) => match *ty.ty().kind() {
-                    ty::FnDef(def_id, _ty_args) => Some(Self { id: def_id.into() }),
-                    _ => bug!("unable to resolve callee from type constant: {:?}", ty),
-                },
-                Const::Unevaluated(..) | Const::Val(..) => {
-                    // TODO (handle indirect calls)
-                    None
-                }
-            },
-        };
-        match resolved {
+        match callee.const_fn_def() {
             None => {
+                // TODO (handle indirect calls)
                 // dump the cfg
                 let dot_path = prefix.with_extension(format!("{}.dot", bid.as_usize()));
                 let mut dot_file = OpenOptions::new()
@@ -235,7 +219,7 @@ impl Callee {
                 warn!("unresolved indirect call at block {:?}", block);
                 Self { id: Ident { index: 0, krate: 0 } }
             }
-            Some(done) => done,
+            Some((def_id, _ty_args)) => Self { id: def_id.into() },
         }
     }
 }
