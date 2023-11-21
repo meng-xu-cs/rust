@@ -6,13 +6,12 @@ use rustc_middle::mir::graphviz::write_mir_fn_graphviz;
 use serde::Serialize;
 
 use rustc_hir::def::{CtorKind, DefKind};
-use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::mir::mono::MonoItem;
 use rustc_middle::mir::{
     BasicBlock, BasicBlockData, Body, MirPhase, Operand, RuntimePhase, TerminatorKind, UnwindAction,
 };
-use rustc_middle::ty::{InstanceDef, TyCtxt};
-use rustc_span::def_id::DefId;
+use rustc_middle::ty::{GenericArgKind, GenericArgsRef, InstanceDef, RegionKind, TyCtxt};
+use rustc_span::def_id::{DefId, LOCAL_CRATE};
 
 /// A complete dump of both the control-flow graph and the call graph of the compilation context
 pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
@@ -82,7 +81,12 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
             // branch processing by instance type
             match &instance.def {
                 InstanceDef::Item(id) => {
-                    summary.functions.push(FunctionSummary::process(tcx, *id, &data_prefix));
+                    summary.functions.push(FunctionSummary::process(
+                        tcx,
+                        *id,
+                        instance.args,
+                        &data_prefix,
+                    ));
                 }
                 InstanceDef::Intrinsic(..)
                 | InstanceDef::ClosureOnceShim { .. }
@@ -133,17 +137,72 @@ struct CrateSummary {
     functions: Vec<FunctionSummary>,
 }
 
+#[derive(Serialize)]
+enum LifetimeInfo {
+    Static,
+    EarlyParam { id: Ident, index: u32, name: String },
+    Bound(usize),
+    LateParam,
+    Erased,
+}
+
+/// A struct containing serializable information about a type
+#[derive(Serialize)]
+enum GenericSummary {
+    Lifetime(LifetimeInfo),
+    Type,
+    Const,
+}
+
+impl GenericSummary {
+    /// Process the generic arguments
+    fn process<'tcx>(_tcx: TyCtxt<'tcx>, args: GenericArgsRef<'tcx>) -> Vec<Self> {
+        let mut generics = vec![];
+        for arg in args {
+            let sub = match arg.unpack() {
+                GenericArgKind::Lifetime(region) => {
+                    let converted = match region.kind() {
+                        RegionKind::ReStatic => LifetimeInfo::Static,
+                        RegionKind::ReEarlyParam(p) => LifetimeInfo::EarlyParam {
+                            id: p.def_id.into(),
+                            index: p.index,
+                            name: p.name.to_string(),
+                        },
+                        RegionKind::ReBound(idx, _bound) => LifetimeInfo::Bound(idx.as_usize()),
+                        RegionKind::ReLateParam(_p) => LifetimeInfo::LateParam,
+                        RegionKind::ReErased => LifetimeInfo::Erased,
+                        RegionKind::ReVar(..)
+                        | RegionKind::RePlaceholder(..)
+                        | RegionKind::ReError(..) => bug!("unexpected region kind: {:?}", region),
+                    };
+                    GenericSummary::Lifetime(converted)
+                }
+                GenericArgKind::Type(..) => GenericSummary::Type,
+                GenericArgKind::Const(..) => GenericSummary::Const,
+            };
+            generics.push(sub);
+        }
+        generics
+    }
+}
+
 /// A struct containing serializable information about one user-defined function
 #[derive(Serialize)]
 struct FunctionSummary {
     id: Ident,
     path: String,
+    generics: Vec<GenericSummary>,
     blocks: Vec<BlockSummary>,
 }
 
 impl FunctionSummary {
     /// Process the mir body for one function
-    fn process<'tcx>(tcx: TyCtxt<'tcx>, id: DefId, prefix: &Path) -> Self {
+    fn process<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        id: DefId,
+        generic_args: GenericArgsRef<'tcx>,
+        prefix: &Path,
+    ) -> Self {
         let path = tcx.def_path(id).to_string_no_crate_verbose();
         let body = tcx.optimized_mir(id);
 
@@ -164,6 +223,9 @@ impl FunctionSummary {
             );
         }
 
+        // handle the generics
+        let generics = GenericSummary::process(tcx, generic_args);
+
         // iterate over each basic blocks
         let mut blocks = vec![];
         for blk_id in body.basic_blocks.reverse_postorder() {
@@ -172,7 +234,7 @@ impl FunctionSummary {
         }
 
         // done
-        FunctionSummary { id: id.into(), path, blocks }
+        FunctionSummary { id: id.into(), path, generics, blocks }
     }
 }
 
@@ -192,6 +254,7 @@ impl From<BasicBlock> for BlkId {
 #[derive(Serialize)]
 struct Callee {
     id: Ident,
+    generics: Vec<GenericSummary>,
 }
 
 impl Callee {
@@ -228,7 +291,9 @@ impl Callee {
                 // panic on indirect calls
                 bug!("unable to handle the indirect calls in function: {:?}", body.span);
             }
-            Some((def_id, _ty_args)) => Self { id: def_id.into() },
+            Some((def_id, generic_args)) => {
+                Self { id: def_id.into(), generics: GenericSummary::process(tcx, generic_args) }
+            }
         }
     }
 }
