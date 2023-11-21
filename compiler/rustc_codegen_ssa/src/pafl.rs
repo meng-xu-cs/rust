@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::Path;
 
 use rustc_middle::mir::graphviz::write_mir_fn_graphviz;
+use rustc_type_ir::Mutability;
 use serde::Serialize;
 
 use rustc_hir::def::{CtorKind, DefKind};
@@ -11,9 +12,11 @@ use rustc_middle::mir::{
     BasicBlock, BasicBlockData, Body, MirPhase, Operand, RuntimePhase, TerminatorKind, UnwindAction,
 };
 use rustc_middle::ty::{
-    Const, ConstKind, GenericArgKind, GenericArgsRef, InstanceDef, RegionKind, TyCtxt, ValTree,
+    self, Const, ConstKind, ExistentialPredicate, FloatTy, GenericArgKind, GenericArgsRef,
+    InstanceDef, IntTy, Ty, TyCtxt, UintTy, ValTree,
 };
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
+use rustc_target::spec::abi::Abi;
 
 /// A complete dump of both the control-flow graph and the call graph of the compilation context
 pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
@@ -143,7 +146,7 @@ struct CrateSummary {
 #[derive(Serialize)]
 enum GenericSummary {
     Lifetime,
-    Type,
+    Type(TypeSummary),
     Const(ConstSummary),
 }
 
@@ -153,13 +156,8 @@ impl GenericSummary {
         let mut generics = vec![];
         for arg in args {
             let sub = match arg.unpack() {
-                GenericArgKind::Lifetime(region) => {
-                    if !matches!(region.kind(), RegionKind::ReErased) {
-                        bug!("lifetime not erased yet");
-                    }
-                    GenericSummary::Lifetime
-                }
-                GenericArgKind::Type(..) => GenericSummary::Type,
+                GenericArgKind::Lifetime(_region) => GenericSummary::Lifetime,
+                GenericArgKind::Type(item) => GenericSummary::Type(TypeSummary::process(tcx, item)),
                 GenericArgKind::Const(item) => {
                     GenericSummary::Const(ConstSummary::process(tcx, item))
                 }
@@ -210,6 +208,122 @@ impl ValueTree {
                 }
                 Self::Struct(subs)
             }
+        }
+    }
+}
+
+#[derive(Serialize)]
+enum TypeSummary {
+    Bool,
+    Char,
+    Isize,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    Usize,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    F32,
+    F64,
+    Str,
+    Param { index: u32, name: String },
+    Adt(Ident, Vec<GenericSummary>),
+    Foreign(Ident),
+    FnPtr(Vec<TypeSummary>, Box<TypeSummary>),
+    FnDef(Ident, Vec<GenericSummary>),
+    Closure(Ident, Vec<GenericSummary>),
+    Dynamic(Vec<Ident>),
+    Alias(Ident, Vec<GenericSummary>),
+    ImmRef(Box<TypeSummary>),
+    MutRef(Box<TypeSummary>),
+    Slice(Box<TypeSummary>),
+    Array(Box<TypeSummary>, ConstSummary),
+    Tuple(Vec<TypeSummary>),
+}
+
+impl TypeSummary {
+    /// Process the constant
+    fn process<'tcx>(tcx: TyCtxt<'tcx>, item: Ty<'tcx>) -> Self {
+        match item.kind() {
+            ty::Bool => Self::Bool,
+            ty::Char => Self::Char,
+            ty::Int(IntTy::Isize) => Self::Isize,
+            ty::Int(IntTy::I8) => Self::I8,
+            ty::Int(IntTy::I16) => Self::I16,
+            ty::Int(IntTy::I32) => Self::I32,
+            ty::Int(IntTy::I64) => Self::I64,
+            ty::Int(IntTy::I128) => Self::I128,
+            ty::Uint(UintTy::Usize) => Self::Usize,
+            ty::Uint(UintTy::U8) => Self::U8,
+            ty::Uint(UintTy::U16) => Self::U16,
+            ty::Uint(UintTy::U32) => Self::U32,
+            ty::Uint(UintTy::U64) => Self::U64,
+            ty::Uint(UintTy::U128) => Self::U128,
+            ty::Float(FloatTy::F32) => Self::F32,
+            ty::Float(FloatTy::F64) => Self::F64,
+            ty::Str => Self::Str,
+            ty::Param(p) => Self::Param { index: p.index, name: p.name.to_string() },
+            ty::Adt(def, args) => Self::Adt(def.did().into(), GenericSummary::process(tcx, args)),
+            ty::Foreign(def_id) => Self::Foreign((*def_id).into()),
+            ty::FnPtr(binder) => {
+                if !matches!(binder.abi(), Abi::Rust | Abi::RustCall) {
+                    bug!("fn ptr not following the RustCall ABI: {}", binder.abi());
+                }
+                if binder.c_variadic() {
+                    bug!("variadic not supported yet");
+                }
+
+                let mut inputs = vec![];
+                for item in binder.inputs().iter() {
+                    let ty = *item.skip_binder();
+                    inputs.push(TypeSummary::process(tcx, ty));
+                }
+                let output = TypeSummary::process(tcx, binder.output().skip_binder());
+                Self::FnPtr(inputs, output.into())
+            }
+            ty::FnDef(def_id, args) => {
+                Self::FnDef((*def_id).into(), GenericSummary::process(tcx, args))
+            }
+            ty::Closure(def_id, args) => {
+                Self::Closure((*def_id).into(), GenericSummary::process(tcx, args))
+            }
+            ty::Alias(_, alias) => {
+                Self::Alias(alias.def_id.into(), GenericSummary::process(tcx, alias.args))
+            }
+            ty::Ref(_region, sub, mutability) => {
+                let converted = TypeSummary::process(tcx, *sub);
+                match mutability {
+                    Mutability::Not => Self::ImmRef(converted.into()),
+                    Mutability::Mut => Self::MutRef(converted.into()),
+                }
+            }
+            ty::Slice(sub) => Self::Slice(TypeSummary::process(tcx, *sub).into()),
+            ty::Array(sub, len) => Self::Array(
+                TypeSummary::process(tcx, *sub).into(),
+                ConstSummary::process(tcx, *len),
+            ),
+            ty::Tuple(elems) => {
+                Self::Tuple(elems.iter().map(|e| TypeSummary::process(tcx, e)).collect())
+            }
+            ty::Dynamic(binders, _region, _) => {
+                let mut traits = vec![];
+                for binder in *binders {
+                    let predicate = binder.skip_binder();
+                    let def_id = match predicate {
+                        ExistentialPredicate::Trait(r) => r.def_id,
+                        ExistentialPredicate::Projection(r) => r.def_id,
+                        ExistentialPredicate::AutoTrait(r) => r,
+                    };
+                    traits.push(def_id.into());
+                }
+                Self::Dynamic(traits)
+            }
+            _ => bug!("unrecognized type: {:?}", item),
         }
     }
 }
