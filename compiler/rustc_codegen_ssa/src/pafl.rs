@@ -137,19 +137,10 @@ struct CrateSummary {
     functions: Vec<FunctionSummary>,
 }
 
-#[derive(Serialize)]
-enum LifetimeInfo {
-    Static,
-    EarlyParam { id: Ident, index: u32, name: String },
-    Bound(usize),
-    LateParam,
-    Erased,
-}
-
 /// A struct containing serializable information about a type
 #[derive(Serialize)]
 enum GenericSummary {
-    Lifetime(LifetimeInfo),
+    Lifetime,
     Type,
     Const,
 }
@@ -161,21 +152,10 @@ impl GenericSummary {
         for arg in args {
             let sub = match arg.unpack() {
                 GenericArgKind::Lifetime(region) => {
-                    let converted = match region.kind() {
-                        RegionKind::ReStatic => LifetimeInfo::Static,
-                        RegionKind::ReEarlyParam(p) => LifetimeInfo::EarlyParam {
-                            id: p.def_id.into(),
-                            index: p.index,
-                            name: p.name.to_string(),
-                        },
-                        RegionKind::ReBound(idx, _bound) => LifetimeInfo::Bound(idx.as_usize()),
-                        RegionKind::ReLateParam(_p) => LifetimeInfo::LateParam,
-                        RegionKind::ReErased => LifetimeInfo::Erased,
-                        RegionKind::ReVar(..)
-                        | RegionKind::RePlaceholder(..)
-                        | RegionKind::ReError(..) => bug!("unexpected region kind: {:?}", region),
-                    };
-                    GenericSummary::Lifetime(converted)
+                    if !matches!(region.kind(), RegionKind::ReErased) {
+                        bug!("lifetime not erased yet");
+                    }
+                    GenericSummary::Lifetime
                 }
                 GenericArgKind::Type(..) => GenericSummary::Type,
                 GenericArgKind::Const(..) => GenericSummary::Const,
