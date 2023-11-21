@@ -10,7 +10,9 @@ use rustc_middle::mir::mono::MonoItem;
 use rustc_middle::mir::{
     BasicBlock, BasicBlockData, Body, MirPhase, Operand, RuntimePhase, TerminatorKind, UnwindAction,
 };
-use rustc_middle::ty::{GenericArgKind, GenericArgsRef, InstanceDef, RegionKind, TyCtxt};
+use rustc_middle::ty::{
+    Const, ConstKind, GenericArgKind, GenericArgsRef, InstanceDef, RegionKind, TyCtxt, ValTree,
+};
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
 
 /// A complete dump of both the control-flow graph and the call graph of the compilation context
@@ -142,12 +144,12 @@ struct CrateSummary {
 enum GenericSummary {
     Lifetime,
     Type,
-    Const,
+    Const(ConstSummary),
 }
 
 impl GenericSummary {
     /// Process the generic arguments
-    fn process<'tcx>(_tcx: TyCtxt<'tcx>, args: GenericArgsRef<'tcx>) -> Vec<Self> {
+    fn process<'tcx>(tcx: TyCtxt<'tcx>, args: GenericArgsRef<'tcx>) -> Vec<Self> {
         let mut generics = vec![];
         for arg in args {
             let sub = match arg.unpack() {
@@ -158,11 +160,57 @@ impl GenericSummary {
                     GenericSummary::Lifetime
                 }
                 GenericArgKind::Type(..) => GenericSummary::Type,
-                GenericArgKind::Const(..) => GenericSummary::Const,
+                GenericArgKind::Const(item) => {
+                    GenericSummary::Const(ConstSummary::process(tcx, item))
+                }
             };
             generics.push(sub);
         }
         generics
+    }
+}
+
+/// A struct containing serializable information about a const
+#[derive(Serialize)]
+enum ConstSummary {
+    Param { index: u32, name: String },
+    Value(ValueTree),
+}
+
+impl ConstSummary {
+    /// Process the constant
+    fn process<'tcx>(_tcx: TyCtxt<'tcx>, item: Const<'tcx>) -> Self {
+        match item.kind() {
+            ConstKind::Param(param) => {
+                Self::Param { index: param.index, name: param.name.to_string() }
+            }
+            ConstKind::Value(value) => Self::Value(ValueTree::process(value)),
+            _ => bug!("unrecognized constant: {:?}", item),
+        }
+    }
+}
+
+#[derive(Serialize)]
+enum ValueTree {
+    Scalar { bit: usize, val: u128 },
+    Struct(Vec<ValueTree>),
+}
+
+impl ValueTree {
+    fn process<'tcx>(tree: ValTree<'tcx>) -> Self {
+        match tree {
+            ValTree::Leaf(scalar) => Self::Scalar {
+                bit: scalar.size().bits_usize(),
+                val: scalar.to_bits(scalar.size()).expect("scalar value"),
+            },
+            ValTree::Branch(items) => {
+                let mut subs = vec![];
+                for item in items {
+                    subs.push(ValueTree::process(*item));
+                }
+                Self::Struct(subs)
+            }
+        }
     }
 }
 
