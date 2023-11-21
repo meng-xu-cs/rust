@@ -205,9 +205,6 @@ impl Callee {
     ) -> Self {
         match callee.const_fn_def() {
             None => {
-                // TODO (handle indirect calls)
-                warn!("unable to handle the indirect calls in function: {:?}", body.span);
-
                 // dump the control flow graph if requested
                 match std::env::var_os("PAFL_DEBUG") {
                     None => (),
@@ -227,7 +224,9 @@ impl Callee {
                         }
                     }
                 }
-                Self { id: Ident { index: 0, krate: 0 } }
+
+                // panic on indirect calls
+                bug!("unable to handle the indirect calls in function: {:?}", body.span);
             }
             Some((def_id, _ty_args)) => Self { id: def_id.into() },
         }
