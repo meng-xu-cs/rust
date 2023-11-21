@@ -2,13 +2,14 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
+use rustc_middle::mir::graphviz::write_mir_fn_graphviz;
 use serde::Serialize;
 
 use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::mir::mono::MonoItem;
 use rustc_middle::mir::{
-    BasicBlock, BasicBlockData, Const, MirPhase, Operand, RuntimePhase, TerminatorKind,
+    BasicBlock, BasicBlockData, Body, Const, MirPhase, Operand, RuntimePhase, TerminatorKind,
     UnwindAction,
 };
 use rustc_middle::ty::{self, InstanceDef, TyCtxt};
@@ -45,7 +46,7 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
             }
 
             // create a place holder
-            let _index = loop {
+            let index = loop {
                 let mut count: usize = 0;
                 for entry in fs::read_dir(&path_meta).expect("list meta directory") {
                     let _ = entry.expect("iterate meta directory entry");
@@ -77,11 +78,12 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
                     Err(_) => continue,
                 }
             };
+            let data_prefix = path_data.join(index.to_string());
 
             // branch processing by instance type
             match &instance.def {
                 InstanceDef::Item(id) => {
-                    summary.functions.push(FunctionSummary::process(tcx, *id));
+                    summary.functions.push(FunctionSummary::process(tcx, *id, &data_prefix));
                 }
                 InstanceDef::Intrinsic(..)
                 | InstanceDef::ClosureOnceShim { .. }
@@ -142,7 +144,7 @@ struct FunctionSummary {
 
 impl FunctionSummary {
     /// Process the mir body for one function
-    fn process<'tcx>(tcx: TyCtxt<'tcx>, id: DefId) -> Self {
+    fn process<'tcx>(tcx: TyCtxt<'tcx>, id: DefId, prefix: &Path) -> Self {
         let path = tcx.def_path(id).to_string_no_crate_verbose();
         let body = tcx.optimized_mir(id);
 
@@ -167,7 +169,7 @@ impl FunctionSummary {
         let mut blocks = vec![];
         for blk_id in body.basic_blocks.reverse_postorder() {
             let blk_data = body.basic_blocks.get(*blk_id).unwrap();
-            blocks.push(BlockSummary::process(tcx, *blk_id, blk_data));
+            blocks.push(BlockSummary::process(tcx, *blk_id, blk_data, body, prefix));
         }
 
         // done
@@ -195,22 +197,45 @@ struct Callee {
 
 impl Callee {
     /// Resolve the call target
-    fn process<'tcx>(_tcx: TyCtxt<'tcx>, callee: &Operand<'tcx>) -> Self {
-        match callee {
+    fn process<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        callee: &Operand<'tcx>,
+        bid: BasicBlock,
+        block: &BasicBlockData<'tcx>,
+        body: &Body<'tcx>,
+        prefix: &Path,
+    ) -> Self {
+        let resolved = match callee {
             Operand::Move(_place) | Operand::Copy(_place) => {
                 // TODO (handle indirect calls)
-                Self { id: Ident { index: 0, krate: 0 } }
+                None
             }
             Operand::Constant(constant) => match &constant.const_ {
                 Const::Ty(ty) => match *ty.ty().kind() {
-                    ty::FnDef(def_id, _ty_args) => Self { id: def_id.into() },
+                    ty::FnDef(def_id, _ty_args) => Some(Self { id: def_id.into() }),
                     _ => bug!("unable to resolve callee from type constant: {:?}", ty),
                 },
                 Const::Unevaluated(..) | Const::Val(..) => {
                     // TODO (handle indirect calls)
-                    Self { id: Ident { index: 0, krate: 0 } }
+                    None
                 }
             },
+        };
+        match resolved {
+            None => {
+                // dump the cfg
+                let dot_path = prefix.with_extension(format!("{}.dot", bid.as_usize()));
+                let mut dot_file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&dot_path)
+                    .expect("unable to create dot file");
+                write_mir_fn_graphviz(tcx, body, false, &mut dot_file)
+                    .expect("failed to create dot file");
+                warn!("unresolved indirect call at block {:?}", block);
+                Self { id: Ident { index: 0, krate: 0 } }
+            }
+            Some(done) => done,
         }
     }
 }
@@ -258,7 +283,13 @@ struct BlockSummary {
 
 impl BlockSummary {
     /// Process the mir for one basic block
-    fn process<'tcx>(tcx: TyCtxt<'tcx>, id: BasicBlock, data: &BasicBlockData<'tcx>) -> Self {
+    fn process<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        id: BasicBlock,
+        data: &BasicBlockData<'tcx>,
+        body: &Body<'tcx>,
+        prefix: &Path,
+    ) -> Self {
         let term = data.terminator();
 
         // match by the terminator
@@ -280,7 +311,7 @@ impl BlockSummary {
                 call_source: _,
                 fn_span: _,
             } => TermKind::Call {
-                callee: Callee::process(tcx, func),
+                callee: Callee::process(tcx, func, id, data, body, prefix),
                 target: target.as_ref().map(|t| (*t).into()),
                 unwind: unwind.into(),
             },
