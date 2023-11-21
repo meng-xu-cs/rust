@@ -200,23 +200,33 @@ impl Callee {
         tcx: TyCtxt<'tcx>,
         callee: &Operand<'tcx>,
         bid: BasicBlock,
-        block: &BasicBlockData<'tcx>,
         body: &Body<'tcx>,
         prefix: &Path,
     ) -> Self {
         match callee.const_fn_def() {
             None => {
                 // TODO (handle indirect calls)
-                // dump the cfg
-                let dot_path = prefix.with_extension(format!("{}.dot", bid.as_usize()));
-                let mut dot_file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&dot_path)
-                    .expect("unable to create dot file");
-                write_mir_fn_graphviz(tcx, body, false, &mut dot_file)
-                    .expect("failed to create dot file");
-                warn!("unresolved indirect call at block {:?}", block);
+                warn!("unable to handle the indirect calls in function: {:?}", body.span);
+
+                // dump the control flow graph if requested
+                match std::env::var_os("PAFL_DEBUG") {
+                    None => (),
+                    Some(v) => {
+                        if v.to_str().map_or(false, |s| s == "1") {
+                            // dump the cfg
+                            let dot_path = prefix.with_extension(format!("{}.dot", bid.as_usize()));
+                            let mut dot_file = OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(&dot_path)
+                                .expect("unable to create dot file");
+                            write_mir_fn_graphviz(tcx, body, false, &mut dot_file)
+                                .expect("failed to create dot file");
+                        } else {
+                            bug!("invalid value for environment variable PAFL_CFG");
+                        }
+                    }
+                }
                 Self { id: Ident { index: 0, krate: 0 } }
             }
             Some((def_id, _ty_args)) => Self { id: def_id.into() },
@@ -295,7 +305,7 @@ impl BlockSummary {
                 call_source: _,
                 fn_span: _,
             } => TermKind::Call {
-                callee: Callee::process(tcx, func, id, data, body, prefix),
+                callee: Callee::process(tcx, func, id, body, prefix),
                 target: target.as_ref().map(|t| (*t).into()),
                 unwind: unwind.into(),
             },
