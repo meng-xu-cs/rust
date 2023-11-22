@@ -28,7 +28,7 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
     fs::create_dir_all(&path_data).expect("unable to create meta directory");
 
     // extract the mir for each codegen unit
-    let mut summary = CrateSummary { functions: Vec::new() };
+    let mut summary = PaflCrate { functions: Vec::new() };
 
     let (_, units) = tcx.collect_and_partition_mono_items(());
     for unit in units {
@@ -86,7 +86,7 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
             // branch processing by instance type
             match &instance.def {
                 InstanceDef::Item(id) => {
-                    summary.functions.push(FunctionSummary::process(
+                    summary.functions.push(PaflFunction::process(
                         tcx,
                         *id,
                         instance.args,
@@ -138,29 +138,27 @@ impl From<DefId> for Ident {
 
 /// A struct containing serializable information about the entire crate
 #[derive(Serialize)]
-struct CrateSummary {
-    functions: Vec<FunctionSummary>,
+struct PaflCrate {
+    functions: Vec<PaflFunction>,
 }
 
 /// A struct containing serializable information about a type
 #[derive(Serialize)]
-enum GenericSummary {
+enum PaflGeneric {
     Lifetime,
-    Type(TypeSummary),
-    Const(ConstSummary),
+    Type(PaflType),
+    Const(PaflConst),
 }
 
-impl GenericSummary {
+impl PaflGeneric {
     /// Process the generic arguments
     fn process<'tcx>(tcx: TyCtxt<'tcx>, args: GenericArgsRef<'tcx>) -> Vec<Self> {
         let mut generics = vec![];
         for arg in args {
             let sub = match arg.unpack() {
-                GenericArgKind::Lifetime(_region) => GenericSummary::Lifetime,
-                GenericArgKind::Type(item) => GenericSummary::Type(TypeSummary::process(tcx, item)),
-                GenericArgKind::Const(item) => {
-                    GenericSummary::Const(ConstSummary::process(tcx, item))
-                }
+                GenericArgKind::Lifetime(_region) => PaflGeneric::Lifetime,
+                GenericArgKind::Type(item) => PaflGeneric::Type(PaflType::process(tcx, item)),
+                GenericArgKind::Const(item) => PaflGeneric::Const(PaflConst::process(tcx, item)),
             };
             generics.push(sub);
         }
@@ -170,12 +168,12 @@ impl GenericSummary {
 
 /// A struct containing serializable information about a const
 #[derive(Serialize)]
-enum ConstSummary {
+enum PaflConst {
     Param { index: u32, name: String },
     Value(ValueTree),
 }
 
-impl ConstSummary {
+impl PaflConst {
     /// Process the constant
     fn process<'tcx>(_tcx: TyCtxt<'tcx>, item: Const<'tcx>) -> Self {
         match item.kind() {
@@ -213,7 +211,7 @@ impl ValueTree {
 }
 
 #[derive(Serialize)]
-enum TypeSummary {
+enum PaflType {
     Bool,
     Char,
     Isize,
@@ -232,21 +230,21 @@ enum TypeSummary {
     F64,
     Str,
     Param { index: u32, name: String },
-    Adt(Ident, Vec<GenericSummary>),
+    Adt(Ident, Vec<PaflGeneric>),
     Foreign(Ident),
-    FnPtr(Vec<TypeSummary>, Box<TypeSummary>),
-    FnDef(Ident, Vec<GenericSummary>),
-    Closure(Ident, Vec<GenericSummary>),
+    FnPtr(Vec<PaflType>, Box<PaflType>),
+    FnDef(Ident, Vec<PaflGeneric>),
+    Closure(Ident, Vec<PaflGeneric>),
     Dynamic(Vec<Ident>),
-    Alias(Ident, Vec<GenericSummary>),
-    ImmRef(Box<TypeSummary>),
-    MutRef(Box<TypeSummary>),
-    Slice(Box<TypeSummary>),
-    Array(Box<TypeSummary>, ConstSummary),
-    Tuple(Vec<TypeSummary>),
+    Alias(Ident, Vec<PaflGeneric>),
+    ImmRef(Box<PaflType>),
+    MutRef(Box<PaflType>),
+    Slice(Box<PaflType>),
+    Array(Box<PaflType>, PaflConst),
+    Tuple(Vec<PaflType>),
 }
 
-impl TypeSummary {
+impl PaflType {
     /// Process the constant
     fn process<'tcx>(tcx: TyCtxt<'tcx>, item: Ty<'tcx>) -> Self {
         match item.kind() {
@@ -268,7 +266,7 @@ impl TypeSummary {
             ty::Float(FloatTy::F64) => Self::F64,
             ty::Str => Self::Str,
             ty::Param(p) => Self::Param { index: p.index, name: p.name.to_string() },
-            ty::Adt(def, args) => Self::Adt(def.did().into(), GenericSummary::process(tcx, args)),
+            ty::Adt(def, args) => Self::Adt(def.did().into(), PaflGeneric::process(tcx, args)),
             ty::Foreign(def_id) => Self::Foreign((*def_id).into()),
             ty::FnPtr(binder) => {
                 if !matches!(binder.abi(), Abi::Rust | Abi::RustCall) {
@@ -281,34 +279,33 @@ impl TypeSummary {
                 let mut inputs = vec![];
                 for item in binder.inputs().iter() {
                     let ty = *item.skip_binder();
-                    inputs.push(TypeSummary::process(tcx, ty));
+                    inputs.push(PaflType::process(tcx, ty));
                 }
-                let output = TypeSummary::process(tcx, binder.output().skip_binder());
+                let output = PaflType::process(tcx, binder.output().skip_binder());
                 Self::FnPtr(inputs, output.into())
             }
             ty::FnDef(def_id, args) => {
-                Self::FnDef((*def_id).into(), GenericSummary::process(tcx, args))
+                Self::FnDef((*def_id).into(), PaflGeneric::process(tcx, args))
             }
             ty::Closure(def_id, args) => {
-                Self::Closure((*def_id).into(), GenericSummary::process(tcx, args))
+                Self::Closure((*def_id).into(), PaflGeneric::process(tcx, args))
             }
             ty::Alias(_, alias) => {
-                Self::Alias(alias.def_id.into(), GenericSummary::process(tcx, alias.args))
+                Self::Alias(alias.def_id.into(), PaflGeneric::process(tcx, alias.args))
             }
             ty::Ref(_region, sub, mutability) => {
-                let converted = TypeSummary::process(tcx, *sub);
+                let converted = PaflType::process(tcx, *sub);
                 match mutability {
                     Mutability::Not => Self::ImmRef(converted.into()),
                     Mutability::Mut => Self::MutRef(converted.into()),
                 }
             }
-            ty::Slice(sub) => Self::Slice(TypeSummary::process(tcx, *sub).into()),
-            ty::Array(sub, len) => Self::Array(
-                TypeSummary::process(tcx, *sub).into(),
-                ConstSummary::process(tcx, *len),
-            ),
+            ty::Slice(sub) => Self::Slice(PaflType::process(tcx, *sub).into()),
+            ty::Array(sub, len) => {
+                Self::Array(PaflType::process(tcx, *sub).into(), PaflConst::process(tcx, *len))
+            }
             ty::Tuple(elems) => {
-                Self::Tuple(elems.iter().map(|e| TypeSummary::process(tcx, e)).collect())
+                Self::Tuple(elems.iter().map(|e| PaflType::process(tcx, e)).collect())
             }
             ty::Dynamic(binders, _region, _) => {
                 let mut traits = vec![];
@@ -330,14 +327,14 @@ impl TypeSummary {
 
 /// A struct containing serializable information about one user-defined function
 #[derive(Serialize)]
-struct FunctionSummary {
+struct PaflFunction {
     id: Ident,
     path: String,
-    generics: Vec<GenericSummary>,
-    blocks: Vec<BlockSummary>,
+    generics: Vec<PaflGeneric>,
+    blocks: Vec<PaflBlock>,
 }
 
-impl FunctionSummary {
+impl PaflFunction {
     /// Process the mir body for one function
     fn process<'tcx>(
         tcx: TyCtxt<'tcx>,
@@ -366,17 +363,17 @@ impl FunctionSummary {
         }
 
         // handle the generics
-        let generics = GenericSummary::process(tcx, generic_args);
+        let generics = PaflGeneric::process(tcx, generic_args);
 
         // iterate over each basic blocks
         let mut blocks = vec![];
         for blk_id in body.basic_blocks.reverse_postorder() {
             let blk_data = body.basic_blocks.get(*blk_id).unwrap();
-            blocks.push(BlockSummary::process(tcx, *blk_id, blk_data, body, prefix));
+            blocks.push(PaflBlock::process(tcx, *blk_id, blk_data, body, prefix));
         }
 
         // done
-        FunctionSummary { id: id.into(), path, generics, blocks }
+        PaflFunction { id: id.into(), path, generics, blocks }
     }
 }
 
@@ -396,7 +393,7 @@ impl From<BasicBlock> for BlkId {
 #[derive(Serialize)]
 struct Callee {
     id: Ident,
-    generics: Vec<GenericSummary>,
+    generics: Vec<PaflGeneric>,
 }
 
 impl Callee {
@@ -434,7 +431,7 @@ impl Callee {
                 bug!("unable to handle the indirect calls in function: {:?}", body.span);
             }
             Some((def_id, generic_args)) => {
-                Self { id: def_id.into(), generics: GenericSummary::process(tcx, generic_args) }
+                Self { id: def_id.into(), generics: PaflGeneric::process(tcx, generic_args) }
             }
         }
     }
@@ -476,12 +473,12 @@ enum TermKind {
 
 /// A struct containing serializable information about a basic block
 #[derive(Serialize)]
-struct BlockSummary {
+struct PaflBlock {
     id: BlkId,
     term: TermKind,
 }
 
-impl BlockSummary {
+impl PaflBlock {
     /// Process the mir for one basic block
     fn process<'tcx>(
         tcx: TyCtxt<'tcx>,
