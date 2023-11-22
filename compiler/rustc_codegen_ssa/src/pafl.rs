@@ -393,6 +393,8 @@ impl From<BasicBlock> for BlkId {
 #[derive(Serialize)]
 struct Callee {
     id: Ident,
+    krate: Option<String>,
+    path: String,
     generics: Vec<PaflGeneric>,
 }
 
@@ -431,7 +433,18 @@ impl Callee {
                 bug!("unable to handle the indirect calls in function: {:?}", body.span);
             }
             Some((def_id, generic_args)) => {
-                Self { id: def_id.into(), generics: PaflGeneric::process(tcx, generic_args) }
+                let krate = if def_id.is_local() {
+                    None
+                } else {
+                    Some(tcx.crate_name(def_id.krate).to_string())
+                };
+                let path = tcx.def_path(def_id).to_string_no_crate_verbose();
+                Self {
+                    id: def_id.into(),
+                    krate,
+                    path,
+                    generics: PaflGeneric::process(tcx, generic_args),
+                }
             }
         }
     }
