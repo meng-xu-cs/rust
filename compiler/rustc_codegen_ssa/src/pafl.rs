@@ -2,14 +2,15 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
-use rustc_middle::mir::graphviz::write_mir_fn_graphviz;
+use rustc_middle::mir::graphviz::write_mir_graphviz;
+use rustc_span::Span;
 use rustc_type_ir::Mutability;
 use serde::Serialize;
 
 use rustc_hir::def::{CtorKind, DefKind};
 use rustc_middle::mir::mono::MonoItem;
 use rustc_middle::mir::{
-    BasicBlock, BasicBlockData, Body, MirPhase, Operand, RuntimePhase, TerminatorKind, UnwindAction,
+    BasicBlock, BasicBlockData, MirPhase, Operand, RuntimePhase, TerminatorKind, UnwindAction,
 };
 use rustc_middle::ty::{
     self, Const, ConstKind, ExistentialPredicate, FloatTy, GenericArgKind, GenericArgsRef,
@@ -365,11 +366,29 @@ impl PaflFunction {
         // handle the generics
         let generics = PaflGeneric::process(tcx, generic_args);
 
+        // dump the control flow graph if requested
+        match std::env::var_os("PAFL_CFG") {
+            None => (),
+            Some(v) => {
+                if v.to_str().map_or(false, |s| s == path.as_str()) {
+                    // dump the cfg
+                    let dot_path = prefix.with_extension("dot");
+                    let mut dot_file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&dot_path)
+                        .expect("unable to create dot file");
+                    write_mir_graphviz(tcx, Some(id), &mut dot_file)
+                        .expect("failed to create dot file");
+                }
+            }
+        }
+
         // iterate over each basic blocks
         let mut blocks = vec![];
         for blk_id in body.basic_blocks.reverse_postorder() {
             let blk_data = body.basic_blocks.get(*blk_id).unwrap();
-            blocks.push(PaflBlock::process(tcx, *blk_id, blk_data, body, prefix));
+            blocks.push(PaflBlock::process(tcx, *blk_id, blk_data));
         }
 
         // done
@@ -400,38 +419,9 @@ struct Callee {
 
 impl Callee {
     /// Resolve the call target
-    fn process<'tcx>(
-        tcx: TyCtxt<'tcx>,
-        callee: &Operand<'tcx>,
-        bid: BasicBlock,
-        body: &Body<'tcx>,
-        prefix: &Path,
-    ) -> Self {
+    fn process<'tcx>(tcx: TyCtxt<'tcx>, callee: &Operand<'tcx>, span: Span) -> Self {
         match callee.const_fn_def() {
-            None => {
-                // dump the control flow graph if requested
-                match std::env::var_os("PAFL_DEBUG") {
-                    None => (),
-                    Some(v) => {
-                        if v.to_str().map_or(false, |s| s == "1") {
-                            // dump the cfg
-                            let dot_path = prefix.with_extension(format!("{}.dot", bid.as_usize()));
-                            let mut dot_file = OpenOptions::new()
-                                .write(true)
-                                .create_new(true)
-                                .open(&dot_path)
-                                .expect("unable to create dot file");
-                            write_mir_fn_graphviz(tcx, body, false, &mut dot_file)
-                                .expect("failed to create dot file");
-                        } else {
-                            bug!("invalid value for environment variable PAFL_CFG");
-                        }
-                    }
-                }
-
-                // panic on indirect calls
-                bug!("unable to handle the indirect calls in function: {:?}", body.span);
-            }
+            None => bug!("unable to handle the indirect call: {:?}", span),
             Some((def_id, generic_args)) => {
                 let krate = if def_id.is_local() {
                     None
@@ -493,13 +483,7 @@ struct PaflBlock {
 
 impl PaflBlock {
     /// Process the mir for one basic block
-    fn process<'tcx>(
-        tcx: TyCtxt<'tcx>,
-        id: BasicBlock,
-        data: &BasicBlockData<'tcx>,
-        body: &Body<'tcx>,
-        prefix: &Path,
-    ) -> Self {
+    fn process<'tcx>(tcx: TyCtxt<'tcx>, id: BasicBlock, data: &BasicBlockData<'tcx>) -> Self {
         let term = data.terminator();
 
         // match by the terminator
@@ -521,7 +505,7 @@ impl PaflBlock {
                 call_source: _,
                 fn_span: _,
             } => TermKind::Call {
-                callee: Callee::process(tcx, func, id, body, prefix),
+                callee: Callee::process(tcx, func, term.source_info.span),
                 target: target.as_ref().map(|t| (*t).into()),
                 unwind: unwind.into(),
             },
