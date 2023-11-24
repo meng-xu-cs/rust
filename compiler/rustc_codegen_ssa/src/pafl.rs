@@ -28,6 +28,11 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
     let path_data = outdir.join("data");
     fs::create_dir_all(&path_data).expect("unable to create meta directory");
 
+    // verbosity
+    let verbose = std::env::var_os("PAFL_VERBOSE")
+        .and_then(|v| v.into_string().ok())
+        .map_or(false, |v| v.as_str() == "1");
+
     // extract the mir for each codegen unit
     let mut summary = PaflCrate { functions: Vec::new() };
 
@@ -47,6 +52,31 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
             let path = tcx.def_path(instance.def_id());
             if path.krate != LOCAL_CRATE {
                 continue;
+            }
+
+            // verbose mode
+            if verbose {
+                println!("Processing {}", path.to_string_no_crate_verbose());
+            }
+
+            // normalize and check consistency
+            let param_env = tcx.param_env_reveal_all_normalized(instance.def_id());
+            let normalized_ty = instance.ty(tcx, param_env);
+            match normalized_ty.kind() {
+                ty::FnDef(ty_def_id, ty_def_args) | ty::Closure(ty_def_id, ty_def_args) => {
+                    if *ty_def_id != instance.def_id() {
+                        bug!("normalized type def_id mismatch");
+                    }
+                    if ty_def_args.len() != instance.args.len() {
+                        bug!("normalized type generics mismatch");
+                    }
+                    for (t1, t2) in ty_def_args.iter().zip(instance.args.iter()) {
+                        if t1 != t2 {
+                            bug!("normalized type generics mismatch");
+                        }
+                    }
+                }
+                _ => bug!("normalized type is neither function nor closure"),
             }
 
             // create a place holder
@@ -75,7 +105,7 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
                             InstanceDef::CloneShim(_, _) => "shim(clone)",
                             InstanceDef::FnPtrAddrShim(_, _) => "shim(&<fn>)",
                         };
-                        let content = format!("[{}] {}", kind, path.to_string_no_crate_verbose());
+                        let content = format!("[{}] {}", kind, path.to_string_no_crate_verbose(),);
                         file.write_all(content.as_bytes()).expect("save meta content");
                         break count;
                     }
