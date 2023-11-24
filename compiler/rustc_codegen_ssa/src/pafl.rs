@@ -231,13 +231,13 @@ enum PaflType {
     F64,
     Str,
     Param { index: u32, name: String },
-    Adt(Ident, Vec<PaflGeneric>),
+    Adt { id: Ident, generics: Vec<PaflGeneric> },
+    Alias { id: Ident, generics: Vec<PaflGeneric> },
     Foreign(Ident),
     FnPtr(Vec<PaflType>, Box<PaflType>),
-    FnDef(Ident, Vec<PaflGeneric>),
-    Closure(Ident, Vec<PaflGeneric>),
+    FnDef { id: Ident, krate: Option<String>, path: String, generics: Vec<PaflGeneric> },
+    Closure { id: Ident, krate: Option<String>, path: String, generics: Vec<PaflGeneric> },
     Dynamic(Vec<Ident>),
-    Alias(Ident, Vec<PaflGeneric>),
     ImmRef(Box<PaflType>),
     MutRef(Box<PaflType>),
     Slice(Box<PaflType>),
@@ -267,7 +267,13 @@ impl PaflType {
             ty::Float(FloatTy::F64) => Self::F64,
             ty::Str => Self::Str,
             ty::Param(p) => Self::Param { index: p.index, name: p.name.to_string() },
-            ty::Adt(def, args) => Self::Adt(def.did().into(), PaflGeneric::process(tcx, args)),
+            ty::Adt(def, args) => {
+                Self::Adt { id: def.did().into(), generics: PaflGeneric::process(tcx, args) }
+            }
+            ty::Alias(_, alias) => Self::Alias {
+                id: alias.def_id.into(),
+                generics: PaflGeneric::process(tcx, alias.args),
+            },
             ty::Foreign(def_id) => Self::Foreign((*def_id).into()),
             ty::FnPtr(binder) => {
                 if !matches!(binder.abi(), Abi::Rust | Abi::RustCall) {
@@ -286,13 +292,30 @@ impl PaflType {
                 Self::FnPtr(inputs, output.into())
             }
             ty::FnDef(def_id, args) => {
-                Self::FnDef((*def_id).into(), PaflGeneric::process(tcx, args))
+                let krate = if def_id.is_local() {
+                    None
+                } else {
+                    Some(tcx.crate_name(def_id.krate).to_string())
+                };
+                Self::FnDef {
+                    id: (*def_id).into(),
+                    krate,
+                    path: tcx.def_path(*def_id).to_string_no_crate_verbose(),
+                    generics: PaflGeneric::process(tcx, args),
+                }
             }
             ty::Closure(def_id, args) => {
-                Self::Closure((*def_id).into(), PaflGeneric::process(tcx, args))
-            }
-            ty::Alias(_, alias) => {
-                Self::Alias(alias.def_id.into(), PaflGeneric::process(tcx, alias.args))
+                let krate = if def_id.is_local() {
+                    None
+                } else {
+                    Some(tcx.crate_name(def_id.krate).to_string())
+                };
+                Self::Closure {
+                    id: (*def_id).into(),
+                    krate,
+                    path: tcx.def_path(*def_id).to_string_no_crate_verbose(),
+                    generics: PaflGeneric::process(tcx, args),
+                }
             }
             ty::Ref(_region, sub, mutability) => {
                 let converted = PaflType::process(tcx, *sub);
