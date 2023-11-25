@@ -32,19 +32,21 @@ impl From<DefId> for Ident {
     }
 }
 
+/// Constant value or aggregates
 #[derive(Serialize)]
 enum ValueTree {
     Scalar { bit: usize, val: u128 },
     Struct(Vec<ValueTree>),
 }
 
-/// A struct containing serializable information about a const
+/// Serializable information about a Rust const
 #[derive(Serialize)]
 enum PaflConst {
     Param { index: u32, name: String },
     Value(ValueTree),
 }
 
+/// Serializable information about a Rust type
 #[derive(Serialize)]
 enum PaflType {
     Bool,
@@ -79,7 +81,7 @@ enum PaflType {
     Tuple(Vec<PaflType>),
 }
 
-/// A struct containing serializable information about a type
+/// Serializable information about a Rust generic argument
 #[derive(Serialize)]
 enum PaflGeneric {
     Lifetime,
@@ -87,7 +89,7 @@ enum PaflGeneric {
     Const(PaflConst),
 }
 
-/// Kinds of callee
+/// Callee of a call instruction
 #[derive(Serialize)]
 enum Callee {
     Local(PaflFunction),
@@ -122,7 +124,7 @@ enum Callee {
     },
 }
 
-/// Identifier mimicking `DefId`
+/// Identifier mimicking `BasicBlock`
 #[derive(Serialize)]
 struct BlkId {
     index: usize,
@@ -134,7 +136,7 @@ impl From<BasicBlock> for BlkId {
     }
 }
 
-/// How unwind will work
+/// How unwind might work
 #[derive(Serialize)]
 enum UnwindRoute {
     Resume,
@@ -154,7 +156,7 @@ impl From<&UnwindAction> for UnwindRoute {
     }
 }
 
-/// Kinds of terminator instructions
+/// Kinds of terminator instructions of a basic block
 #[derive(Serialize)]
 enum TermKind {
     Unreachable,
@@ -168,14 +170,14 @@ enum TermKind {
     Call { callee: Callee, target: Option<BlkId>, unwind: UnwindRoute },
 }
 
-/// A struct containing serializable information about a basic block
+/// Serializable information about a basic block
 #[derive(Serialize)]
 struct PaflBlock {
     id: BlkId,
     term: TermKind,
 }
 
-/// A struct containing serializable information about one user-defined function
+/// Serializable information about a user-defined function
 #[derive(Serialize)]
 struct PaflFunction {
     id: Ident,
@@ -184,7 +186,7 @@ struct PaflFunction {
     blocks: Vec<PaflBlock>,
 }
 
-/// A struct containing serializable information about the entire crate
+/// Serializable information about the entire crate
 #[derive(Serialize)]
 struct PaflCrate {
     functions: Vec<PaflFunction>,
