@@ -91,8 +91,10 @@ enum PaflGeneric {
 #[derive(Serialize)]
 enum Callee {
     Local(PaflFunction),
+    Cycle { id: Ident, path: String, generics: Vec<PaflGeneric> },
     Foreign { id: Ident, krate: String, path: String, generics: Vec<PaflGeneric> },
     Intrinsic { id: Ident, path: String, generics: Vec<PaflGeneric> },
+    Unresolved { id: Ident, krate: Option<String>, path: String, generics: Vec<PaflGeneric> },
 }
 
 /// Identifier mimicking `DefId`
@@ -177,6 +179,8 @@ struct PaflDump<'tcx> {
     path_data: PathBuf,
     /// path to the data file
     path_prefix: PathBuf,
+    /// stack
+    stack: Vec<Instance<'tcx>>,
 }
 
 impl<'tcx> PaflDump<'tcx> {
@@ -330,45 +334,69 @@ impl<'tcx> PaflDump<'tcx> {
             None => bug!("unable to handle the indirect call: {:?}", span),
             Some((def_id, generic_args)) => {
                 // resolve trait targets, if possible
-                let resolved =
-                    Instance::expect_resolve(self.tcx, self.param_env, def_id, generic_args);
-
-                match resolved.def {
-                    InstanceDef::Item(item_id) => {
-                        if item_id.is_local() {
-                            let func = PaflDump::process_instance(
-                                self.tcx,
-                                resolved,
-                                self.verbose,
-                                &self.path_meta,
-                                &self.path_data,
-                            );
-                            Callee::Local(func)
+                match Instance::resolve(self.tcx, self.param_env, def_id, generic_args)
+                    .expect("resolution failure")
+                {
+                    None => {
+                        let krate = if def_id.is_local() {
+                            None
                         } else {
-                            Callee::Foreign {
-                                id: item_id.into(),
-                                krate: self.tcx.crate_name(item_id.krate).to_string(),
-                                path: self.tcx.def_path(item_id).to_string_no_crate_verbose(),
-                                generics: self.process_generics(resolved.args),
-                            }
+                            Some(self.tcx.crate_name(def_id.krate).to_string())
+                        };
+                        Callee::Unresolved {
+                            id: def_id.into(),
+                            krate,
+                            path: self.tcx.def_path(def_id).to_string_no_crate_verbose(),
+                            generics: self.process_generics(generic_args),
                         }
                     }
-                    InstanceDef::Intrinsic(intrinsic_id) => Callee::Intrinsic {
-                        id: intrinsic_id.into(),
-                        path: self.tcx.def_path(intrinsic_id).to_string_no_crate_verbose(),
-                        generics: self.process_generics(resolved.args),
+                    Some(resolved) => match resolved.def {
+                        InstanceDef::Item(item_id) => {
+                            if item_id.is_local() {
+                                match PaflDump::process_instance(
+                                    self.tcx,
+                                    resolved,
+                                    self.verbose,
+                                    &self.path_meta,
+                                    &self.path_data,
+                                    &self.stack,
+                                ) {
+                                    None => Callee::Cycle {
+                                        id: item_id.into(),
+                                        path: self
+                                            .tcx
+                                            .def_path(item_id)
+                                            .to_string_no_crate_verbose(),
+                                        generics: self.process_generics(generic_args),
+                                    },
+                                    Some(func) => Callee::Local(func),
+                                }
+                            } else {
+                                Callee::Foreign {
+                                    id: item_id.into(),
+                                    krate: self.tcx.crate_name(item_id.krate).to_string(),
+                                    path: self.tcx.def_path(item_id).to_string_no_crate_verbose(),
+                                    generics: self.process_generics(resolved.args),
+                                }
+                            }
+                        }
+                        InstanceDef::Intrinsic(intrinsic_id) => Callee::Intrinsic {
+                            id: intrinsic_id.into(),
+                            path: self.tcx.def_path(intrinsic_id).to_string_no_crate_verbose(),
+                            generics: self.process_generics(resolved.args),
+                        },
+                        InstanceDef::ClosureOnceShim { .. }
+                        | InstanceDef::DropGlue(..)
+                        | InstanceDef::CloneShim(..)
+                        | InstanceDef::Virtual(..)
+                        | InstanceDef::VTableShim(..)
+                        | InstanceDef::FnPtrShim(..)
+                        | InstanceDef::ReifyShim(..)
+                        | InstanceDef::FnPtrAddrShim(..)
+                        | InstanceDef::ThreadLocalShim(..) => {
+                            bug!("unusual calls are not supported yet: {}", resolved);
+                        }
                     },
-                    InstanceDef::ClosureOnceShim { .. }
-                    | InstanceDef::DropGlue(..)
-                    | InstanceDef::CloneShim(..)
-                    | InstanceDef::Virtual(..)
-                    | InstanceDef::VTableShim(..)
-                    | InstanceDef::FnPtrShim(..)
-                    | InstanceDef::ReifyShim(..)
-                    | InstanceDef::FnPtrAddrShim(..)
-                    | InstanceDef::ThreadLocalShim(..) => {
-                        bug!("unusual calls are not supported yet: {}", resolved);
-                    }
                 }
             }
         }
@@ -488,7 +516,13 @@ impl<'tcx> PaflDump<'tcx> {
         verbose: bool,
         path_meta: &Path,
         path_data: &Path,
-    ) -> PaflFunction {
+        stack: &[Instance<'tcx>],
+    ) -> Option<PaflFunction> {
+        // avoid recursion
+        if stack.iter().any(|i| *i == instance) {
+            return None;
+        }
+
         // verbose mode
         let path = tcx.def_path(instance.def_id());
         if verbose {
@@ -551,6 +585,9 @@ impl<'tcx> PaflDump<'tcx> {
         let path_prefix = path_data.join(index.to_string());
 
         // construct the dumper
+        let mut new_stack: Vec<_> = stack.iter().cloned().collect();
+        new_stack.push(instance);
+
         let dumper = PaflDump {
             tcx,
             param_env,
@@ -558,6 +595,7 @@ impl<'tcx> PaflDump<'tcx> {
             path_meta: path_meta.to_path_buf(),
             path_data: path_data.to_path_buf(),
             path_prefix,
+            stack: new_stack,
         };
 
         // branch processing by instance type
@@ -576,7 +614,7 @@ impl<'tcx> PaflDump<'tcx> {
                 bug!("unusual calls are not supported yet: {}", instance);
             }
         };
-        dumper.process_function(fun_id, instance.args)
+        Some(dumper.process_function(fun_id, instance.args))
     }
 }
 
@@ -612,9 +650,12 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
             }
 
             // process it and save the result to summary
-            let converted =
-                PaflDump::process_instance(tcx, instance, verbose, &path_meta, &path_data);
-            summary.functions.push(converted);
+            match PaflDump::process_instance(tcx, instance, verbose, &path_meta, &path_data, &[]) {
+                None => bug!("cannot have a recursive call when call stack is empty"),
+                Some(converted) => {
+                    summary.functions.push(converted);
+                }
+            }
         }
     }
 
