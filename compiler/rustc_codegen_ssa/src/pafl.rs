@@ -89,11 +89,78 @@ enum PaflGeneric {
 
 /// Kinds of callee
 #[derive(Serialize)]
-struct Callee {
+enum Callee {
+    Local(PaflFunction),
+    Foreign { id: Ident, krate: String, path: String, generics: Vec<PaflGeneric> },
+    Intrinsic { id: Ident, path: String, generics: Vec<PaflGeneric> },
+}
+
+/// Identifier mimicking `DefId`
+#[derive(Serialize)]
+struct BlkId {
+    index: usize,
+}
+
+impl From<BasicBlock> for BlkId {
+    fn from(id: BasicBlock) -> Self {
+        Self { index: id.as_usize() }
+    }
+}
+
+/// How unwind will work
+#[derive(Serialize)]
+enum UnwindRoute {
+    Resume,
+    Terminate,
+    Unreachable,
+    Cleanup(BlkId),
+}
+
+impl From<&UnwindAction> for UnwindRoute {
+    fn from(action: &UnwindAction) -> Self {
+        match action {
+            UnwindAction::Continue => Self::Resume,
+            UnwindAction::Unreachable => Self::Unreachable,
+            UnwindAction::Terminate(..) => Self::Terminate,
+            UnwindAction::Cleanup(blk) => Self::Cleanup((*blk).into()),
+        }
+    }
+}
+
+/// Kinds of terminator instructions
+#[derive(Serialize)]
+enum TermKind {
+    Unreachable,
+    Goto(BlkId),
+    Switch(Vec<BlkId>),
+    Return,
+    UnwindResume,
+    UnwindFinish,
+    Assert { target: BlkId, unwind: UnwindRoute },
+    Drop { target: BlkId, unwind: UnwindRoute },
+    Call { callee: Callee, target: Option<BlkId>, unwind: UnwindRoute },
+}
+
+/// A struct containing serializable information about a basic block
+#[derive(Serialize)]
+struct PaflBlock {
+    id: BlkId,
+    term: TermKind,
+}
+
+/// A struct containing serializable information about one user-defined function
+#[derive(Serialize)]
+struct PaflFunction {
     id: Ident,
-    krate: Option<String>,
     path: String,
     generics: Vec<PaflGeneric>,
+    blocks: Vec<PaflBlock>,
+}
+
+/// A struct containing serializable information about the entire crate
+#[derive(Serialize)]
+struct PaflCrate {
+    functions: Vec<PaflFunction>,
 }
 
 /// Helper for dumping path-AFL related information
@@ -130,16 +197,16 @@ impl<'tcx> PaflDump<'tcx> {
         }
     }
 
-        /// Process a constant
-        fn process_const(&self, item: Const<'tcx>) -> PaflConst {
-            match item.kind() {
-                ConstKind::Param(param) => {
-                    PaflConst::Param { index: param.index, name: param.name.to_string() }
-                }
-                ConstKind::Value(value) => PaflConst::Value(self.process_vtree(value)),
-                _ => bug!("unrecognized constant: {:?}", item),
+    /// Process a constant
+    fn process_const(&self, item: Const<'tcx>) -> PaflConst {
+        match item.kind() {
+            ConstKind::Param(param) => {
+                PaflConst::Param { index: param.index, name: param.name.to_string() }
             }
+            ConstKind::Value(value) => PaflConst::Value(self.process_vtree(value)),
+            _ => bug!("unrecognized constant: {:?}", item),
         }
+    }
 
     /// Process the type
     fn process_type(&self, item: Ty<'tcx>) -> PaflType {
@@ -224,7 +291,7 @@ impl<'tcx> PaflDump<'tcx> {
                 PaflType::Array(self.process_type(*sub).into(), self.process_const(*len))
             }
             ty::Tuple(elems) => {
-                PaflType::Tuple(elems.iter().map(|e|self.process_type(e)).collect())
+                PaflType::Tuple(elems.iter().map(|e| self.process_type(e)).collect())
             }
             ty::Dynamic(binders, _region, _) => {
                 let mut traits = vec![];
@@ -243,40 +310,176 @@ impl<'tcx> PaflDump<'tcx> {
         }
     }
 
-        /// Resolve the call target
-        fn process_callee(
-            &self,
-            callee: &Operand<'tcx>,
-            span: Span,
-        ) -> Callee {
-            match callee.const_fn_def() {
-                None => bug!("unable to handle the indirect call: {:?}", span),
-                Some((def_id, generic_args)) => {
-                    // resolve trait targets, if any
-                    match Instance::resolve(self.tcx, self.param_env, def_id, generic_args) {
-                        Ok(None) => {
-                            let krate = if def_id.is_local() {
-                                None
-                            } else {
-                                Some(self.tcx.crate_name(def_id.krate).to_string())
-                            };
-                            let path = self.tcx.def_path(def_id).to_string_no_crate_verbose();
-                            Callee {
-                                id: def_id.into(),
-                                krate,
-                                path,
-                                generics: self.process_generics(generic_args),
+    /// Process the generic arguments
+    fn process_generics(&self, args: GenericArgsRef<'tcx>) -> Vec<PaflGeneric> {
+        let mut generics = vec![];
+        for arg in args {
+            let sub = match arg.unpack() {
+                GenericArgKind::Lifetime(_region) => PaflGeneric::Lifetime,
+                GenericArgKind::Type(item) => PaflGeneric::Type(self.process_type(item)),
+                GenericArgKind::Const(item) => PaflGeneric::Const(self.process_const(item)),
+            };
+            generics.push(sub);
+        }
+        generics
+    }
+
+    /// Resolve the call target
+    fn process_callee(&self, callee: &Operand<'tcx>, span: Span) -> Callee {
+        match callee.const_fn_def() {
+            None => bug!("unable to handle the indirect call: {:?}", span),
+            Some((def_id, generic_args)) => {
+                // resolve trait targets, if possible
+                let resolved =
+                    Instance::expect_resolve(self.tcx, self.param_env, def_id, generic_args);
+
+                match resolved.def {
+                    InstanceDef::Item(item_id) => {
+                        if item_id.is_local() {
+                            let func = PaflDump::process_instance(
+                                self.tcx,
+                                resolved,
+                                self.verbose,
+                                &self.path_meta,
+                                &self.path_data,
+                            );
+                            Callee::Local(func)
+                        } else {
+                            Callee::Foreign {
+                                id: item_id.into(),
+                                krate: self.tcx.crate_name(item_id.krate).to_string(),
+                                path: self.tcx.def_path(item_id).to_string_no_crate_verbose(),
+                                generics: self.process_generics(resolved.args),
                             }
                         }
-                        Ok(Some(instance)) => {
-                            PaflDump::process_instance(self.tcx, instance, self.verbose, &self.path_meta, &self.path_data);
-                            todo!("utilize the instance function");
-                        }
-                        Err(_) => bug!("unable to resolve callee instance"),
+                    }
+                    InstanceDef::Intrinsic(intrinsic_id) => Callee::Intrinsic {
+                        id: intrinsic_id.into(),
+                        path: self.tcx.def_path(intrinsic_id).to_string_no_crate_verbose(),
+                        generics: self.process_generics(resolved.args),
+                    },
+                    InstanceDef::ClosureOnceShim { .. }
+                    | InstanceDef::DropGlue(..)
+                    | InstanceDef::CloneShim(..)
+                    | InstanceDef::Virtual(..)
+                    | InstanceDef::VTableShim(..)
+                    | InstanceDef::FnPtrShim(..)
+                    | InstanceDef::ReifyShim(..)
+                    | InstanceDef::FnPtrAddrShim(..)
+                    | InstanceDef::ThreadLocalShim(..) => {
+                        bug!("unusual calls are not supported yet: {}", resolved);
                     }
                 }
             }
         }
+    }
+
+    /// Process the mir for one basic block
+    fn process_block(&self, id: BasicBlock, data: &BasicBlockData<'tcx>) -> PaflBlock {
+        let term = data.terminator();
+
+        // match by the terminator
+        let kind = match &term.kind {
+            // basics
+            TerminatorKind::Goto { target } => TermKind::Goto((*target).into()),
+            TerminatorKind::SwitchInt { discr: _, targets } => {
+                TermKind::Switch(targets.all_targets().iter().map(|b| (*b).into()).collect())
+            }
+            TerminatorKind::Unreachable => TermKind::Unreachable,
+            TerminatorKind::Return => TermKind::Return,
+            // call (which may unwind)
+            TerminatorKind::Call {
+                func,
+                args: _,
+                destination: _,
+                target,
+                unwind,
+                call_source: _,
+                fn_span: _,
+            } => TermKind::Call {
+                callee: self.process_callee(func, term.source_info.span),
+                target: target.as_ref().map(|t| (*t).into()),
+                unwind: unwind.into(),
+            },
+            TerminatorKind::Drop { place: _, target, unwind, replace: _ } => {
+                TermKind::Drop { target: (*target).into(), unwind: unwind.into() }
+            }
+            TerminatorKind::Assert { cond: _, expected: _, msg: _, target, unwind } => {
+                TermKind::Assert { target: (*target).into(), unwind: unwind.into() }
+            }
+            // unwinding
+            TerminatorKind::UnwindResume => TermKind::UnwindResume,
+            TerminatorKind::UnwindTerminate(..) => TermKind::UnwindFinish,
+            // imaginary
+            TerminatorKind::FalseEdge { real_target, imaginary_target: _ }
+            | TerminatorKind::FalseUnwind { real_target, unwind: _ } => {
+                TermKind::Goto((*real_target).into())
+            }
+            // coroutine
+            TerminatorKind::Yield { .. } | TerminatorKind::CoroutineDrop => {
+                bug!("unexpected coroutine")
+            }
+            // assembly
+            TerminatorKind::InlineAsm { .. } => bug!("unexpected inline assembly"),
+        };
+
+        // done
+        PaflBlock { id: id.into(), term: kind }
+    }
+
+    /// Process the mir body for one function
+    fn process_function(&self, id: DefId, generic_args: GenericArgsRef<'tcx>) -> PaflFunction {
+        let path = self.tcx.def_path(id).to_string_no_crate_verbose();
+        let body = self.tcx.optimized_mir(id);
+
+        // sanity check
+        let expected_phase = match self.tcx.def_kind(id) {
+            DefKind::Ctor(_, CtorKind::Fn) => MirPhase::Built,
+            DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::Coroutine => {
+                MirPhase::Runtime(RuntimePhase::Optimized)
+            }
+            kind => bug!("unexpected def_kind: {}", kind.descr(id)),
+        };
+        if body.phase != expected_phase {
+            bug!(
+                "MIR for '{}' with description '{}' is at an unexpected phase '{:?}'",
+                path,
+                self.tcx.def_descr(id),
+                body.phase
+            );
+        }
+
+        // handle the generics
+        let generics = self.process_generics(generic_args);
+
+        // dump the control flow graph if requested
+        match std::env::var_os("PAFL_CFG") {
+            None => (),
+            Some(v) => {
+                if v.to_str().map_or(false, |s| s == path.as_str()) {
+                    // dump the cfg
+                    let dot_path = self.path_prefix.with_extension("dot");
+                    let mut dot_file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&dot_path)
+                        .expect("unable to create dot file");
+                    write_mir_graphviz(self.tcx, Some(id), &mut dot_file)
+                        .expect("failed to create dot file");
+                }
+            }
+        }
+
+        // iterate over each basic blocks
+        let mut blocks = vec![];
+        for blk_id in body.basic_blocks.reverse_postorder() {
+            let blk_data = body.basic_blocks.get(*blk_id).unwrap();
+            blocks.push(self.process_block(*blk_id, blk_data));
+        }
+
+        // done
+        PaflFunction { id: id.into(), path, generics, blocks }
+    }
 
     /// Process a codegen instance
     fn process_instance(
@@ -359,9 +562,7 @@ impl<'tcx> PaflDump<'tcx> {
 
         // branch processing by instance type
         let fun_id = match &instance.def {
-            InstanceDef::Item(id) => {
-                *id
-            }
+            InstanceDef::Item(id) => *id,
             InstanceDef::Intrinsic(..)
             | InstanceDef::ClosureOnceShim { .. }
             | InstanceDef::DropGlue(..)
@@ -376,78 +577,6 @@ impl<'tcx> PaflDump<'tcx> {
             }
         };
         dumper.process_function(fun_id, instance.args)
-    }
-
-        /// Process the mir body for one function
-        fn process_function(
-            &self,
-            id: DefId,
-            generic_args: GenericArgsRef<'tcx>,
-        ) -> PaflFunction {
-            let path = self.tcx.def_path(id).to_string_no_crate_verbose();
-            let body = self.tcx.optimized_mir(id);
-
-            // sanity check
-            let expected_phase = match self.tcx.def_kind(id) {
-                DefKind::Ctor(_, CtorKind::Fn) => MirPhase::Built,
-                DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::Coroutine => {
-                    MirPhase::Runtime(RuntimePhase::Optimized)
-                }
-                kind => bug!("unexpected def_kind: {}", kind.descr(id)),
-            };
-            if body.phase != expected_phase {
-                bug!(
-                    "MIR for '{}' with description '{}' is at an unexpected phase '{:?}'",
-                    path,
-                    self.tcx.def_descr(id),
-                    body.phase
-                );
-            }
-
-            // handle the generics
-            let generics = PaflGeneric::process(tcx, generic_args);
-
-            // dump the control flow graph if requested
-            match std::env::var_os("PAFL_CFG") {
-                None => (),
-                Some(v) => {
-                    if v.to_str().map_or(false, |s| s == path.as_str()) {
-                        // dump the cfg
-                        let dot_path = self.path_prefix.with_extension("dot");
-                        let mut dot_file = OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&dot_path)
-                            .expect("unable to create dot file");
-                        write_mir_graphviz(self.tcx, Some(id), &mut dot_file)
-                            .expect("failed to create dot file");
-                    }
-                }
-            }
-
-            // iterate over each basic blocks
-            let mut blocks = vec![];
-            for blk_id in body.basic_blocks.reverse_postorder() {
-                let blk_data = body.basic_blocks.get(*blk_id).unwrap();
-                blocks.push(PaflBlock::process(tcx, *blk_id, blk_data, param_env));
-            }
-
-            // done
-            PaflFunction { id: id.into(), path, generics, blocks }
-        }
-
-            /// Process the generic arguments
-    fn process_generics(&self, args: GenericArgsRef<'tcx>) -> Vec<PaflGeneric> {
-        let mut generics = vec![];
-        for arg in args {
-            let sub = match arg.unpack() {
-                GenericArgKind::Lifetime(_region) => PaflGeneric::Lifetime,
-                GenericArgKind::Type(item) => PaflGeneric::Type(PaflType::process(tcx, item)),
-                GenericArgKind::Const(item) => PaflGeneric::Const(PaflConst::process(tcx, item)),
-            };
-            generics.push(sub);
-        }
-        generics
     }
 }
 
@@ -483,7 +612,8 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
             }
 
             // process it and save the result to summary
-            let converted = PaflDump::process_instance(tcx, instance, verbose, &path_meta,& path_data);
+            let converted =
+                PaflDump::process_instance(tcx, instance, verbose, &path_meta, &path_data);
             summary.functions.push(converted);
         }
     }
@@ -500,133 +630,4 @@ pub fn dump(tcx: TyCtxt<'_>, outdir: &Path) {
         .open(output)
         .expect("unable to create output file");
     file.write_all(content.as_bytes()).expect("unexpected failure on outputting to file");
-}
-
-
-/// A struct containing serializable information about the entire crate
-#[derive(Serialize)]
-struct PaflCrate {
-    functions: Vec<PaflFunction>,
-}
-
-/// A struct containing serializable information about one user-defined function
-#[derive(Serialize)]
-struct PaflFunction {
-    id: Ident,
-    path: String,
-    generics: Vec<PaflGeneric>,
-    blocks: Vec<PaflBlock>,
-}
-
-/// Identifier mimicking `DefId`
-#[derive(Serialize)]
-struct BlkId {
-    index: usize,
-}
-
-impl From<BasicBlock> for BlkId {
-    fn from(id: BasicBlock) -> Self {
-        Self { index: id.as_usize() }
-    }
-}
-
-/// How unwind will work
-#[derive(Serialize)]
-enum UnwindRoute {
-    Resume,
-    Terminate,
-    Unreachable,
-    Cleanup(BlkId),
-}
-
-impl From<&UnwindAction> for UnwindRoute {
-    fn from(action: &UnwindAction) -> Self {
-        match action {
-            UnwindAction::Continue => Self::Resume,
-            UnwindAction::Unreachable => Self::Unreachable,
-            UnwindAction::Terminate(..) => Self::Terminate,
-            UnwindAction::Cleanup(blk) => Self::Cleanup((*blk).into()),
-        }
-    }
-}
-
-/// Kinds of terminator instructions
-#[derive(Serialize)]
-enum TermKind {
-    Unreachable,
-    Goto(BlkId),
-    Switch(Vec<BlkId>),
-    Return,
-    UnwindResume,
-    UnwindFinish,
-    Assert { target: BlkId, unwind: UnwindRoute },
-    Drop { target: BlkId, unwind: UnwindRoute },
-    Call { callee: Callee, target: Option<BlkId>, unwind: UnwindRoute },
-}
-
-/// A struct containing serializable information about a basic block
-#[derive(Serialize)]
-struct PaflBlock {
-    id: BlkId,
-    term: TermKind,
-}
-
-impl PaflBlock {
-    /// Process the mir for one basic block
-    fn process<'tcx>(
-        tcx: TyCtxt<'tcx>,
-        id: BasicBlock,
-        data: &BasicBlockData<'tcx>,
-        param_env: ParamEnv<'tcx>,
-    ) -> Self {
-        let term = data.terminator();
-
-        // match by the terminator
-        let kind = match &term.kind {
-            // basics
-            TerminatorKind::Goto { target } => TermKind::Goto((*target).into()),
-            TerminatorKind::SwitchInt { discr: _, targets } => {
-                TermKind::Switch(targets.all_targets().iter().map(|b| (*b).into()).collect())
-            }
-            TerminatorKind::Unreachable => TermKind::Unreachable,
-            TerminatorKind::Return => TermKind::Return,
-            // call (which may unwind)
-            TerminatorKind::Call {
-                func,
-                args: _,
-                destination: _,
-                target,
-                unwind,
-                call_source: _,
-                fn_span: _,
-            } => TermKind::Call {
-                callee: Callee::process(tcx, func, term.source_info.span, param_env),
-                target: target.as_ref().map(|t| (*t).into()),
-                unwind: unwind.into(),
-            },
-            TerminatorKind::Drop { place: _, target, unwind, replace: _ } => {
-                TermKind::Drop { target: (*target).into(), unwind: unwind.into() }
-            }
-            TerminatorKind::Assert { cond: _, expected: _, msg: _, target, unwind } => {
-                TermKind::Assert { target: (*target).into(), unwind: unwind.into() }
-            }
-            // unwinding
-            TerminatorKind::UnwindResume => TermKind::UnwindResume,
-            TerminatorKind::UnwindTerminate(..) => TermKind::UnwindFinish,
-            // imaginary
-            TerminatorKind::FalseEdge { real_target, imaginary_target: _ }
-            | TerminatorKind::FalseUnwind { real_target, unwind: _ } => {
-                TermKind::Goto((*real_target).into())
-            }
-            // coroutine
-            TerminatorKind::Yield { .. } | TerminatorKind::CoroutineDrop => {
-                bug!("unexpected coroutine")
-            }
-            // assembly
-            TerminatorKind::InlineAsm { .. } => bug!("unexpected inline assembly"),
-        };
-
-        // done
-        Self { id: id.into(), term: kind }
-    }
 }
