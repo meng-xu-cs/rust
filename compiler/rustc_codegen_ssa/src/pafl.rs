@@ -91,10 +91,35 @@ enum PaflGeneric {
 #[derive(Serialize)]
 enum Callee {
     Local(PaflFunction),
-    Cycle { id: Ident, path: String, generics: Vec<PaflGeneric> },
-    Foreign { id: Ident, krate: String, path: String, generics: Vec<PaflGeneric> },
-    Intrinsic { id: Ident, path: String, generics: Vec<PaflGeneric> },
-    Unresolved { id: Ident, krate: Option<String>, path: String, generics: Vec<PaflGeneric> },
+    Cycle {
+        id: Ident,
+        path: String,
+        generics: Vec<PaflGeneric>,
+    },
+    Virtual {
+        id: Ident,
+        krate: Option<String>,
+        path: String,
+        generics: Vec<PaflGeneric>,
+        offset: usize,
+    },
+    Foreign {
+        id: Ident,
+        krate: String,
+        path: String,
+        generics: Vec<PaflGeneric>,
+    },
+    Intrinsic {
+        id: Ident,
+        path: String,
+        generics: Vec<PaflGeneric>,
+    },
+    Unresolved {
+        id: Ident,
+        krate: Option<String>,
+        path: String,
+        generics: Vec<PaflGeneric>,
+    },
 }
 
 /// Identifier mimicking `DefId`
@@ -380,6 +405,20 @@ impl<'tcx> PaflDump<'tcx> {
                                 }
                             }
                         }
+                        InstanceDef::Virtual(virtual_id, offset) => {
+                            let krate = if virtual_id.is_local() {
+                                None
+                            } else {
+                                Some(self.tcx.crate_name(virtual_id.krate).to_string())
+                            };
+                            Callee::Virtual {
+                                id: virtual_id.into(),
+                                krate,
+                                path: self.tcx.def_path(virtual_id).to_string_no_crate_verbose(),
+                                generics: self.process_generics(resolved.args),
+                                offset,
+                            }
+                        }
                         InstanceDef::Intrinsic(intrinsic_id) => Callee::Intrinsic {
                             id: intrinsic_id.into(),
                             path: self.tcx.def_path(intrinsic_id).to_string_no_crate_verbose(),
@@ -388,7 +427,6 @@ impl<'tcx> PaflDump<'tcx> {
                         InstanceDef::ClosureOnceShim { .. }
                         | InstanceDef::DropGlue(..)
                         | InstanceDef::CloneShim(..)
-                        | InstanceDef::Virtual(..)
                         | InstanceDef::VTableShim(..)
                         | InstanceDef::FnPtrShim(..)
                         | InstanceDef::ReifyShim(..)
@@ -562,20 +600,7 @@ impl<'tcx> PaflDump<'tcx> {
                 .open(path_meta.join(count.to_string()))
             {
                 Ok(mut file) => {
-                    let kind = match instance.def {
-                        InstanceDef::Item(_) => "function",
-                        InstanceDef::VTableShim(_) => "shim(vtable)",
-                        InstanceDef::ReifyShim(_) => "shim(reify)",
-                        InstanceDef::ThreadLocalShim(_) => "shim(tls)",
-                        InstanceDef::Intrinsic(_) => "intrinsic",
-                        InstanceDef::Virtual(_, _) => "virtual",
-                        InstanceDef::FnPtrShim(_, _) => "shim(<fn>)",
-                        InstanceDef::ClosureOnceShim { .. } => "shim(once)",
-                        InstanceDef::DropGlue(_, _) => "shim(drop)",
-                        InstanceDef::CloneShim(_, _) => "shim(clone)",
-                        InstanceDef::FnPtrAddrShim(_, _) => "shim(&<fn>)",
-                    };
-                    let content = format!("[{}] {}", kind, path.to_string_no_crate_verbose(),);
+                    let content = format!("{}", path.to_string_no_crate_verbose(),);
                     file.write_all(content.as_bytes()).expect("save meta content");
                     break count;
                 }
@@ -611,7 +636,7 @@ impl<'tcx> PaflDump<'tcx> {
             | InstanceDef::ReifyShim(..)
             | InstanceDef::FnPtrAddrShim(..)
             | InstanceDef::ThreadLocalShim(..) => {
-                bug!("unusual calls are not supported yet: {}", instance);
+                bug!("invalid top-level instance: {}", instance);
             }
         };
         Some(dumper.process_function(fun_id, instance.args))
