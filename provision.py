@@ -3,7 +3,6 @@
 if __name__ == "__main__":
     import os
     import pathlib
-    import shutil
     import subprocess
 
     # paths
@@ -14,8 +13,8 @@ if __name__ == "__main__":
     path_src_std = path_base.joinpath("library", "std")
 
     path_build = path_base.joinpath("build", "host")
-    path_build_stage1_base = path_build.joinpath("stage1", "bin")
-    path_build_stage1_tool = path_build.joinpath("stage1-tools-bin")
+    path_build_stage1_bin = path_build.joinpath("stage1", "bin")
+    path_build_stage1_tool_cargo = path_build.joinpath("stage1-tools-bin", "cargo")
 
     # setup
     if not path_config.exists():
@@ -40,17 +39,27 @@ if __name__ == "__main__":
 
     # build
     subprocess.check_call([path_x, "build"])
-    if not path_build_stage1_base.exists():
-        raise RuntimeError("{} does not exist".format(path_build_stage1_base))
-    if not path_build_stage1_tool.exists():
-        raise RuntimeError("{} does not exist".format(path_build_stage1_tool))
+    if not path_build_stage1_bin.exists():
+        raise RuntimeError("{} does not exist".format(path_build_stage1_bin))
+    if not path_build_stage1_tool_cargo.exists():
+        raise RuntimeError("{} does not exist".format(path_build_stage1_tool_cargo))
 
-    # merge the binaries in the tools
-    for item in os.listdir(path_build_stage1_tool):
-        dst = path_build_stage1_base.joinpath(item)
-        if not dst.exists():
-            shutil.copy2(path_build_stage1_tool.joinpath(item), dst)
+    # wrap the cargo tool with a script
+    dst = path_build_stage1_bin.joinpath("cargo")
+    if dst.exists():
+        raise RuntimeError("{} already exists".format(dst))
+
+    with open(dst, "w") as f:
+        f.write(
+            """#!/bin/bash
+exec env RUSTC_BOOTSTRAP=1 {} "$@"
+""".format(
+                path_build_stage1_tool_cargo
+            )
+        )
+
+    os.chmod(dst, 0o755)
 
     # dump the information
-    print("Toolchain: {}".format(path_build_stage1_tool))
+    print("Toolchain: {}".format(path_build_stage1_bin))
     print("Stdlib: {}".format(path_src_std))
