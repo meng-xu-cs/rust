@@ -13,6 +13,7 @@ if __name__ == "__main__":
     path_src_std = path_base.joinpath("library", "std")
 
     path_build = path_base.joinpath("build", "host")
+    path_build_stage0_tool_cargo = path_build.joinpath("stage0", "bin", "cargo")
     path_build_stage1_bin = path_build.joinpath("stage1", "bin")
     path_build_stage1_tool_cargo = path_build.joinpath("stage1-tools-bin", "cargo")
 
@@ -52,9 +53,12 @@ if __name__ == "__main__":
     with open(dst, "w") as f:
         f.write(
             """#!/bin/bash
-exec env RUSTC_BOOTSTRAP=1 {} "$@"
-""".format(
-                path_build_stage1_tool_cargo
+if [ "$1" == "check" ]; then
+    exec env RUSTC_BOOTSTRAP=1 {} "$@"
+else  
+    exec env RUSTC_BOOTSTRAP=1 {} "$@"
+fi""".format(
+                path_build_stage0_tool_cargo, path_build_stage1_tool_cargo
             )
         )
 
