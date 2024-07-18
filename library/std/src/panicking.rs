@@ -13,8 +13,8 @@ use core::panic::Location;
 #[cfg(not(target_os = "solana"))]
 // make sure to use the stderr output configured
 // by libtest in the real copy of std
-#[cfg(all(test, not(target_family = "solana")))]
-use realstd::io::set_output_capture;
+#[cfg(test)]
+use realstd::io::try_set_output_capture;
 
 #[cfg(not(target_os = "solana"))]
 use crate::any::Any;
@@ -657,7 +657,7 @@ pub fn panicking() -> bool {
 }
 
 /// Entry point of panics from the core crate (`panic_impl` lang item).
-#[cfg(not(any(test, doctest, target_os = "solana")))]
+#[cfg(not(any(test, doctest, target_family = "solana")))]
 #[panic_handler]
 pub fn begin_panic_handler(info: &core::panic::PanicInfo<'_>) -> ! {
     struct FormatStringPayload<'a> {

@@ -666,6 +666,10 @@
     [xtensa_esp32s3_espidf] compile-flags: --target xtensa-esp32s3-espidf
     [xtensa_esp32s3_espidf] needs-llvm-components: xtensa
 */
+//@ revisions: sbf_solana_solana
+//@ [sbf_solana_solana] compile-flags: --target sbf-solana-solana
+//@ [sbf_solana_solana] needs-llvm-components: sbf
+
 // Sanity-check that each target can produce assembly code.
 
 #![feature(no_core, lang_items)]

@@ -162,8 +162,8 @@ pub struct BacktraceFrame {
 }
 
 #[derive(Debug)]
+#[cfg(not(target_family = "solana"))]
 enum RawFrame {
-    #[cfg(not(target_family = "solana"))]
     Actual(backtrace_rs::Frame),
     #[cfg(test)]
     Fake,

@@ -483,7 +483,7 @@ const WASM_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
 const BPF_FEATURES: &[(&str, Stability, ImpliedFeatures)] =
     &[("alu32", Unstable(sym::bpf_target_feature), &[])];
 
-const SBF_ALLOWED_FEATURES: &[(&str, Stability, ImpliedFeatures)] =
+const SBF_FEATURES: &[(&str, Stability, ImpliedFeatures)] =
     &[("alu32", Unstable(sym::sbf_target_feature), &[]), ("static-syscalls", Unstable(sym::sbf_target_feature), &[])];
 
 const CSKY_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
@@ -581,6 +581,7 @@ pub fn all_rust_features() -> impl Iterator<Item = (&'static str, Stability)> {
         .chain(LOONGARCH_FEATURES)
         .chain(IBMZ_FEATURES)
         .chain(SPARC_FEATURES)
+        .chain(SBF_FEATURES)
         .cloned()
         .map(|(f, s, _)| (f, s))
 }
@@ -624,6 +625,7 @@ impl super::spec::Target {
             "loongarch64" => LOONGARCH_FEATURES,
             "s390x" => IBMZ_FEATURES,
             "sparc" | "sparc64" => SPARC_FEATURES,
+            "sbf" => SBF_FEATURES,
             _ => &[],
         }
     }
