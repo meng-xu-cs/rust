@@ -8,7 +8,7 @@ const ALLOWED_SOURCES: &[&str] = &[
     r#""registry+https://github.com/rust-lang/crates.io-index""#,
     // This is `rust_team_data` used by `site` in src/tools/rustc-perf,
     r#""git+https://github.com/rust-lang/team#a5260e76d3aa894c64c56e6ddc8545b9a98043ec""#,
-    "\"git+https://github.com/anza-xyz/compiler-builtins?tag=solana-tools-v1.44#59d7315985b3d001ca32fbd29593802148051c8b\"",
+    "\"git+https://github.com/anza-xyz/compiler-builtins?tag=solana-tools-v1.44#4abd7f45fc621344e4b9d1df37a45b7445f03c71\"",
     "\"git+https://github.com/anza-xyz/rustc-build-sysroot?tag=solana-tools-v1.44#4f19dfe109fc80efbe62b6de9781125bc7ce7485\""
 ];
 
