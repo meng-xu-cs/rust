@@ -79,8 +79,6 @@ jobs:
     continue-on-error: ${{ matrix.continue_on_error || false }}
     strategy:
       matrix:
-        # Check the `calculate_matrix` job to see how is the matrix defined.
-        include: ${{ fromJSON(needs.calculate_matrix.outputs.jobs) }}
     steps:
       - if: contains(matrix.os, 'windows')
         uses: msys2/setup-msys2@v2.22.0
