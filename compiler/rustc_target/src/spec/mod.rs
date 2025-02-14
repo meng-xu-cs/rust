@@ -1908,6 +1908,11 @@ supported_targets! {
     ("bpfeb-unknown-none", bpfeb_unknown_none),
     ("bpfel-unknown-none", bpfel_unknown_none),
     ("sbf-solana-solana", sbf_solana_solana),
+    ("sbpf-solana-solana", sbpf_solana_solana),
+    ("sbpfv1-solana-solana", sbpfv1_solana_solana),
+    ("sbpfv2-solana-solana", sbpfv2_solana_solana),
+    ("sbpfv3-solana-solana", sbpfv3_solana_solana),
+
 
     ("armv6k-nintendo-3ds", armv6k_nintendo_3ds),
 
@@ -2493,9 +2498,6 @@ pub struct TargetOptions {
 
     /// Whether the targets supports -Z small-data-threshold
     small_data_threshold_support: SmallDataThresholdSupport,
-
-    /// SBFv3 linker script
-    pub sbf_v3_link_script: Option<StaticCow<str>>,
 }
 
 /// Add arguments for the given flavor and also for its "twin" flavors
@@ -2720,7 +2722,6 @@ impl Default for TargetOptions {
             entry_abi: Conv::C,
             supports_xray: false,
             small_data_threshold_support: SmallDataThresholdSupport::DefaultForArch,
-            sbf_v3_link_script: None,
         }
     }
 }
@@ -3459,7 +3460,6 @@ impl Target {
         key!(entry_name);
         key!(entry_abi, Conv)?;
         key!(supports_xray, bool);
-        key!(sbf_v3_link_script, optional);
 
         base.update_from_cli();
 
@@ -3736,7 +3736,6 @@ impl ToJson for Target {
         target_option_val!(entry_name);
         target_option_val!(entry_abi);
         target_option_val!(supports_xray);
-        target_option_val!(sbf_v3_link_script);
 
         // Serializing `-Clink-self-contained` needs a dynamic key to support the
         // backwards-compatible variants.
