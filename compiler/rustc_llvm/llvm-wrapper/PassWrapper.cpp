@@ -197,7 +197,7 @@ extern "C" void LLVMRustTimeTraceProfilerFinish(const char *FileName) {
   SUBTARGET_RISCV                                                              \
   SUBTARGET_LOONGARCH                                                          \
   SUBTARGET_BPF                                                                \
-  SUBTARGET_SBF                                                                \
+  SUBTARGET_SBF
 
 #define SUBTARGET(x)                                                           \
   namespace llvm {                                                             \

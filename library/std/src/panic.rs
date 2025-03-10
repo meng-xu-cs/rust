@@ -5,7 +5,6 @@
 use crate::any::Any;
 #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 use crate::sync::atomic::{AtomicU8, Ordering};
-#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 use crate::sync::{Condvar, Mutex, RwLock};
 use crate::thread::Result;
 use crate::{collections, fmt, panicking};
@@ -49,6 +48,7 @@ pub struct PanicHookInfo<'a> {
 }
 
 impl<'a> PanicHookInfo<'a> {
+    #[cfg(not(target_family = "solana"))]
     #[inline]
     pub(crate) fn new(
         location: &'a Location<'a>,

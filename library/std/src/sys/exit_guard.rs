@@ -64,6 +64,7 @@ cfg_if::cfg_if! {
         ///
         /// Mitigation is ***NOT*** implemented on this platform, either because this platform
         /// is not affected, or because mitigation is not yet implemented for this platform.
+        #[cfg(not(target_family = "solana"))]
         #[cfg_attr(any(test, doctest), allow(dead_code))]
         pub(crate) fn unique_thread_exit() {
             // Mitigation not required on platforms where `exit` is thread-safe.

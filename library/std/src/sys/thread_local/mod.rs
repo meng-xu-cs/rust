@@ -28,9 +28,11 @@ cfg_if::cfg_if! {
         all(target_family = "wasm", not(target_feature = "atomics")),
         target_os = "uefi",
         target_os = "zkvm",
+        target_os = "solana",
     ))] {
         mod statik;
         pub use statik::{EagerStorage, LazyStorage, thread_local_inner};
+        #[cfg(not(target_family = "solana"))]
         pub(crate) use statik::{LocalPointer, local_pointer};
     } else if #[cfg(target_thread_local)] {
         mod native;
@@ -113,6 +115,8 @@ pub(crate) mod guard {
         } else if #[cfg(target_os = "solid_asp3")] {
             mod solid;
             pub(crate) use solid::enable;
+        } else if #[cfg(target_os = "solana")] {
+
         } else {
             mod key;
             pub(crate) use key::enable;

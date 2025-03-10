@@ -62,8 +62,7 @@ dependencies = [
 [[package]]
 name = "compiler_builtins"
 version = "0.1.138"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53f0ea7fff95b51f84371588f06062557e96bbe363d2b36218ddb806f3ca8611"
+source = "git+https://github.com/anza-xyz/compiler-builtins?tag=solana-tools-v1.47#bf501f2f0a7d38d6dca6aab067017a288d2bf2dd"
 dependencies = [
  "cc",
  "rustc-std-workspace-core",

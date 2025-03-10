@@ -1434,7 +1434,7 @@ checksum = "c4567c8db10ae91089c99af84c68c38da3ec2f087c3f82960bcdbf3656b6f4d7"
 dependencies = [
  "cfg-if",
  "libc",
- "wasi 0.11.0+wasi-snapshot-preview1",
+ "wasi",
 ]
 
 [[package]]
@@ -2284,7 +2284,7 @@ dependencies = [
  "colored",
  "ctrlc",
  "directories",
- "getrandom 0.2.13",
+ "getrandom",
  "jemalloc-sys",
  "libc",
  "libffi",
@@ -2925,7 +2925,7 @@ version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
- "getrandom 0.2.13",
+ "getrandom",
 ]
 
 [[package]]
@@ -2972,7 +2972,7 @@ version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
 dependencies = [
- "getrandom 0.2.13",
+ "getrandom",
  "libredox",
  "thiserror",
 ]
@@ -3117,9 +3117,8 @@ dependencies = [
 
 [[package]]
 name = "rustc-build-sysroot"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6d984a9db43148467059309bd1e5ad577085162f695d9fe2cf3543aeb25cd38"
+version = "0.5.3"
+source = "git+https://github.com/anza-xyz/rustc-build-sysroot?tag=solana-tools-v1.47#0d6d7ae18aaecf45f0a6e87bcf83b2293263f5bd"
 dependencies = [
  "anyhow",
  "rustc_version",
@@ -5701,7 +5700,7 @@ version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8c5f0a0af699448548ad1a2fbf920fb4bee257eae39953ba95cb84891a0446a"
 dependencies = [
- "getrandom 0.2.13",
+ "getrandom",
 ]
 
 [[package]]
@@ -5731,12 +5730,6 @@ dependencies = [
  "same-file",
  "winapi-util",
 ]
-
-[[package]]
-name = "wasi"
-version = "0.9.0+wasi-snapshot-preview1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cccddf32554fecc6acb585f82a32a72e28b48f8c4c1883ddfeeeaa96f7d8e519"
 
 [[package]]
 name = "wasi"

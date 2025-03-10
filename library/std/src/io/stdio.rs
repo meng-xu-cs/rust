@@ -14,13 +14,16 @@ use crate::panic::{RefUnwindSafe, UnwindSafe};
 #[cfg(not(target_os = "solana"))]
 use crate::io::{self, BorrowedCursor, BufReader, IoSlice, IoSliceMut, LineWriter, Lines, SpecReadByte};
 #[cfg(target_os = "solana")]
-use crate::io::{self, BufReader, IoSlice, IoSliceMut, LineWriter, Lines};
+use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 #[cfg(not(target_family = "solana"))]
 use crate::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_family = "solana"))]
-use crate::sync::{Arc, Mutex, MutexGuard, OnceLock, ReentrantMutex, ReentrantMutexGuard};
+use crate::sync::{Arc, Mutex, MutexGuard, OnceLock, ReentrantLock, ReentrantLockGuard};
+#[cfg(not(target_family = "solana"))]
 use crate::sys::stdio;
 use crate::thread::AccessError;
+#[cfg(target_family = "solana")]
+use crate::sync::{Arc, Mutex};
 
 type LocalStream = Arc<Mutex<Vec<u8>>>;
 
@@ -661,7 +664,7 @@ pub struct Stdout {
     //        stdout (tty or not). Note that if this is not line buffered it
     //        should also flush-on-panic or some form of flush-on-abort.
     #[cfg(not(target_family = "solana"))]
-    inner: &'static ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>,
+    inner: &'static ReentrantLock<RefCell<LineWriter<StdoutRaw>>>,
 }
 
 /// A locked reference to the [`Stdout`] handle.
@@ -694,7 +697,7 @@ pub struct StdoutLock {
 }
 
 #[cfg(not(target_family = "solana"))]
-static STDOUT: OnceLock<ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>> = OnceLock::new();
+static STDOUT: OnceLock<ReentrantLock<RefCell<LineWriter<StdoutRaw>>>> = OnceLock::new();
 
 /// Constructs a new handle to the standard output of the current process.
 ///

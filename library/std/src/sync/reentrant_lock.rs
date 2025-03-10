@@ -8,7 +8,9 @@ use crate::fmt;
 use crate::ops::Deref;
 use crate::panic::{RefUnwindSafe, UnwindSafe};
 use crate::sys::sync as sys;
-use crate::thread::{ThreadId, current_id};
+use crate::thread::ThreadId;
+#[cfg(not(target_family = "solana"))]
+use crate::thread::current_id;
 
 /// A re-entrant mutual exclusion lock
 ///
@@ -97,10 +99,12 @@ cfg_if!(
         struct Tid(AtomicU64);
 
         impl Tid {
+            #[cfg(not(target_family = "solana"))]
             const fn new() -> Self {
                 Self(AtomicU64::new(0))
             }
 
+            #[cfg(not(target_family = "solana"))]
             #[inline]
             fn contains(&self, owner: ThreadId) -> bool {
                 owner.as_u64().get() == self.0.load(Relaxed)

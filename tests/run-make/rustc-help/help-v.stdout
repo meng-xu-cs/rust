@@ -54,6 +54,7 @@ Options:
         --extern NAME[=PATH]
                         Specify where an external rust library is located
         --sysroot PATH  Override the system root
+    -Z FLAG             Set unstable / perma-unstable options
         --error-format human|json|short
                         How errors and other messages are produced
         --json CONFIG   Configure the JSON output of the compiler
@@ -68,6 +69,8 @@ Options:
         --remap-path-prefix FROM=TO
                         Remap source names in all output (compiler messages
                         and output files)
+        --env-set VAR=VALUE
+                        Inject an environment variable
     @path               Read newline separated options from `path`
 
 Additional help:
