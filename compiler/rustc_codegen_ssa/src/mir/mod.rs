@@ -193,6 +193,8 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         mir = tcx.arena.alloc(optimize_use_clone::<Bx>(cx, monomorphized_mir));
     }
 
+    crate::solana::entrypoint(tcx, instance);
+
     let debug_context = cx.create_function_debug_context(instance, fn_abi, llfn, &mir);
 
     let start_llbb = Bx::append_block(cx, llfn, "start");
