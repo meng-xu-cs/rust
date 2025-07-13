@@ -61,6 +61,9 @@ pub mod size_of_val;
 pub mod target_features;
 pub mod traits;
 
+// encapsulates the solana-specific codegen logic
+pub(crate) mod solana;
+
 rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 pub struct ModuleCodegen<M> {
