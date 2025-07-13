@@ -681,7 +681,7 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
     }
 
     // Hijack the process for instrumentation and analysis
-    crate::solana::solanalysis_entrypoint(tcx);
+    crate::solana::entrypoint(tcx);
 
     // Resume the rest of the codegen procedure
     let ongoing_codegen = start_async_codegen(backend.clone(), tcx, target_cpu);
