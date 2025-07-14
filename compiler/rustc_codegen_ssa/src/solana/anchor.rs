@@ -22,7 +22,7 @@ fn collect_instructions(tcx: TyCtxt<'_>) {
                 }
             };
 
-            // an instruction must be an `fn` item
+            // an instruction must be a `fn` item
             if !matches!(instance.def, InstanceKind::Item(_)) {
                 continue;
             }
@@ -35,25 +35,42 @@ fn collect_instructions(tcx: TyCtxt<'_>) {
             // check parameter types
             let sig_decl = tcx.fn_sig(def_id);
             let sig_inst = sig_decl.instantiate(tcx, instance.args);
+            let sig_norm = tcx.instantiate_bound_regions_with_erased(sig_inst);
 
-            let ty = match sig_inst.inputs().iter().next() {
+            let ty_param0 = match sig_norm.inputs().first() {
                 None => continue, // skip if no parameters
-                Some(bounded) => bounded.skip_binder(),
+                Some(ty) => ty,
             };
 
-            match ty.kind() {
+            let ty_state = match ty_param0.kind() {
                 ty::Adt(adt_def, adt_ty_args) => {
-                    if tcx.def_path_str(adt_def.did()) == "anchor_lang::context::Context" {
-                        info!("- found instruction: {}", tcx.def_path_str(instance.def_id()));
+                    // the first parameter of an instruction must be `anchor_lang::context::Context`
+                    if tcx.def_path_str(adt_def.did()) != "anchor_lang::context::Context" {
+                        continue;
                     }
-                    if !adt_ty_args.len() == 1 {
+
+                    // extract the type that represents the state
+                    if adt_ty_args.len() != 1 {
                         bug!(
                             "expect one and only one type argument for anchor_lang::context::Context"
                         );
                     }
+                    adt_ty_args.first().unwrap().expect_ty()
                 }
                 _ => continue, // skip for all non-adt types
             };
+
+            // extract the state type definition
+            match ty_state.kind() {
+                ty::Adt(adt_def, _adt_ty_args) => {
+                    info!(
+                        "- found instruction {} taking state {}",
+                        tcx.def_path_str(instance.def_id()),
+                        tcx.def_path_str(adt_def.did())
+                    );
+                }
+                _ => bug!("expect the state type to be an adt, found: {ty_state}"),
+            }
         }
     }
 }
