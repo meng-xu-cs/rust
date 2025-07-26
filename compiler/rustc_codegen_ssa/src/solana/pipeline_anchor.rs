@@ -8,9 +8,20 @@ use rustc_middle::mir::graphviz::write_mir_fn_graphviz;
 use rustc_middle::mir::pretty::{PrettyPrintMirOptions, write_mir_fn};
 use rustc_middle::ty::{InstanceKind, TyCtxt};
 use rustc_middle::{bug, ty};
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::solana::common::SolanaContext;
+use crate::solana::typing::SolType;
+
+/// Represents an Anchor instruction
+#[derive(Serialize, Deserialize)]
+struct AnchorInstruction {
+    /// name of the instruction
+    name: String,
+    /// type of the state
+    state: SolType,
+}
 
 pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolanaContext, body: &mut Body<'tcx>) {
     info!(
@@ -99,7 +110,7 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolanaContext, body:
     // prepare for output directory
     let instance_outdir = sol.instance_output_dir();
 
-    // dump the MIR to a file
+    // dump the MIR to file
     let mut file_mir = File::create(instance_outdir.join("body.mir"))
         .unwrap_or_else(|e| bug!("[invariant] failed to create MIR file: {e}"));
     write_mir_fn(
@@ -111,7 +122,7 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolanaContext, body:
     )
     .unwrap_or_else(|e| bug!("[invariant] failed to write MIR to file: {e}"));
 
-    // dump the CFG to a file
+    // dump the CFG to file
     let mut file_dot = File::create(instance_outdir.join("body.dot"))
         .unwrap_or_else(|e| bug!("[invariant] failed to create Dot file: {e}"));
     write_mir_fn_graphviz(tcx, body, false, &mut file_dot)
@@ -122,4 +133,15 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolanaContext, body:
         ty::Adt(_adt_def, _adt_ty_args) => {}
         _ => bug!("[assumption] expect the state type to be an adt, found: {ty_state}"),
     }
+
+    // FIXME: fill in other information in the instruction
+    let instruction = AnchorInstruction { name: def_desc, state: SolType::convert(tcx, ty_state) };
+
+    // serialize the instruction to file
+    serde_json::to_writer(
+        File::create(instance_outdir.join("info.json"))
+            .unwrap_or_else(|e| bug!("[invariant] failed to create info.json file: {e}")),
+        &instruction,
+    )
+    .unwrap_or_else(|e| bug!("[invariant] failed to serialize instruction: {e}"));
 }
