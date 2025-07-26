@@ -1,7 +1,6 @@
 use rustc_middle::bug;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) enum SolTypeInt {
@@ -19,8 +18,8 @@ pub(crate) enum SolTypeInt {
     Usize,
 }
 
-impl<'a> From<&'a ty::IntTy> for SolTypeInt {
-    fn from(t: &'a ty::IntTy) -> Self {
+impl From<ty::IntTy> for SolTypeInt {
+    fn from(t: ty::IntTy) -> Self {
         match t {
             ty::IntTy::I8 => Self::I8,
             ty::IntTy::I16 => Self::I16,
@@ -32,8 +31,8 @@ impl<'a> From<&'a ty::IntTy> for SolTypeInt {
     }
 }
 
-impl<'a> From<&'a ty::UintTy> for SolTypeInt {
-    fn from(t: &'a ty::UintTy) -> Self {
+impl From<ty::UintTy> for SolTypeInt {
+    fn from(t: ty::UintTy) -> Self {
         match t {
             ty::UintTy::U8 => Self::U8,
             ty::UintTy::U16 => Self::U16,
@@ -53,8 +52,8 @@ pub(crate) enum SolTypeFloat {
     F128,
 }
 
-impl<'a> From<&'a ty::FloatTy> for SolTypeFloat {
-    fn from(t: &'a ty::FloatTy) -> Self {
+impl From<ty::FloatTy> for SolTypeFloat {
+    fn from(t: ty::FloatTy) -> Self {
         match t {
             ty::FloatTy::F16 => Self::F16,
             ty::FloatTy::F32 => Self::F32,
@@ -75,24 +74,46 @@ pub(crate) enum SolType {
     Tuple(Vec<SolType>),
     Struct {
         name: String,
-        /* FIXME: instantiation */
+        mono: Vec<SolGenericArg>,
         fields: Vec<(String, SolType)>,
     },
     Union {
         name: String,
-        /* FIXME: instantiation */
+        mono: Vec<SolGenericArg>,
         fields: Vec<(String, SolType)>,
     },
     Enum {
         name: String,
-        /* FIXME: instantiation */
+        mono: Vec<SolGenericArg>,
         variants: Vec<(String, Vec<(String, SolType)>)>,
     },
+    Slice(Box<SolType>),
+    ImmRef(Box<SolType>),
+    MutRef(Box<SolType>),
+    ImmPtr(Box<SolType>),
+    MutPtr(Box<SolType>),
+    Function {
+        name: String,
+        mono: Vec<SolGenericArg>,
+        /* FIXME: entire function definition here */
+    },
+    Closure {
+        name: String,
+        mono: Vec<SolGenericArg>,
+        /* FIXME: entire closure definition here */
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum SolGenericArg {
+    Type(SolType),
+    Const(usize),
+    Lifetime,
 }
 
 impl SolType {
     pub(crate) fn convert<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Self {
-        match ty.kind() {
+        match *ty.kind() {
             ty::Bool => Self::Bool,
             ty::Char => Self::Char,
             ty::Int(t) => Self::Int(t.into()),
@@ -100,58 +121,95 @@ impl SolType {
             ty::Float(t) => Self::Float(t.into()),
             ty::Str => Self::Str,
             ty::Array(sub_ty, size_const) => Self::Array(
-                Box::new(Self::convert(tcx, *sub_ty)),
+                Box::new(Self::convert(tcx, sub_ty)),
                 size_const.try_to_target_usize(tcx).unwrap_or_else(|| {
                     bug!("[assumption] unexpected non-constant array size {size_const}");
                 }) as usize,
             ),
             ty::Tuple(tys) => Self::Tuple(tys.iter().map(|t| Self::convert(tcx, t)).collect()),
-            ty::Adt(adt_def, adt_args) => match adt_def.adt_kind() {
-                ty::AdtKind::Struct => Self::Struct {
-                    name: tcx.def_path_str(adt_def.did()),
-                    fields: adt_def
-                        .all_fields()
-                        .map(|field| {
-                            (field.name.to_string(), Self::convert(tcx, field.ty(tcx, adt_args)))
-                        })
-                        .collect(),
-                    // FIXME: instantiations
-                },
-                ty::AdtKind::Union => Self::Union {
-                    name: tcx.def_path_str(adt_def.did()),
-                    fields: adt_def
-                        .all_fields()
-                        .map(|field| {
-                            (field.name.to_string(), Self::convert(tcx, field.ty(tcx, adt_args)))
-                        })
-                        .collect(),
-                    // FIXME: instantiations
-                },
-                ty::AdtKind::Enum => Self::Enum {
-                    name: tcx.def_path_str(adt_def.did()),
-                    variants: adt_def
-                        .variants()
-                        .iter()
-                        .map(|variant| {
-                            (
-                                variant.name.to_string(),
-                                variant
-                                    .fields
-                                    .iter()
-                                    .map(|field| {
-                                        (
-                                            field.name.to_string(),
-                                            Self::convert(tcx, field.ty(tcx, adt_args)),
-                                        )
-                                    })
-                                    .collect(),
-                            )
-                        })
-                        .collect(),
-                },
+            ty::Adt(adt_def, adt_args) => {
+                let mono = adt_args.iter().map(|arg| SolGenericArg::convert(tcx, arg)).collect();
+                match adt_def.adt_kind() {
+                    ty::AdtKind::Struct => Self::Struct {
+                        name: tcx.def_path_str(adt_def.did()),
+                        mono,
+                        fields: adt_def
+                            .all_fields()
+                            .map(|field| {
+                                (
+                                    field.name.to_string(),
+                                    Self::convert(tcx, field.ty(tcx, adt_args)),
+                                )
+                            })
+                            .collect(),
+                    },
+                    ty::AdtKind::Union => Self::Union {
+                        name: tcx.def_path_str(adt_def.did()),
+                        mono,
+                        fields: adt_def
+                            .all_fields()
+                            .map(|field| {
+                                (
+                                    field.name.to_string(),
+                                    Self::convert(tcx, field.ty(tcx, adt_args)),
+                                )
+                            })
+                            .collect(),
+                    },
+                    ty::AdtKind::Enum => Self::Enum {
+                        name: tcx.def_path_str(adt_def.did()),
+                        mono,
+                        variants: adt_def
+                            .variants()
+                            .iter()
+                            .map(|variant| {
+                                (
+                                    variant.name.to_string(),
+                                    variant
+                                        .fields
+                                        .iter()
+                                        .map(|field| {
+                                            (
+                                                field.name.to_string(),
+                                                Self::convert(tcx, field.ty(tcx, adt_args)),
+                                            )
+                                        })
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                    },
+                }
+            }
+            ty::Slice(sub_ty) => Self::Slice(Box::new(Self::convert(tcx, sub_ty))),
+            ty::Ref(_, sub_ty, mutability) => match mutability {
+                ty::Mutability::Mut => Self::MutPtr(Box::new(Self::convert(tcx, sub_ty))),
+                ty::Mutability::Not => Self::ImmPtr(Box::new(Self::convert(tcx, sub_ty))),
             },
+            ty::RawPtr(sub_ty, mutability) => match mutability {
+                ty::Mutability::Mut => Self::MutPtr(Box::new(Self::convert(tcx, sub_ty))),
+                ty::Mutability::Not => Self::ImmPtr(Box::new(Self::convert(tcx, sub_ty))),
+            },
+            ty::FnDef(def_id, fn_ty_args) => {
+                let mono = fn_ty_args.iter().map(|arg| SolGenericArg::convert(tcx, arg)).collect();
+                Self::Function { name: tcx.def_path_str(def_id), mono }
+            }
+            ty::Closure(def_id, closure_ty_args) => {
+                let mono =
+                    closure_ty_args.iter().map(|arg| SolGenericArg::convert(tcx, arg)).collect();
+                Self::Closure { name: tcx.def_path_str(def_id), mono }
+            }
+            ty::Pat(..) => {
+                bug!("[unsupported] pattern type: {ty}");
+            }
+            ty::Dynamic(..) => {
+                bug!("[unsupported] dynamic (dyn trait) type: {ty}");
+            }
             ty::Coroutine(..) | ty::CoroutineClosure(..) | ty::CoroutineWitness(..) => {
                 bug!("[unsupported] coroutine-related type: {ty}");
+            }
+            ty::FnPtr(..) => {
+                bug!("[assumption] unexpected function pointer type: {ty}");
             }
             ty::Foreign(..) => {
                 bug!("[assumption] unexpected foreign type {ty}");
@@ -160,15 +218,26 @@ impl SolType {
                 bug!("[assumption] unexpected alias type {ty}");
             }
             ty::Param(..) | ty::Bound(..) | ty::UnsafeBinder(..) => {
-                bug!("[assumption] unexpected generic type: {ty}");
+                bug!("[invariant] unexpected generic type: {ty}");
             }
             ty::Never | ty::Infer(..) | ty::Placeholder(..) | ty::Error(..) => {
                 bug!("[invariant] unexpected type used in type analysis: {ty}");
             }
-            _ => {
-                warn!("Unsupported type for SolType: {ty}");
-                Self::Bool
+        }
+    }
+}
+
+impl SolGenericArg {
+    pub(crate) fn convert<'tcx>(tcx: TyCtxt<'tcx>, arg: ty::GenericArg<'tcx>) -> Self {
+        match arg.kind() {
+            ty::GenericArgKind::Type(ty) => Self::Type(SolType::convert(tcx, ty)),
+            ty::GenericArgKind::Const(c) => {
+                let size = c.try_to_target_usize(tcx).unwrap_or_else(|| {
+                    bug!("[assumption] unexpected non-integer generic argument {c}");
+                });
+                Self::Const(size as usize)
             }
+            ty::GenericArgKind::Lifetime(_) => Self::Lifetime,
         }
     }
 }
