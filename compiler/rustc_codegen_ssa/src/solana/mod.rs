@@ -1,6 +1,8 @@
 use rustc_middle::ty::{self, Instance, TyCtxt};
 
 pub(crate) mod common;
+pub(crate) mod typing;
+
 pub(crate) mod pipeline_anchor;
 
 /// Entrypoint for the solana-specific codegen logic
@@ -10,6 +12,7 @@ pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
         Some(ctxt) => ctxt,
     };
 
+    // convert the instance to monomorphised MIR
     let instance_mir = tcx.instance_mir(instance.def).clone();
     let mut monomorphised_mir = instance.instantiate_mir_and_normalize_erasing_regions(
         tcx,
@@ -17,6 +20,7 @@ pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
         ty::EarlyBinder::bind(instance_mir),
     );
 
+    // work on the monomorphised MIR
     match sol.build_system {
         common::BuildSystem::Anchor => match sol.phase {
             common::Phase::Bootstrap => {
