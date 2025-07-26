@@ -138,7 +138,7 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolanaContext, body:
     let instruction = AnchorInstruction { name: def_desc, state: SolType::convert(tcx, ty_state) };
 
     // serialize the instruction to file
-    serde_json::to_writer(
+    serde_json::to_writer_pretty(
         File::create(instance_outdir.join("info.json"))
             .unwrap_or_else(|e| bug!("[invariant] failed to create info.json file: {e}")),
         &instruction,
