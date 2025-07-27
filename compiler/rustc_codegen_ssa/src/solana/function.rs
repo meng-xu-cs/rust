@@ -2,7 +2,8 @@ use rustc_middle::bug;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::{
     AggregateKind, BinOp, BorrowKind, CastKind, Const, ConstValue, MirPhase, NullOp, Operand,
-    Place, ProjectionElem, RawPtrKind, RuntimePhase, Rvalue, StatementKind, UnOp,
+    Place, ProjectionElem, RawPtrKind, RuntimePhase, Rvalue, StatementKind, TerminatorKind, UnOp,
+    UnwindAction,
 };
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,7 @@ pub(crate) struct SolFunc {
 pub(crate) struct SolBasicBlock {
     index: usize,
     stmts: Vec<SolStatement>,
+    terminator: SolTerminator,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -35,6 +37,16 @@ pub(crate) enum SolStatement {
     PlaceMention(SolPlace),
     Assign { lhs: SolPlace, rhs: SolExpression },
     SetDiscriminant { place: SolPlace, variant: usize },
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum SolTerminator {
+    Goto { target: usize },
+    Switch { cond: SolOperand, targets: Vec<(u128, usize)>, default: usize },
+    Return,
+    Unreachable,
+    Drop { place: SolPlace, target: usize },
+    Assert { cond: SolOperand, expected: bool, target: usize },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -265,10 +277,76 @@ impl SolFunc {
                 statements.push(converted);
             }
 
-            // FIXME: process terminator
+            // process terminator
+            let terminator = block_data.terminator();
+            let term = match &terminator.kind {
+                TerminatorKind::Goto { target } => SolTerminator::Goto { target: target.index() },
+                TerminatorKind::SwitchInt { discr, targets } => {
+                    let mut target_pairs = vec![];
+                    for &value in targets.all_values() {
+                        target_pairs
+                            .push((value.get(), targets.target_for_value(value.get()).index()));
+                    }
+                    SolTerminator::Switch {
+                        cond: SolOperand::convert(tcx, depth.next(), discr),
+                        targets: target_pairs,
+                        default: targets.otherwise().index(),
+                    }
+                }
+                TerminatorKind::Return => SolTerminator::Return,
+                TerminatorKind::Unreachable => SolTerminator::Unreachable,
+                TerminatorKind::Drop { place, target, unwind, replace: _, drop, async_fut } => {
+                    if drop.is_some() || async_fut.is_some() {
+                        bug!("[invariant] unexpected async features in drop terminator");
+                    }
+                    if !matches!(unwind, UnwindAction::Unreachable | UnwindAction::Terminate(..)) {
+                        bug!("[assumption] unexpected unwind action in drop terminator");
+                    }
+                    SolTerminator::Drop {
+                        place: SolPlace::convert(tcx, depth.next(), *place),
+                        target: target.index(),
+                    }
+                }
+                TerminatorKind::Assert { cond, expected, msg: _, target, unwind } => {
+                    if !matches!(unwind, UnwindAction::Unreachable | UnwindAction::Terminate(..)) {
+                        bug!("[assumption] unexpected unwind action in assert terminator");
+                    }
+                    SolTerminator::Assert {
+                        cond: SolOperand::convert(tcx, depth.next(), cond),
+                        expected: *expected,
+                        target: target.index(),
+                    }
+                }
+                TerminatorKind::Call { .. } => {
+                    // FIXME
+                    bug!("FIXME: call");
+                }
+                TerminatorKind::TailCall { .. } => {
+                    // FIXME
+                    bug!("FIXME: call");
+                }
+                TerminatorKind::InlineAsm { .. } => {
+                    bug!("[unsupported] inline assembly in function {def_desc}");
+                }
+                TerminatorKind::UnwindResume | TerminatorKind::UnwindTerminate(..) => {
+                    bug!(
+                        "[assumption] unexpected unwind-related terminator in function {def_desc}"
+                    );
+                }
+                TerminatorKind::Yield { .. } | TerminatorKind::CoroutineDrop => {
+                    bug!("[assumption] unexpected async-related terminator in function {def_desc}");
+                }
+                TerminatorKind::FalseEdge { .. } | TerminatorKind::FalseUnwind { .. } => {
+                    bug!("[invariant] unexpected false terminator in function {def_desc}");
+                }
+            };
 
             // pack information
-            blocks.push(SolBasicBlock { index: block_id.index(), stmts: statements });
+            blocks.push(SolBasicBlock {
+                index: block_id.index(),
+                stmts: statements,
+                terminator: term,
+            });
         }
 
         // mark end
