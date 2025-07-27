@@ -5,7 +5,7 @@ use rustc_middle::ty::{Instance, InstanceKind, TyCtxt};
 use rustc_middle::{bug, ty};
 use tracing::{info, warn};
 
-use crate::solana::common::SolanaContext;
+use crate::solana::common::{Depth, SolanaContext};
 use crate::solana::function::SolFunc;
 
 pub(crate) fn phase_bootstrap<'tcx>(
@@ -103,5 +103,5 @@ pub(crate) fn phase_bootstrap<'tcx>(
 
     // output to directory
     warn!("- found instruction {def_desc} with argument {ty_state}");
-    sol.save_instance_info(tcx, body, &SolFunc::convert(tcx, instance));
+    sol.save_instance_info(tcx, body, &SolFunc::convert(tcx, Depth::new(), instance));
 }

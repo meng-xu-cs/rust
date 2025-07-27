@@ -182,3 +182,23 @@ impl SolanaContext {
         .unwrap_or_else(|e| bug!("[invariant] failed to serialize information: {e}"));
     }
 }
+
+pub(crate) struct Depth {
+    level: usize,
+}
+
+impl Depth {
+    pub(crate) fn new() -> Self {
+        Self { level: 0 }
+    }
+
+    pub(crate) fn next(&self) -> Self {
+        Self { level: self.level + 1 }
+    }
+}
+
+impl Display for Depth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", "  ".repeat(self.level))
+    }
+}
