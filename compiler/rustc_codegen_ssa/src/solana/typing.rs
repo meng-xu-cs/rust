@@ -2,6 +2,8 @@ use rustc_middle::bug;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use serde::{Deserialize, Serialize};
 
+use crate::solana::ident::Ident;
+
 #[derive(Serialize, Deserialize)]
 pub(crate) enum SolTypeInt {
     I8,
@@ -73,17 +75,17 @@ pub(crate) enum SolType {
     Array(Box<SolType>, usize),
     Tuple(Vec<SolType>),
     Struct {
-        name: String,
+        name: Ident,
         mono: Vec<SolGenericArg>,
         fields: Vec<(String, SolType)>,
     },
     Union {
-        name: String,
+        name: Ident,
         mono: Vec<SolGenericArg>,
         fields: Vec<(String, SolType)>,
     },
     Enum {
-        name: String,
+        name: Ident,
         mono: Vec<SolGenericArg>,
         variants: Vec<(String, Vec<(String, SolType)>)>,
     },
@@ -93,12 +95,12 @@ pub(crate) enum SolType {
     ImmPtr(Box<SolType>),
     MutPtr(Box<SolType>),
     Function {
-        name: String,
+        name: Ident,
         mono: Vec<SolGenericArg>,
         /* FIXME: entire function definition here */
     },
     Closure {
-        name: String,
+        name: Ident,
         mono: Vec<SolGenericArg>,
         /* FIXME: entire closure definition here */
     },
@@ -128,10 +130,11 @@ impl SolType {
             ),
             ty::Tuple(tys) => Self::Tuple(tys.iter().map(|t| Self::convert(tcx, t)).collect()),
             ty::Adt(adt_def, adt_args) => {
+                let name = Ident::new(tcx, adt_def.did());
                 let mono = adt_args.iter().map(|arg| SolGenericArg::convert(tcx, arg)).collect();
                 match adt_def.adt_kind() {
                     ty::AdtKind::Struct => Self::Struct {
-                        name: tcx.def_path_str(adt_def.did()),
+                        name,
                         mono,
                         fields: adt_def
                             .all_fields()
@@ -144,7 +147,7 @@ impl SolType {
                             .collect(),
                     },
                     ty::AdtKind::Union => Self::Union {
-                        name: tcx.def_path_str(adt_def.did()),
+                        name,
                         mono,
                         fields: adt_def
                             .all_fields()
@@ -157,7 +160,7 @@ impl SolType {
                             .collect(),
                     },
                     ty::AdtKind::Enum => Self::Enum {
-                        name: tcx.def_path_str(adt_def.did()),
+                        name,
                         mono,
                         variants: adt_def
                             .variants()
@@ -192,12 +195,12 @@ impl SolType {
             },
             ty::FnDef(def_id, fn_ty_args) => {
                 let mono = fn_ty_args.iter().map(|arg| SolGenericArg::convert(tcx, arg)).collect();
-                Self::Function { name: tcx.def_path_str(def_id), mono }
+                Self::Function { name: Ident::new(tcx, def_id), mono }
             }
             ty::Closure(def_id, closure_ty_args) => {
                 let mono =
                     closure_ty_args.iter().map(|arg| SolGenericArg::convert(tcx, arg)).collect();
-                Self::Closure { name: tcx.def_path_str(def_id), mono }
+                Self::Closure { name: Ident::new(tcx, def_id), mono }
             }
             ty::Pat(..) => {
                 bug!("[unsupported] pattern type: {ty}");
