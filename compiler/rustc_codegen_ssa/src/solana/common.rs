@@ -183,6 +183,7 @@ impl SolanaContext {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct Depth {
     level: usize,
 }
