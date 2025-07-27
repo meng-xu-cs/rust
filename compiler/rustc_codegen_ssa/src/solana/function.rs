@@ -61,10 +61,22 @@ pub(crate) struct SolScalar {
 }
 
 #[derive(Serialize, Deserialize)]
+pub(crate) enum SolConst {
+    ZeroSized,
+    Scalar(SolScalar),
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SolTypedConst {
+    ty: SolType,
+    const_: SolConst,
+}
+
+#[derive(Serialize, Deserialize)]
 pub(crate) enum SolOperand {
     Copy(SolPlace),
     Move(SolPlace),
-    Constant(SolScalar),
+    Constant(SolTypedConst),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -253,6 +265,8 @@ impl SolFunc {
                 statements.push(converted);
             }
 
+            // FIXME: process terminator
+
             // pack information
             blocks.push(SolBasicBlock { index: block_id.index(), stmts: statements });
         }
@@ -307,24 +321,25 @@ impl SolPlace {
     }
 }
 
-impl SolScalar {
-    // NOTE: intentionally left _tcx and _depth unused for future extensibility
-    pub(crate) fn convert<'tcx>(_tcx: TyCtxt<'tcx>, _depth: Depth, const_: Const<'tcx>) -> Self {
+impl SolTypedConst {
+    pub(crate) fn convert<'tcx>(tcx: TyCtxt<'tcx>, depth: Depth, const_: Const<'tcx>) -> Self {
         match const_ {
             Const::Val(value, ty) => {
-                if !matches!(
-                    ty.kind(),
-                    ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_)
-                ) {
-                    bug!("[assumption] unexpected non-scalar type in scalar conversion: {ty}");
-                }
-                let scalar = match value {
-                    ConstValue::Scalar(Scalar::Int(scalar)) => scalar,
-                    _ => {
-                        bug!("[assumption] unexpected constant in scalar conversion: {const_}");
+                let converted_ty = SolType::convert(tcx, depth, ty);
+                let converted_const = match value {
+                    ConstValue::Scalar(Scalar::Int(scalar)) => SolConst::Scalar(SolScalar {
+                        bits: scalar.size().bits_usize(),
+                        value: scalar.to_bits_unchecked(),
+                    }),
+                    ConstValue::Scalar(Scalar::Ptr(..)) => {
+                        bug!("[assumption] unexpected pointer scalar: {const_}");
+                    }
+                    ConstValue::ZeroSized => SolConst::ZeroSized,
+                    ConstValue::Slice { .. } | ConstValue::Indirect { .. } => {
+                        bug!("[assumption] unexpected constant kind: {const_}");
                     }
                 };
-                Self { bits: scalar.size().bits_usize(), value: scalar.to_bits_unchecked() }
+                Self { ty: converted_ty, const_: converted_const }
             }
             Const::Unevaluated(..) => {
                 bug!("[assumption] unexpected unevaluated constant in scalar conversion: {const_}");
@@ -341,7 +356,9 @@ impl SolOperand {
         match operand {
             Operand::Copy(place) => Self::Copy(SolPlace::convert(tcx, depth, *place)),
             Operand::Move(place) => Self::Move(SolPlace::convert(tcx, depth, *place)),
-            Operand::Constant(cval) => Self::Constant(SolScalar::convert(tcx, depth, cval.const_)),
+            Operand::Constant(cval) => {
+                Self::Constant(SolTypedConst::convert(tcx, depth, cval.const_))
+            }
         }
     }
 }
