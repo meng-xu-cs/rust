@@ -1,7 +1,9 @@
 use rustc_middle::bug;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypingEnv};
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
+use crate::solana::common::Depth;
 use crate::solana::ident::Ident;
 
 #[derive(Serialize, Deserialize)]
@@ -114,92 +116,127 @@ pub(crate) enum SolGenericArg {
 }
 
 impl SolType {
-    pub(crate) fn convert<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Self {
-        match *ty.kind() {
+    pub(crate) fn convert<'tcx>(tcx: TyCtxt<'tcx>, depth: Depth, ty: Ty<'tcx>) -> Self {
+        // mark start
+        info!("{depth}-> type {ty}");
+
+        // force normalize the type due to lazy normalization (this is needed for at least associated types)
+        let normalized_ty = tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
+        info!("{depth}-- normalized to {normalized_ty}");
+
+        // switch by type kind
+        let converted = match *normalized_ty.kind() {
             ty::Bool => Self::Bool,
             ty::Char => Self::Char,
             ty::Int(t) => Self::Int(t.into()),
             ty::Uint(t) => Self::Int(t.into()),
             ty::Float(t) => Self::Float(t.into()),
             ty::Str => Self::Str,
-            ty::Array(sub_ty, size_const) => Self::Array(
-                Box::new(Self::convert(tcx, sub_ty)),
-                size_const.try_to_target_usize(tcx).unwrap_or_else(|| {
-                    bug!("[assumption] unexpected non-constant array size {size_const}");
-                }) as usize,
-            ),
-            ty::Tuple(tys) => Self::Tuple(tys.iter().map(|t| Self::convert(tcx, t)).collect()),
+            ty::Array(sub_ty, size_const) => {
+                info!("{depth}-- array element type");
+                Self::Array(
+                    Box::new(Self::convert(tcx, depth.next(), sub_ty)),
+                    size_const.try_to_target_usize(tcx).unwrap_or_else(|| {
+                        bug!("[assumption] unexpected non-constant array size {size_const}");
+                    }) as usize,
+                )
+            }
+            ty::Tuple(tys) => {
+                let mut elem_tys = vec![];
+                for (i, t) in tys.iter().enumerate() {
+                    info!("{depth}-- tuple element {i}: {t}");
+                    elem_tys.push(Self::convert(tcx, depth.next(), t));
+                }
+                Self::Tuple(elem_tys)
+            }
             ty::Adt(adt_def, adt_args) => {
                 let name = Ident::new(tcx, adt_def.did());
-                let mono = adt_args.iter().map(|arg| SolGenericArg::convert(tcx, arg)).collect();
+                let mut mono = vec![];
+                for (i, arg) in adt_args.iter().enumerate() {
+                    info!("{depth}-- adt type argument {i}: {arg}");
+                    mono.push(SolGenericArg::convert(tcx, depth.next(), arg));
+                }
                 match adt_def.adt_kind() {
-                    ty::AdtKind::Struct => Self::Struct {
-                        name,
-                        mono,
-                        fields: adt_def
-                            .all_fields()
-                            .map(|field| {
-                                (
+                    ty::AdtKind::Struct => {
+                        let mut fields = vec![];
+                        for (i, field) in adt_def.all_fields().enumerate() {
+                            info!("{depth}-- struct field {i}: {}", field.name);
+                            fields.push((
+                                field.name.to_string(),
+                                Self::convert(tcx, depth.next(), field.ty(tcx, adt_args)),
+                            ));
+                        }
+                        Self::Struct { name, mono, fields }
+                    }
+                    ty::AdtKind::Union => {
+                        let mut fields = vec![];
+                        for (i, field) in adt_def.all_fields().enumerate() {
+                            info!("{depth}-- union field {i}: {}", field.name);
+                            fields.push((
+                                field.name.to_string(),
+                                Self::convert(tcx, depth.next(), field.ty(tcx, adt_args)),
+                            ));
+                        }
+                        Self::Union { name, mono, fields }
+                    }
+                    ty::AdtKind::Enum => {
+                        let mut variants = vec![];
+                        for (i, variant) in adt_def.variants().iter().enumerate() {
+                            info!("{depth}-- enum variant {i}: {}", variant.name);
+                            let mut fields = vec![];
+                            for (j, field) in variant.fields.iter().enumerate() {
+                                info!("{depth}-- variant field {j}: {}", field.name);
+                                fields.push((
                                     field.name.to_string(),
-                                    Self::convert(tcx, field.ty(tcx, adt_args)),
-                                )
-                            })
-                            .collect(),
-                    },
-                    ty::AdtKind::Union => Self::Union {
-                        name,
-                        mono,
-                        fields: adt_def
-                            .all_fields()
-                            .map(|field| {
-                                (
-                                    field.name.to_string(),
-                                    Self::convert(tcx, field.ty(tcx, adt_args)),
-                                )
-                            })
-                            .collect(),
-                    },
-                    ty::AdtKind::Enum => Self::Enum {
-                        name,
-                        mono,
-                        variants: adt_def
-                            .variants()
-                            .iter()
-                            .map(|variant| {
-                                (
-                                    variant.name.to_string(),
-                                    variant
-                                        .fields
-                                        .iter()
-                                        .map(|field| {
-                                            (
-                                                field.name.to_string(),
-                                                Self::convert(tcx, field.ty(tcx, adt_args)),
-                                            )
-                                        })
-                                        .collect(),
-                                )
-                            })
-                            .collect(),
-                    },
+                                    Self::convert(tcx, depth.next(), field.ty(tcx, adt_args)),
+                                ));
+                            }
+                            variants.push((variant.name.to_string(), fields));
+                        }
+                        Self::Enum { name, mono, variants }
+                    }
                 }
             }
-            ty::Slice(sub_ty) => Self::Slice(Box::new(Self::convert(tcx, sub_ty))),
-            ty::Ref(_, sub_ty, mutability) => match mutability {
-                ty::Mutability::Mut => Self::MutPtr(Box::new(Self::convert(tcx, sub_ty))),
-                ty::Mutability::Not => Self::ImmPtr(Box::new(Self::convert(tcx, sub_ty))),
-            },
-            ty::RawPtr(sub_ty, mutability) => match mutability {
-                ty::Mutability::Mut => Self::MutPtr(Box::new(Self::convert(tcx, sub_ty))),
-                ty::Mutability::Not => Self::ImmPtr(Box::new(Self::convert(tcx, sub_ty))),
-            },
+            ty::Slice(sub_ty) => {
+                info!("{depth}-- slice element type");
+                Self::Slice(Box::new(Self::convert(tcx, depth.next(), sub_ty)))
+            }
+            ty::Ref(_, sub_ty, mutability) => {
+                info!("{depth}-- ref inner type");
+                match mutability {
+                    ty::Mutability::Mut => {
+                        Self::MutPtr(Box::new(Self::convert(tcx, depth.next(), sub_ty)))
+                    }
+                    ty::Mutability::Not => {
+                        Self::ImmPtr(Box::new(Self::convert(tcx, depth.next(), sub_ty)))
+                    }
+                }
+            }
+            ty::RawPtr(sub_ty, mutability) => {
+                info!("{depth}-- ptr inner type");
+                match mutability {
+                    ty::Mutability::Mut => {
+                        Self::MutPtr(Box::new(Self::convert(tcx, depth.next(), sub_ty)))
+                    }
+                    ty::Mutability::Not => {
+                        Self::ImmPtr(Box::new(Self::convert(tcx, depth.next(), sub_ty)))
+                    }
+                }
+            }
             ty::FnDef(def_id, fn_ty_args) => {
-                let mono = fn_ty_args.iter().map(|arg| SolGenericArg::convert(tcx, arg)).collect();
+                // FIXME: resolve to an instance
+                let mono = fn_ty_args
+                    .iter()
+                    .map(|arg| SolGenericArg::convert(tcx, depth.next(), arg))
+                    .collect();
                 Self::Function { name: Ident::new(tcx, def_id), mono }
             }
             ty::Closure(def_id, closure_ty_args) => {
-                let mono =
-                    closure_ty_args.iter().map(|arg| SolGenericArg::convert(tcx, arg)).collect();
+                // FIXME: resolve to an instance
+                let mono = closure_ty_args
+                    .iter()
+                    .map(|arg| SolGenericArg::convert(tcx, depth.next(), arg))
+                    .collect();
                 Self::Closure { name: Ident::new(tcx, def_id), mono }
             }
             ty::Pat(..) => {
@@ -218,7 +255,7 @@ impl SolType {
                 bug!("[assumption] unexpected foreign type {ty}");
             }
             ty::Alias(..) => {
-                bug!("[assumption] unexpected alias type {ty}");
+                bug!("[invariant] unexpected alias type {ty}");
             }
             ty::Param(..) | ty::Bound(..) | ty::UnsafeBinder(..) => {
                 bug!("[invariant] unexpected generic type: {ty}");
@@ -226,14 +263,24 @@ impl SolType {
             ty::Never | ty::Infer(..) | ty::Placeholder(..) | ty::Error(..) => {
                 bug!("[invariant] unexpected type used in type analysis: {ty}");
             }
-        }
+        };
+
+        // mark end
+        info!("{depth}<- type {ty}");
+
+        // done
+        converted
     }
 }
 
 impl SolGenericArg {
-    pub(crate) fn convert<'tcx>(tcx: TyCtxt<'tcx>, arg: ty::GenericArg<'tcx>) -> Self {
+    pub(crate) fn convert<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        depth: Depth,
+        arg: ty::GenericArg<'tcx>,
+    ) -> Self {
         match arg.kind() {
-            ty::GenericArgKind::Type(ty) => Self::Type(SolType::convert(tcx, ty)),
+            ty::GenericArgKind::Type(ty) => Self::Type(SolType::convert(tcx, depth, ty)),
             ty::GenericArgKind::Const(c) => {
                 let size = c.try_to_target_usize(tcx).unwrap_or_else(|| {
                     bug!("[assumption] unexpected non-integer generic argument {c}");
