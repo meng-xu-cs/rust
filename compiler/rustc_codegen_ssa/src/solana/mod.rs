@@ -1,6 +1,8 @@
+use rustc_middle::mir::{MirPhase, RuntimePhase};
 use rustc_middle::ty::{self, Instance, TyCtxt};
 
 pub(crate) mod common;
+pub(crate) mod ident;
 pub(crate) mod typing;
 
 pub(crate) mod pipeline_anchor;
@@ -12,12 +14,17 @@ pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
         Some(ctxt) => ctxt,
     };
 
+    // skip shims and other non-user defined items
+    let instance_mir = tcx.instance_mir(instance.def);
+    if !matches!(instance_mir.phase, MirPhase::Runtime(RuntimePhase::Optimized)) {
+        return;
+    }
+
     // convert the instance to monomorphised MIR
-    let instance_mir = tcx.instance_mir(instance.def).clone();
     let mut monomorphised_mir = instance.instantiate_mir_and_normalize_erasing_regions(
         tcx,
-        ty::TypingEnv::fully_monomorphized(),
-        ty::EarlyBinder::bind(instance_mir),
+        instance_mir.typing_env(tcx),
+        ty::EarlyBinder::bind(instance_mir.clone()),
     );
 
     // work on the monomorphised MIR
