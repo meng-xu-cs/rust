@@ -1,6 +1,10 @@
 use rustc_middle::bug;
-use rustc_middle::mir::{MirPhase, Place, ProjectionElem, RuntimePhase, StatementKind};
-use rustc_middle::ty::{self, Instance, TyCtxt};
+use rustc_middle::mir::interpret::Scalar;
+use rustc_middle::mir::{
+    AggregateKind, BinOp, BorrowKind, CastKind, Const, ConstValue, MirPhase, NullOp, Operand,
+    Place, ProjectionElem, RawPtrKind, RuntimePhase, Rvalue, StatementKind, UnOp,
+};
+use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -29,7 +33,7 @@ pub(crate) enum SolStatement {
     StorageLive(usize),
     StorageDead(usize),
     PlaceMention(SolPlace),
-    Assign { lhs: SolPlace /* FIXME: RHS */ },
+    Assign { lhs: SolPlace, rhs: SolExpression },
     SetDiscriminant { place: SolPlace, variant: usize },
 }
 
@@ -48,6 +52,90 @@ pub(crate) enum SolProjection {
 pub(crate) struct SolPlace {
     local: usize,
     projection: Vec<SolProjection>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SolScalar {
+    bits: usize,
+    value: u128,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum SolOperand {
+    Copy(SolPlace),
+    Move(SolPlace),
+    Constant(SolScalar),
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum SolCastKind {
+    IntToInt,
+    FloatToFloat,
+    IntToFloat,
+    FloatToInt,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum SolExpression {
+    Use(SolOperand),
+    Repeat(SolOperand, usize),
+    BorrowImm(SolPlace),
+    BorrowMut(SolPlace),
+    PointerImm(SolPlace),
+    PointerMut(SolPlace),
+    Length(SolPlace),
+    Cast { kind: SolCastKind, place: SolOperand, ty: SolType },
+    OpNullary { opcode: SolOpcodeNullary, ty: SolType },
+    OpUnary { opcode: SolOpcodeUnary, operand: SolOperand },
+    OpBinary { opcode: SolOpcodeBinary, v1: SolOperand, v2: SolOperand },
+    Discriminant(SolPlace),
+    Aggregate { opcode: SolOpcodeAggregate, values: Vec<(usize, SolOperand)> },
+    Load(SolPlace),
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum SolOpcodeNullary {
+    SizeOf,
+    AlignOf,
+    OffsetOf(Vec<(usize, usize)>),
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum SolOpcodeUnary {
+    SizeOf,
+    Not,
+    Neg,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum SolOpcodeBinary {
+    Add(bool),
+    Sub(bool),
+    Mul(bool),
+    Div(bool),
+    Rem(bool),
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Cmp,
+    Offset,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum SolOpcodeAggregate {
+    Tuple,
+    Array(SolType /* element type */),
+    Struct { ty: SolType },
+    Union { ty: SolType, field: usize },
+    Enum { ty: SolType, variant: usize },
 }
 
 impl SolFunc {
@@ -120,10 +208,10 @@ impl SolFunc {
                 let converted = match &stmt.kind {
                     // assign
                     StatementKind::Assign(assignment) => {
-                        let (place, _value) = assignment.as_ref();
-                        // FIXME: rvalue
+                        let (place, value) = assignment.as_ref();
                         SolStatement::Assign {
                             lhs: SolPlace::convert(tcx, stmt_depth.next(), *place),
+                            rhs: SolExpression::convert(tcx, stmt_depth.next(), value),
                         }
                     }
                     StatementKind::SetDiscriminant { place, variant_index } => {
@@ -216,5 +304,233 @@ impl SolPlace {
             .collect();
 
         Self { local, projection }
+    }
+}
+
+impl SolScalar {
+    // NOTE: intentionally left _tcx and _depth unused for future extensibility
+    pub(crate) fn convert<'tcx>(_tcx: TyCtxt<'tcx>, _depth: Depth, const_: Const<'tcx>) -> Self {
+        match const_ {
+            Const::Val(value, ty) => {
+                if !matches!(
+                    ty.kind(),
+                    ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_)
+                ) {
+                    bug!("[assumption] unexpected non-scalar type in scalar conversion: {ty}");
+                }
+                let scalar = match value {
+                    ConstValue::Scalar(Scalar::Int(scalar)) => scalar,
+                    _ => {
+                        bug!("[assumption] unexpected constant in scalar conversion: {const_}");
+                    }
+                };
+                Self { bits: scalar.size().bits_usize(), value: scalar.to_bits_unchecked() }
+            }
+            Const::Unevaluated(..) => {
+                bug!("[assumption] unexpected unevaluated constant in scalar conversion: {const_}");
+            }
+            Const::Ty(..) => {
+                bug!("[assumption] unexpected type constant in scalar conversion: {const_}");
+            }
+        }
+    }
+}
+
+impl SolOperand {
+    pub(crate) fn convert<'tcx>(tcx: TyCtxt<'tcx>, depth: Depth, operand: &Operand<'tcx>) -> Self {
+        match operand {
+            Operand::Copy(place) => Self::Copy(SolPlace::convert(tcx, depth, *place)),
+            Operand::Move(place) => Self::Move(SolPlace::convert(tcx, depth, *place)),
+            Operand::Constant(cval) => Self::Constant(SolScalar::convert(tcx, depth, cval.const_)),
+        }
+    }
+}
+
+impl SolExpression {
+    pub(crate) fn convert<'tcx>(tcx: TyCtxt<'tcx>, depth: Depth, rvalue: &Rvalue<'tcx>) -> Self {
+        match rvalue {
+            Rvalue::Use(operand) => Self::Use(SolOperand::convert(tcx, depth, operand)),
+            Rvalue::Repeat(value, count) => Self::Repeat(
+                SolOperand::convert(tcx, depth, value),
+                count.try_to_target_usize(tcx).unwrap_or_else(|| {
+                    bug!("[assumption] unexpected non-constant array size {count}");
+                }) as usize,
+            ),
+            Rvalue::Ref(_, borrow_kind, place) => {
+                let converted_place = SolPlace::convert(tcx, depth, *place);
+                match borrow_kind {
+                    BorrowKind::Shared => Self::BorrowImm(converted_place),
+                    BorrowKind::Mut { .. } => Self::BorrowMut(converted_place),
+                    BorrowKind::Fake(..) => bug!("[invariant] fake borrow not expected"),
+                }
+            }
+            Rvalue::RawPtr(raw_ptr_kind, place) => {
+                let converted_place = SolPlace::convert(tcx, depth, *place);
+                match raw_ptr_kind {
+                    RawPtrKind::Const => Self::PointerImm(converted_place),
+                    RawPtrKind::Mut => Self::PointerMut(converted_place),
+                    RawPtrKind::FakeForPtrMetadata => bug!("[invariant] fake raw ptr not expected"),
+                }
+            }
+            Rvalue::Len(place) => Self::Length(SolPlace::convert(tcx, depth, *place)),
+            Rvalue::Cast(cast_kind, operand, ty) => {
+                let kind = match cast_kind {
+                    CastKind::IntToInt => SolCastKind::IntToInt,
+                    CastKind::FloatToFloat => SolCastKind::FloatToFloat,
+                    CastKind::IntToFloat => SolCastKind::IntToFloat,
+                    CastKind::FloatToInt => SolCastKind::FloatToInt,
+                    _ => bug!("[assumption] unexpected cast kind: {cast_kind:?}"),
+                };
+                Self::Cast {
+                    kind,
+                    place: SolOperand::convert(tcx, depth, operand),
+                    ty: SolType::convert(tcx, depth, *ty),
+                }
+            }
+            Rvalue::NullaryOp(op, ty) => {
+                let opcode = match op {
+                    NullOp::SizeOf => SolOpcodeNullary::SizeOf,
+                    NullOp::AlignOf => SolOpcodeNullary::AlignOf,
+                    NullOp::OffsetOf(indices) => SolOpcodeNullary::OffsetOf(
+                        indices
+                            .iter()
+                            .map(|(variant_idx, field_idx)| {
+                                (variant_idx.index(), field_idx.index())
+                            })
+                            .collect(),
+                    ),
+                    _ => bug!("[invariant] unexpected nullary opcode: {op:?}"),
+                };
+                Self::OpNullary { opcode, ty: SolType::convert(tcx, depth, *ty) }
+            }
+            Rvalue::UnaryOp(op, operand) => {
+                let opcode = match op {
+                    UnOp::Not => SolOpcodeUnary::Not,
+                    UnOp::Neg => SolOpcodeUnary::Neg,
+                    _ => bug!("[invariant] unexpected unary opcode: {op:?}"),
+                };
+                Self::OpUnary { opcode, operand: SolOperand::convert(tcx, depth, operand) }
+            }
+            Rvalue::BinaryOp(op, operand_pair) => {
+                let (v1, v2) = operand_pair.as_ref();
+                let opcode = match op {
+                    // arithmetic
+                    BinOp::Add | BinOp::AddUnchecked => SolOpcodeBinary::Add(false),
+                    BinOp::Sub | BinOp::SubUnchecked => SolOpcodeBinary::Sub(false),
+                    BinOp::Mul | BinOp::MulUnchecked => SolOpcodeBinary::Mul(false),
+                    BinOp::Div => SolOpcodeBinary::Div(false),
+                    BinOp::Rem => SolOpcodeBinary::Rem(false),
+                    BinOp::AddWithOverflow => SolOpcodeBinary::Add(true),
+                    BinOp::SubWithOverflow => SolOpcodeBinary::Sub(true),
+                    BinOp::MulWithOverflow => SolOpcodeBinary::Mul(true),
+                    // bitwise
+                    BinOp::BitAnd => SolOpcodeBinary::BitAnd,
+                    BinOp::BitOr => SolOpcodeBinary::BitOr,
+                    BinOp::BitXor => SolOpcodeBinary::BitXor,
+                    // shift
+                    BinOp::Shl | BinOp::ShlUnchecked => SolOpcodeBinary::Shl,
+                    BinOp::Shr | BinOp::ShrUnchecked => SolOpcodeBinary::Shr,
+                    // comparison
+                    BinOp::Eq => SolOpcodeBinary::Eq,
+                    BinOp::Ne => SolOpcodeBinary::Ne,
+                    BinOp::Lt => SolOpcodeBinary::Lt,
+                    BinOp::Le => SolOpcodeBinary::Le,
+                    BinOp::Gt => SolOpcodeBinary::Gt,
+                    BinOp::Ge => SolOpcodeBinary::Ge,
+                    BinOp::Cmp => SolOpcodeBinary::Cmp,
+                    // pointer
+                    BinOp::Offset => SolOpcodeBinary::Offset,
+                };
+                Self::OpBinary {
+                    opcode,
+                    v1: SolOperand::convert(tcx, depth, v1),
+                    v2: SolOperand::convert(tcx, depth, v2),
+                }
+            }
+            Rvalue::Discriminant(place) => {
+                Self::Discriminant(SolPlace::convert(tcx, depth, *place))
+            }
+            Rvalue::Aggregate(kind, operands) => {
+                let opcode = match kind.as_ref() {
+                    AggregateKind::Tuple => SolOpcodeAggregate::Tuple,
+                    AggregateKind::Array(ty) => {
+                        SolOpcodeAggregate::Array(SolType::convert(tcx, depth, *ty))
+                    }
+                    AggregateKind::Adt(def_id, variant_idx, ty_args, _, union_field_idx) => {
+                        let adt_def = tcx.adt_def(def_id);
+                        let converted_adt_ty =
+                            SolType::convert(tcx, depth.next(), Ty::new_adt(tcx, adt_def, ty_args));
+
+                        match adt_def.adt_kind() {
+                            ty::AdtKind::Struct => {
+                                if variant_idx.index() != 0 {
+                                    bug!(
+                                        "[invariant] unexpected non-zero variant index for struct pack: {}",
+                                        variant_idx.index()
+                                    );
+                                }
+                                if union_field_idx.is_some() {
+                                    bug!(
+                                        "[invariant] unexpected union field index for struct pack"
+                                    );
+                                }
+                                SolOpcodeAggregate::Struct { ty: converted_adt_ty }
+                            }
+                            ty::AdtKind::Union => {
+                                if variant_idx.index() != 0 {
+                                    bug!(
+                                        "[invariant] unexpected non-zero variant index for union pack: {}",
+                                        variant_idx.index()
+                                    );
+                                }
+                                match union_field_idx {
+                                    None => {
+                                        bug!(
+                                            "[invariant] unexpected missing union field index for union pack"
+                                        );
+                                    }
+                                    Some(field_idx) => SolOpcodeAggregate::Union {
+                                        ty: converted_adt_ty,
+                                        field: field_idx.index(),
+                                    },
+                                }
+                            }
+                            ty::AdtKind::Enum => {
+                                if union_field_idx.is_some() {
+                                    bug!(
+                                        "[invariant] unexpected union field index for struct pack"
+                                    );
+                                }
+                                SolOpcodeAggregate::Enum {
+                                    ty: converted_adt_ty,
+                                    variant: variant_idx.index(),
+                                }
+                            }
+                        }
+                    }
+                    AggregateKind::Closure(..) => {
+                        bug!("[assumption] unexpected closure in aggregate conversion");
+                    }
+                    AggregateKind::Coroutine(..) | AggregateKind::CoroutineClosure(..) => {
+                        bug!("[invariant] unexpected coroutine in aggregate conversion");
+                    }
+                    AggregateKind::RawPtr(..) => {
+                        bug!("[assumption] unexpected raw ptr in aggregate conversion");
+                    }
+                };
+
+                let mut values = vec![];
+                for (field_idx, operand) in operands.iter_enumerated() {
+                    let value = SolOperand::convert(tcx, depth.next(), operand);
+                    values.push((field_idx.index(), value));
+                }
+                Self::Aggregate { opcode, values }
+            }
+            Rvalue::CopyForDeref(place) => Self::Load(SolPlace::convert(tcx, depth, *place)),
+
+            _ => {
+                bug!("unhandled");
+            }
+        }
     }
 }
