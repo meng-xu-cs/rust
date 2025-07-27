@@ -1,9 +1,10 @@
 use rustc_middle::bug;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypingEnv};
+use rustc_middle::ty::{self, Instance, Ty, TyCtxt, TypingEnv};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::solana::common::Depth;
+use crate::solana::function::SolFunc;
 use crate::solana::ident::Ident;
 
 #[derive(Serialize, Deserialize)]
@@ -76,36 +77,16 @@ pub(crate) enum SolType {
     Str,
     Array(Box<SolType>, usize),
     Tuple(Vec<SolType>),
-    Struct {
-        name: Ident,
-        mono: Vec<SolGenericArg>,
-        fields: Vec<(String, SolType)>,
-    },
-    Union {
-        name: Ident,
-        mono: Vec<SolGenericArg>,
-        fields: Vec<(String, SolType)>,
-    },
-    Enum {
-        name: Ident,
-        mono: Vec<SolGenericArg>,
-        variants: Vec<(String, Vec<(String, SolType)>)>,
-    },
+    Struct { name: Ident, mono: Vec<SolGenericArg>, fields: Vec<(String, SolType)> },
+    Union { name: Ident, mono: Vec<SolGenericArg>, fields: Vec<(String, SolType)> },
+    Enum { name: Ident, mono: Vec<SolGenericArg>, variants: Vec<(String, Vec<(String, SolType)>)> },
     Slice(Box<SolType>),
     ImmRef(Box<SolType>),
     MutRef(Box<SolType>),
     ImmPtr(Box<SolType>),
     MutPtr(Box<SolType>),
-    Function {
-        name: Ident,
-        mono: Vec<SolGenericArg>,
-        /* FIXME: entire function definition here */
-    },
-    Closure {
-        name: Ident,
-        mono: Vec<SolGenericArg>,
-        /* FIXME: entire closure definition here */
-    },
+    Function { name: Ident, mono: Vec<SolGenericArg>, func: Box<SolFunc> },
+    Closure { name: Ident, mono: Vec<SolGenericArg>, func: Box<SolFunc> },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -224,20 +205,63 @@ impl SolType {
                 }
             }
             ty::FnDef(def_id, fn_ty_args) => {
-                // FIXME: resolve to an instance
-                let mono = fn_ty_args
-                    .iter()
-                    .map(|arg| SolGenericArg::convert(tcx, depth.next(), arg))
-                    .collect();
-                Self::Function { name: Ident::new(tcx, def_id), mono }
+                let name = Ident::new(tcx, def_id);
+
+                // convert the function type arguments
+                let mut mono = vec![];
+                for (i, arg) in fn_ty_args.iter().enumerate() {
+                    info!("{depth}-- fn type argument {i}: {arg}");
+                    mono.push(SolGenericArg::convert(tcx, depth.next(), arg));
+                }
+
+                // resolve the function instance
+                let instance = match Instance::try_resolve(
+                    tcx,
+                    TypingEnv::fully_monomorphized(),
+                    def_id,
+                    fn_ty_args,
+                ) {
+                    Ok(Some(instance)) => instance,
+                    Ok(None) => {
+                        bug!("[assumption] unresolved function type: {ty}");
+                    }
+                    Err(_) => {
+                        bug!("[invariant] failed to resolve function type {ty}");
+                    }
+                };
+
+                // convert the function instance
+                info!("{depth}-- fn type instance: {}", tcx.def_path_str(def_id));
+                let func = SolFunc::convert(tcx, depth.next(), instance);
+
+                // pack the information
+                Self::Function { name, mono, func: func.into() }
             }
-            ty::Closure(def_id, closure_ty_args) => {
-                // FIXME: resolve to an instance
-                let mono = closure_ty_args
-                    .iter()
-                    .map(|arg| SolGenericArg::convert(tcx, depth.next(), arg))
-                    .collect();
-                Self::Closure { name: Ident::new(tcx, def_id), mono }
+            ty::Closure(def_id, recorded_ty_args) => {
+                let name = Ident::new(tcx, def_id);
+
+                // convert the closure type arguments
+                let mut mono = vec![];
+                for (i, arg) in recorded_ty_args.iter().enumerate() {
+                    info!("{depth}-- closure type argument {i}: {arg}");
+                    mono.push(SolGenericArg::convert(tcx, depth.next(), arg));
+                }
+
+                // resolve the closure instance
+                let closure_ty_args = recorded_ty_args.as_closure();
+                let instance = Instance::resolve_closure(
+                    tcx,
+                    def_id,
+                    recorded_ty_args,
+                    closure_ty_args.kind(),
+                );
+
+                // convert the closure instance
+                info!("{depth}-- closure type instance: {}", tcx.def_path_str(def_id));
+                let func = SolFunc::convert(tcx, depth.next(), instance);
+
+                // pack the information
+                Self::Closure { name, mono, func: func.into() }
             }
             ty::Pat(..) => {
                 bug!("[unsupported] pattern type: {ty}");
