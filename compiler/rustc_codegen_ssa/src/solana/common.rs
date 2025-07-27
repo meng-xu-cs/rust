@@ -1,10 +1,15 @@
 use std::fmt::Display;
+use std::fs::File;
 use std::path::PathBuf;
 use std::{env, fs};
 
 use rustc_middle::bug;
+use rustc_middle::mir::Body;
+use rustc_middle::mir::graphviz::write_mir_fn_graphviz;
+use rustc_middle::mir::pretty::{PrettyPrintMirOptions, write_mir_fn};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::FileNameDisplayPreference;
+use serde::Serialize;
 
 const COMPONENT_NAME: &str = "solanalysis";
 
@@ -123,7 +128,7 @@ pub(crate) fn retrieve_context(tcx: TyCtxt<'_>) -> Option<SolanaContext> {
 
 impl SolanaContext {
     /// Return the output directory for the current phase
-    pub(crate) fn instance_output_dir(&self) -> PathBuf {
+    fn instance_output_dir(&self) -> PathBuf {
         let phase_output = self.output_dir.join(self.phase.to_string());
         let mut counter = 0;
         loop {
@@ -139,5 +144,41 @@ impl SolanaContext {
                 }
             }
         }
+    }
+
+    pub(crate) fn save_instance_info<'tcx, T: Serialize>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        info: &T,
+    ) {
+        // prepare for output directory
+        let instance_outdir = self.instance_output_dir();
+
+        // dump the MIR to file
+        let mut file_mir = File::create(instance_outdir.join("body.mir"))
+            .unwrap_or_else(|e| bug!("[invariant] failed to create MIR file: {e}"));
+        write_mir_fn(
+            tcx,
+            body,
+            &mut |_, _| Ok(()),
+            &mut file_mir,
+            PrettyPrintMirOptions::from_cli(tcx),
+        )
+        .unwrap_or_else(|e| bug!("[invariant] failed to write MIR to file: {e}"));
+
+        // dump the CFG to file
+        let mut file_dot = File::create(instance_outdir.join("body.dot"))
+            .unwrap_or_else(|e| bug!("[invariant] failed to create Dot file: {e}"));
+        write_mir_fn_graphviz(tcx, body, false, &mut file_dot)
+            .unwrap_or_else(|e| bug!("[invariant] failed to write Dot to file: {e}"));
+
+        // serialize the information to file
+        serde_json::to_writer_pretty(
+            File::create(instance_outdir.join("info.json"))
+                .unwrap_or_else(|e| bug!("[invariant] failed to create info.json file: {e}")),
+            info,
+        )
+        .unwrap_or_else(|e| bug!("[invariant] failed to serialize information: {e}"));
     }
 }
