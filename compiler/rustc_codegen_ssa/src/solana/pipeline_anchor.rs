@@ -1,29 +1,18 @@
 //! This pass encapsulate all the transformations related to Solana's Anchor framework.
 
-use std::fs::File;
-
 use rustc_hir::def::DefKind;
-use rustc_middle::mir::Body;
-use rustc_middle::mir::graphviz::write_mir_fn_graphviz;
-use rustc_middle::mir::pretty::{PrettyPrintMirOptions, write_mir_fn};
-use rustc_middle::ty::{InstanceKind, TyCtxt};
+use rustc_middle::ty::{Instance, InstanceKind, TyCtxt};
 use rustc_middle::{bug, ty};
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::solana::common::SolanaContext;
-use crate::solana::typing::SolType;
+use crate::solana::function::SolFunc;
 
-/// Represents an Anchor instruction
-#[derive(Serialize, Deserialize)]
-struct AnchorInstruction {
-    /// name of the instruction
-    name: String,
-    /// type of the state
-    state: SolType,
-}
-
-pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolanaContext, body: &mut Body<'tcx>) {
+pub(crate) fn phase_bootstrap<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sol: SolanaContext,
+    instance: Instance<'tcx>,
+) {
     info!(
         "phase: {} on {} with source {}",
         sol.phase,
@@ -32,7 +21,7 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolanaContext, body:
     );
 
     // debug marking
-    let def_id = body.source.instance.def_id();
+    let def_id = instance.def_id();
     let def_desc = tcx.def_path_str(def_id);
     info!("processing {def_desc}");
 
@@ -49,13 +38,16 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolanaContext, body:
     }
 
     // an instruction must be a `fn` item
-    match body.source.instance {
+    match instance.def {
         InstanceKind::Item(did) if tcx.def_kind(did) == DefKind::Fn => (),
         _ => {
             info!("- skipped, not a fn item");
             return;
         }
     };
+
+    // reveal function definition
+    let body = tcx.instance_mir(instance.def);
 
     // check parameter types
     let ty_state = match body.args_iter().next() {
@@ -104,44 +96,12 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolanaContext, body:
         }
     };
 
-    // need subsequent processing
-    warn!("- found instruction {def_desc} with argument {ty_state}");
-
-    // prepare for output directory
-    let instance_outdir = sol.instance_output_dir();
-
-    // dump the MIR to file
-    let mut file_mir = File::create(instance_outdir.join("body.mir"))
-        .unwrap_or_else(|e| bug!("[invariant] failed to create MIR file: {e}"));
-    write_mir_fn(
-        tcx,
-        body,
-        &mut |_, _| Ok(()),
-        &mut file_mir,
-        PrettyPrintMirOptions::from_cli(tcx),
-    )
-    .unwrap_or_else(|e| bug!("[invariant] failed to write MIR to file: {e}"));
-
-    // dump the CFG to file
-    let mut file_dot = File::create(instance_outdir.join("body.dot"))
-        .unwrap_or_else(|e| bug!("[invariant] failed to create Dot file: {e}"));
-    write_mir_fn_graphviz(tcx, body, false, &mut file_dot)
-        .unwrap_or_else(|e| bug!("[invariant] failed to write Dot to file: {e}"));
-
-    // extract the state type definition
-    match ty_state.kind() {
-        ty::Adt(_adt_def, _adt_ty_args) => {}
-        _ => bug!("[assumption] expect the state type to be an adt, found: {ty_state}"),
+    // assert that the state type must be user-defined
+    if !matches!(ty_state.kind(), ty::Adt(_, _)) {
+        bug!("[assumption] expect the state type to be an adt, found: {ty_state}");
     }
 
-    // FIXME: fill in other information in the instruction
-    let instruction = AnchorInstruction { name: def_desc, state: SolType::convert(tcx, ty_state) };
-
-    // serialize the instruction to file
-    serde_json::to_writer_pretty(
-        File::create(instance_outdir.join("info.json"))
-            .unwrap_or_else(|e| bug!("[invariant] failed to create info.json file: {e}")),
-        &instruction,
-    )
-    .unwrap_or_else(|e| bug!("[invariant] failed to serialize instruction: {e}"));
+    // output to directory
+    warn!("- found instruction {def_desc} with argument {ty_state}");
+    sol.save_instance_info(tcx, body, &SolFunc::convert(tcx, instance));
 }
