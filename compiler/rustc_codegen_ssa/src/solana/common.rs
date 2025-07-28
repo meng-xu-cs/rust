@@ -9,10 +9,12 @@ use rustc_middle::mir::graphviz::write_mir_fn_graphviz;
 use rustc_middle::mir::pretty::{PrettyPrintMirOptions, write_mir_fn};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::FileNameDisplayPreference;
+use serde::Serialize;
 
 const COMPONENT_NAME: &str = "solanalysis";
 
 /// Supported build systems
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum BuildSystem {
     Anchor,
 }
@@ -26,6 +28,7 @@ impl Display for BuildSystem {
 }
 
 /// Phase of execution
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Phase {
     Bootstrap,
 }
@@ -39,6 +42,7 @@ impl Display for Phase {
 }
 
 /// Build context for Solana
+#[derive(Clone)]
 pub(crate) struct SolEnv {
     pub build_system: BuildSystem,
     pub phase: Phase,
@@ -159,5 +163,14 @@ impl SolEnv {
             .unwrap_or_else(|e| bug!("[invariant] failed to create Dot file: {e}"));
         write_mir_fn_graphviz(tcx, body, false, &mut file_dot)
             .unwrap_or_else(|e| bug!("[invariant] failed to write Dot to file: {e}"));
+    }
+
+    pub(crate) fn serialize_to_file<T: Serialize>(&self, tag: &str, data: &T) {
+        let file_path = self.output_dir.join(format!("{tag}.json"));
+        let json_data = serde_json::to_string_pretty(data)
+            .unwrap_or_else(|e| bug!("[invariant] failed to serialize data to JSON: {e}"));
+        fs::write(&file_path, json_data).unwrap_or_else(|e| {
+            bug!("[invariant] failed to write JSON to file {}: {e}", file_path.display())
+        });
     }
 }
