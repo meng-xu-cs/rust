@@ -124,8 +124,13 @@ pub(crate) fn retrieve_env(tcx: TyCtxt<'_>) -> Option<SolEnv> {
 
 impl SolEnv {
     /// Return the output directory for the current phase
+    fn phase_output_dir(&self) -> PathBuf {
+        self.output_dir.join(self.phase.to_string())
+    }
+
+    /// Return the output directory for a new instance
     fn instance_output_dir(&self) -> PathBuf {
-        let phase_output = self.output_dir.join(self.phase.to_string());
+        let phase_output = self.phase_output_dir();
         let mut counter = 0;
         loop {
             let subdir = phase_output.join(counter.to_string());
@@ -166,7 +171,7 @@ impl SolEnv {
     }
 
     pub(crate) fn serialize_to_file<T: Serialize>(&self, tag: &str, data: &T) {
-        let file_path = self.output_dir.join(format!("{tag}.json"));
+        let file_path = self.phase_output_dir().join(format!("{tag}.json"));
         let json_data = serde_json::to_string_pretty(data)
             .unwrap_or_else(|e| bug!("[invariant] failed to serialize data to JSON: {e}"));
         fs::write(&file_path, json_data).unwrap_or_else(|e| {
