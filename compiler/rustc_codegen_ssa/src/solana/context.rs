@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 
 use rustc_ast::Mutability;
+use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::bug;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::{
@@ -17,10 +18,15 @@ use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::solana::common::SolEnv;
+
 /// A builder for creating a Solana context
 pub(crate) struct SolContextBuilder<'tcx> {
     /// compiler context
     tcx: TyCtxt<'tcx>,
+
+    /// solana environment
+    sol: SolEnv,
 
     /// depth of the current context
     depth: Depth,
@@ -34,15 +40,16 @@ pub(crate) struct SolContextBuilder<'tcx> {
 
 impl<'tcx> SolContextBuilder<'tcx> {
     /// Create a new context builder
-    pub(crate) fn new(tcx: TyCtxt<'tcx>) -> Self {
-        Self { tcx, depth: Depth::new(), ty_defs: BTreeMap::new(), fn_defs: BTreeMap::new() }
+    pub(crate) fn new(tcx: TyCtxt<'tcx>, sol: SolEnv) -> Self {
+        Self { tcx, sol, depth: Depth::new(), ty_defs: BTreeMap::new(), fn_defs: BTreeMap::new() }
     }
 
     /// Create an identifier
     fn mk_ident(&mut self, def_id: DefId) -> SolIdent {
         let def_path = self.tcx.def_path(def_id);
-        let krate = self.tcx.crate_name(def_path.krate).to_string();
-        let paths = def_path.data.iter().map(|segment| segment.as_sym(false).to_string()).collect();
+        let krate = self.tcx.crate_name(def_path.krate).to_ident_string();
+        let paths =
+            def_path.data.iter().map(|segment| segment.as_sym(false).to_ident_string()).collect();
         SolIdent { krate, paths }
     }
 
@@ -173,7 +180,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     .iter_enumerated()
                     .map(|(field_idx, field_def)| {
                         let field_index = SolFieldIndex(field_idx.index());
-                        let field_name = SolFieldName(field_def.name.to_string());
+                        let field_name = SolFieldName(field_def.name.to_ident_string());
                         let field_ty = self.mk_type(field_def.ty(self.tcx, generics));
                         SolField { index: field_index, name: field_name, ty: field_ty }
                     })
@@ -193,7 +200,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     .iter_enumerated()
                     .map(|(field_idx, field_def)| {
                         let field_index = SolFieldIndex(field_idx.index());
-                        let field_name = SolFieldName(field_def.name.to_string());
+                        let field_name = SolFieldName(field_def.name.to_ident_string());
                         let field_ty = self.mk_type(field_def.ty(self.tcx, generics));
                         SolField { index: field_index, name: field_name, ty: field_ty }
                     })
@@ -206,13 +213,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     .iter_enumerated()
                     .map(|(variant_idx, variant_def)| {
                         let variant_index = SolVariantIndex(variant_idx.index());
-                        let variant_name = SolVariantName(variant_def.name.to_string());
+                        let variant_name = SolVariantName(variant_def.name.to_ident_string());
                         let fields = variant_def
                             .fields
                             .iter_enumerated()
                             .map(|(field_idx, field_def)| {
                                 let field_index = SolFieldIndex(field_idx.index());
-                                let field_name = SolFieldName(field_def.name.to_string());
+                                let field_name = SolFieldName(field_def.name.to_ident_string());
                                 let field_ty = self.mk_type(field_def.ty(self.tcx, generics));
                                 SolField { index: field_index, name: field_name, ty: field_ty }
                             })
@@ -791,6 +798,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             instance_mir.typing_env(self.tcx),
             EarlyBinder::bind(instance_mir),
         );
+        self.sol.save_instance_info(self.tcx, &body);
 
         // convert function signatures
         let mut args = vec![];
@@ -844,6 +852,51 @@ impl<'tcx> SolContextBuilder<'tcx> {
         // return the key to the lookup table
         (ident, ty_args)
     }
+
+    /// Build the context
+    pub(crate) fn build(self) -> (SolEnv, SolContext) {
+        let krate = self.tcx.crate_name(LOCAL_CRATE).to_ident_string();
+
+        let mut ty_defs = BTreeMap::new();
+        for (ident, defs) in self.ty_defs.into_iter() {
+            let sub = ty_defs.entry(ident).or_insert_with(BTreeMap::new);
+            for (mono, def) in defs.into_iter() {
+                match def {
+                    None => bug!("[invariant] missing type definition"),
+                    Some(val) => {
+                        sub.insert(mono, val);
+                    }
+                }
+            }
+        }
+
+        let mut fn_defs = BTreeMap::new();
+        for (ident, defs) in self.fn_defs.into_iter() {
+            let sub = fn_defs.entry(ident).or_insert_with(BTreeMap::new);
+            for (mono, def) in defs.into_iter() {
+                match def {
+                    None => bug!("[invariant] missing function definition"),
+                    Some(val) => {
+                        sub.insert(mono, val);
+                    }
+                }
+            }
+        }
+
+        (self.sol, SolContext { krate, ty_defs, fn_defs })
+    }
+}
+
+/*
+ * Context
+ */
+
+/// A complete Solana context
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolContext {
+    krate: String,
+    ty_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, SolTyDef>>,
+    fn_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, SolFnDef>>,
 }
 
 /*
