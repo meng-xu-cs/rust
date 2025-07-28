@@ -9,7 +9,6 @@ use rustc_middle::mir::graphviz::write_mir_fn_graphviz;
 use rustc_middle::mir::pretty::{PrettyPrintMirOptions, write_mir_fn};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::FileNameDisplayPreference;
-use serde::Serialize;
 
 const COMPONENT_NAME: &str = "solanalysis";
 
@@ -39,8 +38,8 @@ impl Display for Phase {
     }
 }
 
-/// Build context for Solana Anchor
-pub(crate) struct SolanaContext {
+/// Build context for Solana
+pub(crate) struct SolEnv {
     pub build_system: BuildSystem,
     pub phase: Phase,
     pub source_dir: PathBuf,
@@ -50,7 +49,7 @@ pub(crate) struct SolanaContext {
 }
 
 /// Entrypoint fo the solana-specific logic
-pub(crate) fn retrieve_context(tcx: TyCtxt<'_>) -> Option<SolanaContext> {
+pub(crate) fn retrieve_env(tcx: TyCtxt<'_>) -> Option<SolEnv> {
     // enable the component is explicitly enabled via environment variable
     let env_prefix = COMPONENT_NAME.to_uppercase();
     match env::var_os(&env_prefix)?
@@ -116,17 +115,10 @@ pub(crate) fn retrieve_context(tcx: TyCtxt<'_>) -> Option<SolanaContext> {
     };
 
     // return the context
-    Some(SolanaContext {
-        build_system,
-        phase,
-        source_dir,
-        src_file_name,
-        src_path_full,
-        output_dir,
-    })
+    Some(SolEnv { build_system, phase, source_dir, src_file_name, src_path_full, output_dir })
 }
 
-impl SolanaContext {
+impl SolEnv {
     /// Return the output directory for the current phase
     fn instance_output_dir(&self) -> PathBuf {
         let phase_output = self.output_dir.join(self.phase.to_string());
@@ -146,12 +138,7 @@ impl SolanaContext {
         }
     }
 
-    pub(crate) fn save_instance_info<'tcx, T: Serialize>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        body: &Body<'tcx>,
-        info: &T,
-    ) {
+    pub(crate) fn save_instance_info<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
         // prepare for output directory
         let instance_outdir = self.instance_output_dir();
 
@@ -172,34 +159,5 @@ impl SolanaContext {
             .unwrap_or_else(|e| bug!("[invariant] failed to create Dot file: {e}"));
         write_mir_fn_graphviz(tcx, body, false, &mut file_dot)
             .unwrap_or_else(|e| bug!("[invariant] failed to write Dot to file: {e}"));
-
-        // serialize the information to file
-        serde_json::to_writer_pretty(
-            File::create(instance_outdir.join("info.json"))
-                .unwrap_or_else(|e| bug!("[invariant] failed to create info.json file: {e}")),
-            info,
-        )
-        .unwrap_or_else(|e| bug!("[invariant] failed to serialize information: {e}"));
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct Depth {
-    level: usize,
-}
-
-impl Depth {
-    pub(crate) fn new() -> Self {
-        Self { level: 0 }
-    }
-
-    pub(crate) fn next(&self) -> Self {
-        Self { level: self.level + 1 }
-    }
-}
-
-impl Display for Depth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", "  ".repeat(self.level))
     }
 }
