@@ -240,14 +240,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
         def_id: DefId,
         generics: GenericArgsRef<'tcx>,
     ) -> (SolIdent, Vec<SolGenericArg>) {
-        let ident = self.mk_ident(def_id);
-        let ty_args: Vec<_> = generics.iter().map(|ty_arg| self.mk_ty_arg(ty_arg)).collect();
-
-        // if already defined or is being defined, return the key
-        if self.fn_defs.get(&ident).map_or(false, |inner| inner.contains_key(&ty_args)) {
-            return (ident, ty_args);
-        }
-
         // resolve the function instance
         let instance = match Instance::try_resolve(
             self.tcx,
@@ -270,25 +262,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
         };
 
-        // mark start
-        self.depth.push();
-        info!("{}-> function definition", self.depth);
-
-        // first update the entry to mark that function definition in progress
-        self.fn_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), None);
-
-        // now create the definition
-        let fn_def = self.mk_function(instance);
-
-        // update the function definition
-        self.fn_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), Some(fn_def));
-
-        // mark end
-        info!("{}<- function definition", self.depth);
-        self.depth.pop();
-
         // return the key to the lookup table
-        (ident, ty_args)
+        self.make_instance(instance)
     }
 
     fn make_type_closure(
@@ -296,38 +271,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
         def_id: DefId,
         generics: GenericArgsRef<'tcx>,
     ) -> (SolIdent, Vec<SolGenericArg>) {
-        let ident = self.mk_ident(def_id);
-        let ty_args: Vec<_> = generics.iter().map(|ty_arg| self.mk_ty_arg(ty_arg)).collect();
-
-        // if already defined or is being defined, return the key
-        if self.fn_defs.get(&ident).map_or(false, |inner| inner.contains_key(&ty_args)) {
-            return (ident, ty_args);
-        }
-
         // resolve the closure instance
         let closure_ty_args = generics.as_closure();
         let instance =
             Instance::resolve_closure(self.tcx, def_id, generics, closure_ty_args.kind());
 
-        // mark start
-        self.depth.push();
-        info!("{}-> closure definition", self.depth);
-
-        // first update the entry to mark that closure definition in progress
-        self.fn_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), None);
-
-        // now create the definition
-        let fn_def = self.mk_function(instance);
-
-        // update the closure definition
-        self.fn_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), Some(fn_def));
-
-        // mark end
-        info!("{}<- closure definition", self.depth);
-        self.depth.pop();
-
         // return the key to the lookup table
-        (ident, ty_args)
+        self.make_instance(instance)
     }
 
     /// Create a generic argument
@@ -757,13 +707,33 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     target: SolBlockId(target.index()),
                 }
             }
-            TerminatorKind::Call { .. } => {
-                // FIXME
-                bug!("FIXME: call");
+            TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                target,
+                unwind,
+                call_source: _,
+                fn_span: _,
+            } => {
+                if !matches!(unwind, UnwindAction::Unreachable | UnwindAction::Terminate(..)) {
+                    bug!("[assumption] unexpected unwind action in call terminator");
+                }
+                let converted_func = self.mk_operand(func);
+                let converted_args = args.iter().map(|arg| self.mk_operand(&arg.node)).collect();
+                let converted_dest = self.mk_place(*destination);
+                let converted_target = target.map(|block| SolBlockId(block.index()));
+                SolTerminator::Call {
+                    func: converted_func,
+                    args: converted_args,
+                    dest: converted_dest,
+                    target: converted_target,
+                }
             }
-            TerminatorKind::TailCall { .. } => {
-                // FIXME
-                bug!("FIXME: call");
+            TerminatorKind::TailCall { func, args, fn_span: _ } => {
+                let converted_func = self.mk_operand(func);
+                let converted_args = args.iter().map(|arg| self.mk_operand(&arg.node)).collect();
+                SolTerminator::TailCall { func: converted_func, args: converted_args }
             }
             TerminatorKind::InlineAsm { .. } => {
                 bug!("[unsupported] inline assembly {term:?}");
@@ -788,9 +758,21 @@ impl<'tcx> SolContextBuilder<'tcx> {
     }
 
     /// Create a function definition
-    fn mk_function(&mut self, instance: Instance<'tcx>) -> SolFnDef {
+    pub(crate) fn make_instance(
+        &mut self,
+        instance: Instance<'tcx>,
+    ) -> (SolIdent, Vec<SolGenericArg>) {
         let def_id = instance.def_id();
         let def_desc = self.tcx.def_path_str(def_id);
+
+        // locate the key of the definition
+        let ident = self.mk_ident(def_id);
+        let ty_args: Vec<_> = instance.args.iter().map(|ty_arg| self.mk_ty_arg(ty_arg)).collect();
+
+        // if already defined or is being defined, return the key
+        if self.fn_defs.get(&ident).map_or(false, |inner| inner.contains_key(&ty_args)) {
+            return (ident, ty_args);
+        }
 
         // mark start
         self.depth.push();
@@ -811,8 +793,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
         );
 
         // convert function signatures
-        let name = self.mk_ident(def_id);
-
         let mut args = vec![];
         for arg_idx in body.args_iter() {
             let decl = &body.local_decls[arg_idx];
@@ -853,12 +833,16 @@ impl<'tcx> SolContextBuilder<'tcx> {
             blocks.push(block);
         }
 
+        // update the function definition lookup table
+        let fn_def = SolFnDef { args, ret_ty, locals, blocks };
+        self.fn_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), Some(fn_def));
+
         // mark end
         info!("{}<- function {def_desc}", self.depth);
         self.depth.pop();
 
-        // pack the function definition
-        SolFnDef { name, args, ret_ty, locals, blocks }
+        // return the key to the lookup table
+        (ident, ty_args)
     }
 }
 
@@ -1158,6 +1142,8 @@ pub(crate) enum SolTerminator {
     Switch { cond: SolOperand, targets: Vec<(u128, SolBlockId)>, otherwise: SolBlockId },
     Drop { place: SolPlace, target: SolBlockId },
     Assert { cond: SolOperand, expected: bool, target: SolBlockId },
+    Call { func: SolOperand, args: Vec<SolOperand>, dest: SolPlace, target: Option<SolBlockId> },
+    TailCall { func: SolOperand, args: Vec<SolOperand> },
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1169,7 +1155,6 @@ pub(crate) struct SolBasicBlock {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolFnDef {
-    name: SolIdent,
     args: Vec<SolType>,
     ret_ty: SolType,
     locals: Vec<SolType>,
