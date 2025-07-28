@@ -97,10 +97,13 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
         bug!("[assumption] expect the state type to be an adt, found: {ty_state}");
     }
 
-    // output to directory
+    // collect information
     warn!("- found instruction {def_desc} with argument {ty_state}");
-    sol.save_instance_info(tcx, body);
 
-    let mut builder = SolContextBuilder::new(tcx);
+    let mut builder = SolContextBuilder::new(tcx, sol);
     builder.make_instance(instance);
+    let (sol, context) = builder.build();
+
+    // serialize the information to file
+    sol.serialize_to_file("context", &context);
 }
