@@ -857,28 +857,22 @@ impl<'tcx> SolContextBuilder<'tcx> {
     pub(crate) fn build(self) -> (SolEnv, SolContext) {
         let krate = self.tcx.crate_name(LOCAL_CRATE).to_ident_string();
 
-        let mut ty_defs = BTreeMap::new();
+        let mut ty_defs = vec![];
         for (ident, defs) in self.ty_defs.into_iter() {
-            let sub = ty_defs.entry(ident).or_insert_with(BTreeMap::new);
             for (mono, def) in defs.into_iter() {
                 match def {
                     None => bug!("[invariant] missing type definition"),
-                    Some(val) => {
-                        sub.insert(mono, val);
-                    }
+                    Some(val) => ty_defs.push((ident.clone(), mono, val)),
                 }
             }
         }
 
-        let mut fn_defs = BTreeMap::new();
+        let mut fn_defs = vec![];
         for (ident, defs) in self.fn_defs.into_iter() {
-            let sub = fn_defs.entry(ident).or_insert_with(BTreeMap::new);
             for (mono, def) in defs.into_iter() {
                 match def {
                     None => bug!("[invariant] missing function definition"),
-                    Some(val) => {
-                        sub.insert(mono, val);
-                    }
+                    Some(val) => fn_defs.push((ident.clone(), mono, val)),
                 }
             }
         }
@@ -895,8 +889,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolContext {
     krate: String,
-    ty_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, SolTyDef>>,
-    fn_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, SolFnDef>>,
+    ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTyDef)>,
+    fn_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolFnDef)>,
 }
 
 /*
