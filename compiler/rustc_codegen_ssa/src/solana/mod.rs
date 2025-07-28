@@ -2,15 +2,11 @@ use rustc_middle::ty::{Instance, TyCtxt};
 
 pub(crate) mod common;
 pub(crate) mod context;
-pub(crate) mod function;
-pub(crate) mod ident;
-pub(crate) mod typing;
-
 pub(crate) mod pipeline_anchor;
 
 /// Entrypoint for the solana-specific codegen logic
 pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
-    let sol = match common::retrieve_context(tcx) {
+    let sol = match common::retrieve_env(tcx) {
         None => return,
         Some(ctxt) => ctxt,
     };
