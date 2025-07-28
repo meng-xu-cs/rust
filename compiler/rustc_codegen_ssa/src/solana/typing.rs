@@ -186,10 +186,10 @@ impl SolType {
                 info!("{depth}-- ref inner type");
                 match mutability {
                     ty::Mutability::Mut => {
-                        Self::MutPtr(Box::new(Self::convert(tcx, depth.next(), sub_ty)))
+                        Self::MutRef(Box::new(Self::convert(tcx, depth.next(), sub_ty)))
                     }
                     ty::Mutability::Not => {
-                        Self::ImmPtr(Box::new(Self::convert(tcx, depth.next(), sub_ty)))
+                        Self::ImmRef(Box::new(Self::convert(tcx, depth.next(), sub_ty)))
                     }
                 }
             }
