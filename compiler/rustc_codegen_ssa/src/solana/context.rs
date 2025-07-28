@@ -696,7 +696,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 if drop.is_some() || async_fut.is_some() {
                     bug!("[invariant] unexpected async features in drop terminator");
                 }
-                if !matches!(unwind, UnwindAction::Unreachable | UnwindAction::Terminate(..)) {
+                if !matches!(
+                    unwind,
+                    UnwindAction::Continue
+                        | UnwindAction::Unreachable
+                        | UnwindAction::Terminate(..)
+                ) {
                     bug!("[assumption] unexpected unwind action in drop terminator");
                 }
                 SolTerminator::Drop {
@@ -705,7 +710,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
             }
             TerminatorKind::Assert { cond, expected, msg: _, target, unwind } => {
-                if !matches!(unwind, UnwindAction::Unreachable | UnwindAction::Terminate(..)) {
+                if !matches!(
+                    unwind,
+                    UnwindAction::Continue
+                        | UnwindAction::Unreachable
+                        | UnwindAction::Terminate(..)
+                ) {
                     bug!("[assumption] unexpected unwind action in assert terminator");
                 }
                 SolTerminator::Assert {
@@ -723,7 +733,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 call_source: _,
                 fn_span: _,
             } => {
-                if !matches!(unwind, UnwindAction::Unreachable | UnwindAction::Terminate(..)) {
+                if !matches!(
+                    unwind,
+                    UnwindAction::Continue
+                        | UnwindAction::Unreachable
+                        | UnwindAction::Terminate(..)
+                ) {
                     bug!("[assumption] unexpected unwind action in call terminator");
                 }
                 let converted_func = self.mk_operand(func);
