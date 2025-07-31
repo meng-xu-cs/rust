@@ -105,5 +105,5 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     let (sol, context) = builder.build();
 
     // serialize the information to file
-    sol.serialize_to_file("context", &context);
+    sol.serialize_to_file(&def_desc, &context);
 }
