@@ -820,6 +820,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
             instance_mir.typing_env(self.tcx),
             EarlyBinder::bind(instance_mir),
         );
+
+        // dump the instance info
         self.sol.save_instance_info(self.tcx, &body);
 
         // convert function signatures
