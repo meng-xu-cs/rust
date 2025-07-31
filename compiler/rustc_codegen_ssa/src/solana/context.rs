@@ -112,19 +112,17 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let (ident, ty_args) = self.make_type_closure(def_id, generics);
                 SolType::Closure(ident, ty_args)
             }
-            ty::FnPtr(sig, _) => {
-                /* FIXME: shoudn't exist */
-                let sig = self.tcx.instantiate_bound_regions_with_erased(sig);
-                let arg_tys = sig.inputs().iter().map(|ty| self.mk_type(*ty)).collect();
-                let ret_ty = self.mk_type(sig.output());
-                SolType::FnPtr(arg_tys, Box::new(ret_ty))
+            ty::FnPtr(..) => {
+                bug!("[unsupported] function pointer type: {ty}");
             }
-            ty::Dynamic(..) => SolType::Dynamic, /* FIXME: shouldn't exist */
+            ty::Dynamic(..) => {
+                bug!("[unsupported] dynamic type: {ty}");
+            }
             ty::Pat(..) => {
-                bug!("[unsupported] pattern type: {ty}");
+                bug!("[assumption] unexpected pattern type: {ty}");
             }
             ty::Coroutine(..) | ty::CoroutineClosure(..) | ty::CoroutineWitness(..) => {
-                bug!("[unsupported] coroutine-related type: {ty}");
+                bug!("[assumption] unexpected coroutine-related type: {ty}");
             }
             ty::Foreign(..) => {
                 bug!("[assumption] unexpected foreign type {ty}");
@@ -467,11 +465,15 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     CastKind::FloatToFloat => SolOpcodeCast::FloatToFloat,
                     CastKind::IntToFloat => SolOpcodeCast::IntToFloat,
                     CastKind::FloatToInt => SolOpcodeCast::FloatToInt,
-                    CastKind::Transmute | CastKind::PtrToPtr | CastKind::PointerCoercion(..) => {
-                        /* FIXME: shouldn't exist */
-                        SolOpcodeCast::Reinterpret
+                    CastKind::Transmute
+                    | CastKind::PtrToPtr
+                    | CastKind::PointerCoercion(..)
+                    | CastKind::FnPtrToPtr => {
+                        bug!("[unsupported] reinterpret cast in cast op");
                     }
-                    _ => bug!("[assumption] unexpected cast kind: {cast_kind:?}"),
+                    CastKind::PointerExposeProvenance | CastKind::PointerWithExposedProvenance => {
+                        bug!("[assumption] unexpected cast kind: {cast_kind:?}")
+                    }
                 };
                 SolExpr::Cast { opcode, place: self.mk_operand(operand), ty: self.mk_type(*ty) }
             }
@@ -490,7 +492,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             })
                             .collect(),
                     ),
-                    NullOp::UbChecks | NullOp::ContractChecks => SolOpcodeNullary::Check, /* FIXME: shouldn't exist */
+                    NullOp::UbChecks | NullOp::ContractChecks => {
+                        bug!("[unsupported] check in nullary op");
+                    }
                 };
                 SolExpr::OpNullary { opcode, ty: self.mk_type(*ty) }
             }
@@ -498,7 +502,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let opcode = match op {
                     UnOp::Not => SolOpcodeUnary::Not,
                     UnOp::Neg => SolOpcodeUnary::Neg,
-                    _ => bug!("[invariant] unexpected unary opcode: {op:?}"),
+                    UnOp::PtrMetadata => bug!("[invariant] unexpected unary opcode: {op:?}"),
                 };
                 SolExpr::OpUnary { opcode, val: self.mk_operand(operand) }
             }
@@ -1001,8 +1005,6 @@ pub(crate) enum SolType {
     MutPtr(Box<SolType>),
     Function(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
-    FnPtr(Vec<SolType>, Box<SolType>), /* FIXME: shouldn't exist */
-    Dynamic,                           /* FIXME: shouldn't exist */
 }
 
 /// User-defined type, i.e., an algebraic data type (ADT)
@@ -1146,7 +1148,6 @@ pub(crate) enum SolOpcodeCast {
     FloatToFloat,
     IntToFloat,
     FloatToInt,
-    Reinterpret, /* FIXME: shouldn't exist */
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1154,7 +1155,6 @@ pub(crate) enum SolOpcodeNullary {
     SizeOf,
     AlignOf,
     OffsetOf(Vec<(SolVariantIndex, SolFieldIndex)>),
-    Check, /* FIXME: shouldn't exist */
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
