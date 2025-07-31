@@ -52,7 +52,7 @@ pub(crate) struct SolEnv {
     pub output_dir: PathBuf,
 }
 
-/// Entrypoint fo the solana-specific logic
+/// Entrypoint to the solana-specific logic
 pub(crate) fn retrieve_env(tcx: TyCtxt<'_>) -> Option<SolEnv> {
     // enable the component is explicitly enabled via environment variable
     let env_prefix = COMPONENT_NAME.to_uppercase();
@@ -172,6 +172,10 @@ impl SolEnv {
 
     pub(crate) fn serialize_to_file<T: Serialize>(&self, tag: &str, data: &T) {
         let file_path = self.phase_output_dir().join(format!("{tag}.json"));
+        if file_path.exists() {
+            bug!("[invariant] file {file_path:?} already exists");
+        }
+
         let json_data = serde_json::to_string_pretty(data)
             .unwrap_or_else(|e| bug!("[invariant] failed to serialize data to JSON: {e}"));
         fs::write(&file_path, json_data).unwrap_or_else(|e| {
