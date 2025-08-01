@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 
 use rustc_ast::Mutability;
+use rustc_data_structures::fx::FxHashMap;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LOCAL_CRATE;
+use rustc_hir::definitions::DefPathData;
 use rustc_middle::bug;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::{
@@ -18,6 +21,7 @@ use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::solana::builtin::BuiltinFunction;
 use crate::solana::common::SolEnv;
 
 /// A builder for creating a Solana context
@@ -31,6 +35,9 @@ pub(crate) struct SolContextBuilder<'tcx> {
     /// depth of the current context
     depth: Depth,
 
+    /// a cache of id to identifier mappings
+    id_cache: FxHashMap<DefId, SolIdent>,
+
     /// collected definitions of datatypes
     ty_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolTyDef>>>,
 
@@ -41,16 +48,108 @@ pub(crate) struct SolContextBuilder<'tcx> {
 impl<'tcx> SolContextBuilder<'tcx> {
     /// Create a new context builder
     pub(crate) fn new(tcx: TyCtxt<'tcx>, sol: SolEnv) -> Self {
-        Self { tcx, sol, depth: Depth::new(), ty_defs: BTreeMap::new(), fn_defs: BTreeMap::new() }
+        Self {
+            tcx,
+            sol,
+            depth: Depth::new(),
+            id_cache: FxHashMap::default(),
+            ty_defs: BTreeMap::new(),
+            fn_defs: BTreeMap::new(),
+        }
     }
 
     /// Create an identifier
     fn mk_ident(&mut self, def_id: DefId) -> SolIdent {
+        // check cache first
+        if let Some(ident) = self.id_cache.get(&def_id) {
+            return ident.clone();
+        }
+
+        // now construct the identifier
         let def_path = self.tcx.def_path(def_id);
         let krate = self.tcx.crate_name(def_path.krate).to_ident_string();
-        let paths =
-            def_path.data.iter().map(|segment| segment.as_sym(false).to_ident_string()).collect();
-        SolIdent { krate, paths }
+
+        // shortcut if we are at the crate root
+        if def_id.is_crate_root() {
+            return SolIdent::CrateRoot(krate);
+        }
+
+        // resolve parent
+        let parent = self.mk_ident(self.tcx.parent(def_id));
+        if parent.krate() != krate {
+            bug!("[invariant] parent crate name does not match: {} vs {krate}", parent.krate());
+        }
+        let parent = Box::new(parent);
+
+        // resolve the last path segment
+        let segment = match def_path.data.last() {
+            None => bug!("[invariant] no segment in def_path"),
+            Some(s) => s,
+        };
+
+        let ident = match &segment.data {
+            DefPathData::CrateRoot => {
+                bug!("[invariant] unexpected crate root segment in def path");
+            }
+            DefPathData::TypeNs(name) => SolIdent::TypeNs { parent, name: name.to_ident_string() },
+            DefPathData::ValueNs(name) => match self.tcx.def_kind(def_id) {
+                DefKind::Fn | DefKind::AssocFn => {
+                    SolIdent::FuncNs { parent, name: name.to_ident_string() }
+                }
+                _ => {
+                    bug!(
+                        "[invariant] unexpected value name {} for def kind {}",
+                        name.to_ident_string(),
+                        self.tcx.def_kind_descr(self.tcx.def_kind(def_id), def_id)
+                    );
+                }
+            },
+            DefPathData::Impl => match self.tcx.trait_id_of_impl(def_id) {
+                None => {
+                    bug!("[assumption] unexpected inherent impl {}", self.tcx.def_path_str(def_id))
+                }
+                Some(trait_id) => {
+                    SolIdent::TraitImpl { parent, trait_ident: Box::new(self.mk_ident(trait_id)) }
+                }
+            },
+
+            // unsupported or unrelated
+            DefPathData::MacroNs(name) => {
+                bug!("[assumption] unexpected macro namespace segment {name} in def path");
+            }
+            DefPathData::LifetimeNs(name) => {
+                bug!("[assumption] unexpected lifetime namespace segment {name} in def path");
+            }
+            DefPathData::Use => {
+                bug!("[assumption] unexpected use segment in def path");
+            }
+            DefPathData::Closure => {
+                bug!("[assumption] unexpected closure segment in def path");
+            }
+            DefPathData::Ctor => {
+                bug!("[assumption] unexpected ctor segment in def path");
+            }
+            DefPathData::ForeignMod => {
+                bug!("[assumption] unexpected extern segment in def path");
+            }
+            DefPathData::GlobalAsm => {
+                bug!("[unsupported] global asm segment in def path");
+            }
+            DefPathData::AnonConst
+            | DefPathData::OpaqueTy
+            | DefPathData::OpaqueLifetime(..)
+            | DefPathData::AnonAssocTy(..)
+            | DefPathData::SyntheticCoroutineBody
+            | DefPathData::NestedStatic => {
+                bug!("[invariant] unexpected segment in def path: {segment:?}");
+            }
+        };
+
+        // insert into the cache
+        self.id_cache.insert(def_id, ident.clone());
+
+        // return ident
+        ident
     }
 
     /// Create a type
@@ -807,6 +906,15 @@ impl<'tcx> SolContextBuilder<'tcx> {
             return (ident, ty_args);
         }
 
+        // check if this is a known function
+        match BuiltinFunction::try_to_resolve(&ident, &ty_args) {
+            None => (), /* continue construction */
+            Some(_) => {
+                info!("{}-- builtin function {def_desc}", self.depth);
+                return (ident, ty_args);
+            }
+        }
+
         // mark start
         self.depth.push();
         info!("{}-> function {def_desc}", self.depth);
@@ -832,22 +940,15 @@ impl<'tcx> SolContextBuilder<'tcx> {
         let mut args = vec![];
         for arg_idx in body.args_iter() {
             let decl = &body.local_decls[arg_idx];
-            let norm_ty =
-                self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), decl.ty);
-            args.push(self.mk_type(norm_ty));
+            args.push(self.mk_type(decl.ty));
         }
-
-        let norm_ret_ty =
-            self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), body.return_ty());
-        let ret_ty = self.mk_type(norm_ret_ty);
+        let ret_ty = self.mk_type(body.return_ty());
 
         // convert function body
         let mut locals = vec![];
         for local_idx in body.vars_and_temps_iter() {
             let decl = &body.local_decls[local_idx];
-            let norm_ty =
-                self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), decl.ty);
-            locals.push(self.mk_type(norm_ty));
+            locals.push(self.mk_type(decl.ty));
         }
 
         let mut blocks = vec![];
@@ -914,7 +1015,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
  */
 
 /// A complete Solana context
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolContext {
     krate: String,
     ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTyDef)>,
@@ -926,34 +1027,36 @@ pub(crate) struct SolContext {
  */
 
 /// An identifier in the Solana context
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolIdent {
-    krate: String,
-    paths: Vec<String>,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolIdent {
+    CrateRoot(String),
+    TypeNs { parent: Box<SolIdent>, name: String },
+    FuncNs { parent: Box<SolIdent>, name: String },
+    TraitImpl { parent: Box<SolIdent>, trait_ident: Box<SolIdent> },
 }
 
 /// A field name
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolFieldName(String);
 
 /// A field index
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolFieldIndex(usize);
 
 /// A variant name
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolVariantName(String);
 
 /// A variant index
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolVariantIndex(usize);
 
 /// A slot number for locals
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolLocalSlot(usize);
 
 /// A basic block index
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolBlockId(usize);
 
 /*
@@ -961,7 +1064,7 @@ pub(crate) struct SolBlockId(usize);
  */
 
 /// Primitive integer types
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolTypeInt {
     I8,
     U8,
@@ -978,7 +1081,7 @@ pub(crate) enum SolTypeInt {
 }
 
 /// Primitive floating-point types
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolTypeFloat {
     F16,
     F32,
@@ -987,7 +1090,7 @@ pub(crate) enum SolTypeFloat {
 }
 
 /// All supported types in the Solana context
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolType {
     Never,
     Bool,
@@ -1008,7 +1111,7 @@ pub(crate) enum SolType {
 }
 
 /// User-defined type, i.e., an algebraic data type (ADT)
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolTyDef {
     Struct { fields: Vec<SolField> },
     Union { fields: Vec<SolField> },
@@ -1016,7 +1119,7 @@ pub(crate) enum SolTyDef {
 }
 
 /// A field definition in an ADT
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolField {
     index: SolFieldIndex,
     name: SolFieldName,
@@ -1024,7 +1127,7 @@ pub(crate) struct SolField {
 }
 
 /// A field definition in an ADT
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolVariant {
     index: SolVariantIndex,
     name: SolVariantName,
@@ -1032,13 +1135,13 @@ pub(crate) struct SolVariant {
 }
 
 /// A constant known in the type system
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolTyConst {
     Simple { ty: SolType, val: SolConst },
 }
 
 /// A generic argument
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolGenericArg {
     Type(SolType),
     Const(SolTyConst),
@@ -1087,14 +1190,14 @@ impl From<FloatTy> for SolTypeFloat {
  */
 
 /// A place
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolPlace {
     local: SolLocalSlot,
     projection: Vec<SolProjection>,
 }
 
 /// A projection operation
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolProjection {
     Deref,
     Field { field: SolFieldIndex, ty: SolType },
@@ -1106,14 +1209,14 @@ pub(crate) enum SolProjection {
 }
 
 /// A constant known in the operation system
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolOpConst {
     Type(SolType, SolConst),
     Value(SolType, SolConst),
 }
 
 /// An operand used in expressions
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolOperand {
     Copy(SolPlace),
     Move(SolPlace),
@@ -1124,7 +1227,7 @@ pub(crate) enum SolOperand {
  * Expression
  */
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolExpr {
     Use(SolOperand),
     Repeat(SolOperand, SolTyConst),
@@ -1142,7 +1245,7 @@ pub(crate) enum SolExpr {
     Load(SolPlace),
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolOpcodeCast {
     IntToInt,
     FloatToFloat,
@@ -1150,21 +1253,21 @@ pub(crate) enum SolOpcodeCast {
     FloatToInt,
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolOpcodeNullary {
     SizeOf,
     AlignOf,
     OffsetOf(Vec<(SolVariantIndex, SolFieldIndex)>),
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolOpcodeUnary {
     SizeOf,
     Not,
     Neg,
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolOpcodeBinary {
     Add(bool),
     Sub(bool),
@@ -1186,7 +1289,7 @@ pub(crate) enum SolOpcodeBinary {
     Offset,
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolOpcodeAggregate {
     Tuple,
     Array(SolType /* element type */),
@@ -1199,7 +1302,7 @@ pub(crate) enum SolOpcodeAggregate {
  * Control-flow
  */
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolStatement {
     Nop,
     Deinit(SolPlace),
@@ -1210,7 +1313,7 @@ pub(crate) enum SolStatement {
     SetDiscriminant { place: SolPlace, variant: SolVariantIndex },
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolTerminator {
     Unreachable,
     Return,
@@ -1222,14 +1325,14 @@ pub(crate) enum SolTerminator {
     TailCall { func: SolOperand, args: Vec<SolOperand> },
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolBasicBlock {
     id: SolBlockId,
     statements: Vec<SolStatement>,
     terminator: SolTerminator,
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolFnDef {
     args: Vec<SolType>,
     ret_ty: SolType,
@@ -1242,14 +1345,14 @@ pub(crate) struct SolFnDef {
  */
 
 /// A scalar value
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolScalar {
     bits: usize,
     value: u128,
 }
 
 /// A constant, used by both the type system and the value system
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolConst {
     ZeroSized,
     Scalar(SolScalar),
@@ -1287,5 +1390,17 @@ impl Depth {
 impl Display for Depth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", "  ".repeat(self.level))
+    }
+}
+
+impl SolIdent {
+    /// Find the root identifier
+    pub(crate) fn krate(&self) -> &str {
+        match self {
+            Self::CrateRoot(name) => name,
+            Self::TypeNs { parent, name: _ }
+            | Self::FuncNs { parent, name: _ }
+            | Self::TraitImpl { parent, trait_ident: _ } => parent.krate(),
+        }
     }
 }
