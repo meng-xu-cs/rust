@@ -1,22 +1,24 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 
+use rustc_abi::Size;
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_hir::definitions::DefPathData;
 use rustc_middle::bug;
-use rustc_middle::mir::interpret::Scalar;
+use rustc_middle::mir::interpret::{AllocId, AllocRange, CtfeProvenance, GlobalAlloc, Scalar};
 use rustc_middle::mir::{
-    AggregateKind, BinOp, BorrowKind, CastKind, Const as OpConst, ConstValue, MirPhase, NullOp,
-    Operand, Place, PlaceElem, RawPtrKind, RuntimePhase, Rvalue, Statement, StatementKind,
-    Terminator, TerminatorKind, UnOp, UnwindAction,
+    AggregateKind, BinOp, BorrowKind, CastKind, Const as OpConst, ConstValue, MirPhase,
+    NonDivergingIntrinsic, NullOp, Operand, Place, PlaceElem, RawPtrKind, RuntimePhase, Rvalue,
+    Statement, StatementKind, Terminator, TerminatorKind, UnOp, UnwindAction,
 };
 use rustc_middle::ty::{
     self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder, FloatTy,
     GenericArg, GenericArgKind, GenericArgsRef, Instance, IntTy, Ty, TyCtxt, TypingEnv, UintTy,
 };
+use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -38,11 +40,17 @@ pub(crate) struct SolContextBuilder<'tcx> {
     /// a cache of id to identifier mappings
     id_cache: FxHashMap<DefId, SolIdent>,
 
+    /// a cache of alloc id to global slot mappings
+    alloc_map: FxHashMap<AllocId, SolGlobalSlot>,
+
     /// collected definitions of datatypes
     ty_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolTyDef>>>,
 
     /// collected definitions of functions
     fn_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolFnDef>>>,
+
+    /// collected definitions of global variables
+    globals: BTreeMap<SolGlobalSlot, SolGlobalObject>,
 }
 
 impl<'tcx> SolContextBuilder<'tcx> {
@@ -53,8 +61,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
             sol,
             depth: Depth::new(),
             id_cache: FxHashMap::default(),
+            alloc_map: FxHashMap::default(),
             ty_defs: BTreeMap::new(),
             fn_defs: BTreeMap::new(),
+            globals: BTreeMap::new(),
         }
     }
 
@@ -105,9 +115,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
             },
             DefPathData::Impl => match self.tcx.trait_id_of_impl(def_id) {
-                None => {
-                    bug!("[assumption] unexpected inherent impl {}", self.tcx.def_path_str(def_id))
-                }
+                None => SolIdent::SelfImpl { parent },
                 Some(trait_id) => {
                     SolIdent::TraitImpl { parent, trait_ident: Box::new(self.mk_ident(trait_id)) }
                 }
@@ -440,8 +448,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 bits: scalar.size().bits_usize(),
                 value: scalar.to_bits_unchecked(),
             }),
-            ConstValue::Scalar(Scalar::Ptr(..)) => {
-                bug!("[assumption] unexpected ptr scalar for value constant: {val_const:?}");
+            ConstValue::Scalar(Scalar::Ptr(ptr, _ /* pointer size */)) => {
+                let (prov, offset) = ptr.prov_and_relative_offset();
+                SolConst::Pointer {
+                    origin: self.make_global(prov),
+                    offset: SolOffset(offset.bytes_usize()),
+                }
             }
             ConstValue::ZeroSized => SolConst::ZeroSized,
             ConstValue::Slice { .. } | ConstValue::Indirect { .. } => {
@@ -473,8 +485,16 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let const_ty = self.mk_type(ty);
                 SolOpConst::Value(const_ty, const_val)
             }
-            OpConst::Unevaluated(..) => {
-                bug!("[assumption] unexpected unevaluated constant: {op_const}");
+            OpConst::Unevaluated(unevaluated, ty) => {
+                let val_const = self
+                    .tcx
+                    .const_eval_resolve(TypingEnv::fully_monomorphized(), unevaluated, DUMMY_SP)
+                    .unwrap_or_else(|e| {
+                        bug!("[invariant] unable to resolve unevaluated constant {op_const}: {e:?}")
+                    });
+                let const_val = self.mk_val_const(val_const);
+                let const_ty = self.mk_type(ty);
+                SolOpConst::Value(const_ty, const_val)
             }
         }
     }
@@ -564,11 +584,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     CastKind::FloatToFloat => SolOpcodeCast::FloatToFloat,
                     CastKind::IntToFloat => SolOpcodeCast::IntToFloat,
                     CastKind::FloatToInt => SolOpcodeCast::FloatToInt,
-                    CastKind::Transmute
-                    | CastKind::PtrToPtr
-                    | CastKind::PointerCoercion(..)
-                    | CastKind::FnPtrToPtr => {
-                        bug!("[unsupported] reinterpret cast in cast op");
+                    CastKind::Transmute | CastKind::PtrToPtr | CastKind::FnPtrToPtr => {
+                        SolOpcodeCast::Reinterpret
+                    }
+                    CastKind::PointerCoercion(..) => {
+                        bug!("[unsupported] pointer coercision in cast op");
                     }
                     CastKind::PointerExposeProvenance | CastKind::PointerWithExposedProvenance => {
                         bug!("[assumption] unexpected cast kind: {cast_kind:?}")
@@ -591,9 +611,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             })
                             .collect(),
                     ),
-                    NullOp::UbChecks | NullOp::ContractChecks => {
-                        bug!("[unsupported] check in nullary op");
-                    }
+                    NullOp::UbChecks => SolOpcodeNullary::UbCheckEnabled,
+                    NullOp::ContractChecks => SolOpcodeNullary::ContractCheckEnabled,
                 };
                 SolExpr::OpNullary { opcode, ty: self.mk_type(*ty) }
             }
@@ -723,6 +742,16 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
     }
 
+    /// Create an unwind action
+    fn mk_unwind_action(&mut self, action: UnwindAction) -> SolUnwindAction {
+        match action {
+            UnwindAction::Continue => SolUnwindAction::Continue,
+            UnwindAction::Unreachable => SolUnwindAction::Unreachable,
+            UnwindAction::Terminate(_) => SolUnwindAction::Terminate,
+            UnwindAction::Cleanup(block) => SolUnwindAction::Cleanup(SolBlockId(block.index())),
+        }
+    }
+
     /// Create a statement
     fn mk_statement(&mut self, stmt: &Statement<'tcx>) -> SolStatement {
         // mark start
@@ -750,6 +779,15 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 SolStatement::StorageDead(SolLocalSlot(local_idx.index()))
             }
             StatementKind::PlaceMention(place) => SolStatement::Deinit(self.mk_place(**place)),
+            // intrinsic
+            StatementKind::Intrinsic(intrinsic) => match intrinsic.as_ref() {
+                NonDivergingIntrinsic::Assume(operand) => {
+                    SolStatement::Assume(self.mk_operand(operand))
+                }
+                NonDivergingIntrinsic::CopyNonOverlapping(..) => {
+                    bug!("[invariant] unexpected intrinsic statement {stmt:?}");
+                }
+            },
             // no-op
             StatementKind::Nop
             | StatementKind::ConstEvalCounter
@@ -762,9 +800,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
             StatementKind::Coverage(..) => {
                 bug!("[invariant] unexpected coverage statement {stmt:?}");
-            }
-            StatementKind::Intrinsic(..) => {
-                bug!("[invariant] unexpected intrinsic statement {stmt:?}");
             }
         };
 
@@ -806,32 +841,18 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 if drop.is_some() || async_fut.is_some() {
                     bug!("[invariant] unexpected async features in drop terminator");
                 }
-                if !matches!(
-                    unwind,
-                    UnwindAction::Continue
-                        | UnwindAction::Unreachable
-                        | UnwindAction::Terminate(..)
-                ) {
-                    bug!("[assumption] unexpected unwind action in drop terminator");
-                }
                 SolTerminator::Drop {
                     place: self.mk_place(*place),
                     target: SolBlockId(target.index()),
+                    unwind: self.mk_unwind_action(*unwind),
                 }
             }
             TerminatorKind::Assert { cond, expected, msg: _, target, unwind } => {
-                if !matches!(
-                    unwind,
-                    UnwindAction::Continue
-                        | UnwindAction::Unreachable
-                        | UnwindAction::Terminate(..)
-                ) {
-                    bug!("[assumption] unexpected unwind action in assert terminator");
-                }
                 SolTerminator::Assert {
                     cond: self.mk_operand(cond),
                     expected: *expected,
                     target: SolBlockId(target.index()),
+                    unwind: self.mk_unwind_action(*unwind),
                 }
             }
             TerminatorKind::Call {
@@ -843,14 +864,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 call_source: _,
                 fn_span: _,
             } => {
-                if !matches!(
-                    unwind,
-                    UnwindAction::Continue
-                        | UnwindAction::Unreachable
-                        | UnwindAction::Terminate(..)
-                ) {
-                    bug!("[assumption] unexpected unwind action in call terminator");
-                }
                 let converted_func = self.mk_operand(func);
                 let converted_args = args.iter().map(|arg| self.mk_operand(&arg.node)).collect();
                 let converted_dest = self.mk_place(*destination);
@@ -860,6 +873,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     args: converted_args,
                     dest: converted_dest,
                     target: converted_target,
+                    unwind: self.mk_unwind_action(*unwind),
                 }
             }
             TerminatorKind::TailCall { func, args, fn_span: _ } => {
@@ -867,11 +881,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let converted_args = args.iter().map(|arg| self.mk_operand(&arg.node)).collect();
                 SolTerminator::TailCall { func: converted_func, args: converted_args }
             }
+            TerminatorKind::UnwindResume => SolTerminator::UnwindResume,
+            TerminatorKind::UnwindTerminate(_) => SolTerminator::UnwindTerminate,
             TerminatorKind::InlineAsm { .. } => {
                 bug!("[unsupported] inline assembly {term:?}");
-            }
-            TerminatorKind::UnwindResume | TerminatorKind::UnwindTerminate(..) => {
-                bug!("[assumption] unexpected unwind-related terminator {term:?}");
             }
             TerminatorKind::Yield { .. } | TerminatorKind::CoroutineDrop => {
                 bug!("[assumption] unexpected async-related terminator {term:?}");
@@ -955,11 +968,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
         for (block_id, block_data) in body.basic_blocks.iter_enumerated() {
             info!("{}-- basic block {}", self.depth, block_id.index());
 
-            // sanity check
-            if block_data.is_cleanup {
-                bug!("[assumption] unexpected cleanup block found in function {def_desc}");
-            }
-
             // block data
             let statements =
                 block_data.statements.iter().map(|stmt| self.mk_statement(stmt)).collect();
@@ -980,6 +988,59 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
         // return the key to the lookup table
         (ident, ty_args)
+    }
+
+    /// Create a global variable definition
+    pub(crate) fn make_global(&mut self, prov: CtfeProvenance) -> SolGlobalSlot {
+        let alloc_id = prov.alloc_id();
+
+        // if already defined or is being defined, return the key
+        if let Some(slot) = self.alloc_map.get(&alloc_id) {
+            return slot.clone();
+        }
+
+        // now analyze the global variable
+        let global = match self.tcx.global_alloc(alloc_id) {
+            GlobalAlloc::Function { instance } => {
+                let (ident, ty_args) = self.make_instance(instance);
+                SolGlobalObject::Function(ident, ty_args)
+            }
+            GlobalAlloc::Memory(memory) => {
+                let memory = memory.inner();
+
+                let bytes = memory
+                    .get_bytes_strip_provenance(
+                        &self.tcx,
+                        AllocRange { start: Size::ZERO, size: memory.size() },
+                    )
+                    .unwrap_or_else(|_| {
+                        bug!("[invariant] failed to read memory for global allocation {alloc_id:?}")
+                    })
+                    .to_vec();
+
+                let mut prov = BTreeMap::new();
+                for (offset, ptr) in memory.provenance().ptrs().iter() {
+                    prov.insert(SolOffset(offset.bytes_usize()), self.make_global(*ptr));
+                }
+
+                let align = SolAlign(memory.align.bytes_usize());
+                match memory.mutability {
+                    Mutability::Not => SolGlobalObject::ImmData { bytes, provenance: prov, align },
+                    Mutability::Mut => SolGlobalObject::MutData { bytes, provenance: prov, align },
+                }
+            }
+            GlobalAlloc::Static(..) => bug!("[invariant] unexpected static global variable"),
+            GlobalAlloc::VTable(..) => bug!("[unsupported] vtable in global variable"),
+            GlobalAlloc::TypeId { .. } => bug!("[unsupported] type id in global variable"),
+        };
+
+        // update the global variable lookup table
+        let key = SolGlobalSlot(self.globals.len());
+        self.globals.insert(key.clone(), global);
+        self.alloc_map.insert(alloc_id, key.clone());
+
+        // return the key
+        key
     }
 
     /// Build the context
@@ -1006,7 +1067,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
         }
 
-        (self.sol, SolContext { krate, ty_defs, fn_defs })
+        let mut globals = vec![];
+        for (slot, global) in self.globals.into_iter() {
+            globals.push((slot, global));
+        }
+
+        (self.sol, SolContext { krate, ty_defs, fn_defs, globals })
     }
 }
 
@@ -1020,6 +1086,7 @@ pub(crate) struct SolContext {
     krate: String,
     ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTyDef)>,
     fn_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolFnDef)>,
+    globals: Vec<(SolGlobalSlot, SolGlobalObject)>,
 }
 
 /*
@@ -1032,6 +1099,7 @@ pub(crate) enum SolIdent {
     CrateRoot(String),
     TypeNs { parent: Box<SolIdent>, name: String },
     FuncNs { parent: Box<SolIdent>, name: String },
+    SelfImpl { parent: Box<SolIdent> },
     TraitImpl { parent: Box<SolIdent>, trait_ident: Box<SolIdent> },
 }
 
@@ -1058,6 +1126,10 @@ pub(crate) struct SolLocalSlot(usize);
 /// A basic block index
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolBlockId(usize);
+
+/// A location id for global values
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolGlobalSlot(usize);
 
 /*
  * Typing
@@ -1251,6 +1323,7 @@ pub(crate) enum SolOpcodeCast {
     FloatToFloat,
     IntToFloat,
     FloatToInt,
+    Reinterpret,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1258,6 +1331,8 @@ pub(crate) enum SolOpcodeNullary {
     SizeOf,
     AlignOf,
     OffsetOf(Vec<(SolVariantIndex, SolFieldIndex)>),
+    UbCheckEnabled,
+    ContractCheckEnabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1303,6 +1378,14 @@ pub(crate) enum SolOpcodeAggregate {
  */
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolUnwindAction {
+    Continue,
+    Unreachable,
+    Terminate,
+    Cleanup(SolBlockId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolStatement {
     Nop,
     Deinit(SolPlace),
@@ -1310,6 +1393,7 @@ pub(crate) enum SolStatement {
     StorageDead(SolLocalSlot),
     PlaceMention(SolPlace),
     Assign { lhs: SolPlace, rhs: SolExpr },
+    Assume(SolOperand),
     SetDiscriminant { place: SolPlace, variant: SolVariantIndex },
 }
 
@@ -1317,12 +1401,38 @@ pub(crate) enum SolStatement {
 pub(crate) enum SolTerminator {
     Unreachable,
     Return,
-    Goto { target: SolBlockId },
-    Switch { cond: SolOperand, targets: Vec<(u128, SolBlockId)>, otherwise: SolBlockId },
-    Drop { place: SolPlace, target: SolBlockId },
-    Assert { cond: SolOperand, expected: bool, target: SolBlockId },
-    Call { func: SolOperand, args: Vec<SolOperand>, dest: SolPlace, target: Option<SolBlockId> },
-    TailCall { func: SolOperand, args: Vec<SolOperand> },
+    Goto {
+        target: SolBlockId,
+    },
+    Switch {
+        cond: SolOperand,
+        targets: Vec<(u128, SolBlockId)>,
+        otherwise: SolBlockId,
+    },
+    Drop {
+        place: SolPlace,
+        target: SolBlockId,
+        unwind: SolUnwindAction,
+    },
+    Assert {
+        cond: SolOperand,
+        expected: bool,
+        target: SolBlockId,
+        unwind: SolUnwindAction,
+    },
+    Call {
+        func: SolOperand,
+        args: Vec<SolOperand>,
+        dest: SolPlace,
+        target: Option<SolBlockId>,
+        unwind: SolUnwindAction,
+    },
+    TailCall {
+        func: SolOperand,
+        args: Vec<SolOperand>,
+    },
+    UnwindResume,
+    UnwindTerminate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1341,8 +1451,25 @@ pub(crate) struct SolFnDef {
 }
 
 /*
+ * Global
+ */
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolGlobalObject {
+    ImmData { bytes: Vec<u8>, provenance: BTreeMap<SolOffset, SolGlobalSlot>, align: SolAlign },
+    MutData { bytes: Vec<u8>, provenance: BTreeMap<SolOffset, SolGlobalSlot>, align: SolAlign },
+    Function(SolIdent, Vec<SolGenericArg>),
+}
+
+/*
  * Shared
  */
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolOffset(usize);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolAlign(usize);
 
 /// A scalar value
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1356,6 +1483,7 @@ pub(crate) struct SolScalar {
 pub(crate) enum SolConst {
     ZeroSized,
     Scalar(SolScalar),
+    Pointer { origin: SolGlobalSlot, offset: SolOffset },
 }
 
 /*
@@ -1400,6 +1528,7 @@ impl SolIdent {
             Self::CrateRoot(name) => name,
             Self::TypeNs { parent, name: _ }
             | Self::FuncNs { parent, name: _ }
+            | Self::SelfImpl { parent }
             | Self::TraitImpl { parent, trait_ident: _ } => parent.krate(),
         }
     }
