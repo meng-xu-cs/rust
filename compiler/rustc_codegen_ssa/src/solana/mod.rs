@@ -1,5 +1,6 @@
 use rustc_middle::ty::{Instance, TyCtxt};
 
+pub(crate) mod builtin;
 pub(crate) mod common;
 pub(crate) mod context;
 pub(crate) mod pipeline_anchor;
