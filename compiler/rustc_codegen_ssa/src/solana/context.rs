@@ -82,6 +82,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
         // now construct the identifier
         let def_path = self.tcx.def_path(def_id);
+        let def_path_str = self.tcx.def_path_str(def_id);
         let krate = self.tcx.crate_name(def_path.krate).to_ident_string();
 
         // shortcut if we are at the crate root
@@ -98,13 +99,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
         // resolve the last path segment
         let segment = match def_path.data.last() {
-            None => bug!("[invariant] no segment in def_path"),
+            None => bug!("[invariant] no segment in def path: {def_path_str}"),
             Some(s) => s,
         };
 
         let ident = match &segment.data {
             DefPathData::CrateRoot => {
-                bug!("[invariant] unexpected crate root segment in def path");
+                bug!("[invariant] unexpected crate root segment in def path: {def_path_str}");
             }
             DefPathData::TypeNs(name) => SolIdent::TypeNs { parent, name: name.to_ident_string() },
             DefPathData::ValueNs(name) => match self.tcx.def_kind(def_id) {
@@ -125,28 +126,26 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     SolIdent::TraitImpl { parent, trait_ident: Box::new(self.mk_ident(trait_id)) }
                 }
             },
+            DefPathData::ForeignMod => SolIdent::Extern { parent },
 
             // unsupported or unrelated
             DefPathData::MacroNs(name) => {
-                bug!("[assumption] unexpected macro namespace segment {name} in def path");
+                bug!("[assumption] unexpected macro segment {name} in def path: {def_path_str}");
             }
             DefPathData::LifetimeNs(name) => {
-                bug!("[assumption] unexpected lifetime namespace segment {name} in def path");
+                bug!("[assumption] unexpected lifetime segment {name} in def path: {def_path_str}");
             }
             DefPathData::Use => {
-                bug!("[assumption] unexpected use segment in def path");
+                bug!("[assumption] unexpected use segment in def path: {def_path_str}");
             }
             DefPathData::Closure => {
-                bug!("[assumption] unexpected closure segment in def path");
+                bug!("[assumption] unexpected closure segment in def path: {def_path_str}");
             }
             DefPathData::Ctor => {
-                bug!("[assumption] unexpected ctor segment in def path");
-            }
-            DefPathData::ForeignMod => {
-                bug!("[assumption] unexpected extern segment in def path");
+                bug!("[assumption] unexpected ctor segment in def path: {def_path_str}");
             }
             DefPathData::GlobalAsm => {
-                bug!("[unsupported] global asm segment in def path");
+                bug!("[unsupported] global asm segment in def path: {def_path_str}");
             }
             DefPathData::AnonConst
             | DefPathData::OpaqueTy
@@ -154,7 +153,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             | DefPathData::AnonAssocTy(..)
             | DefPathData::SyntheticCoroutineBody
             | DefPathData::NestedStatic => {
-                bug!("[invariant] unexpected segment in def path: {segment:?}");
+                bug!("[invariant] unexpected segment {segment:?} in def path: {def_path_str}");
             }
         };
 
@@ -639,7 +638,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let opcode = match op {
                     UnOp::Not => SolOpcodeUnary::Not,
                     UnOp::Neg => SolOpcodeUnary::Neg,
-                    UnOp::PtrMetadata => bug!("[invariant] unexpected unary opcode: {op:?}"),
+                    UnOp::PtrMetadata => SolOpcodeUnary::PtrMetadata,
                 };
                 SolExpr::OpUnary { opcode, val: self.mk_operand(operand) }
             }
@@ -730,14 +729,18 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             }
                         }
                     }
+                    AggregateKind::RawPtr(ty, mutability) => {
+                        let pointee_ty = self.mk_type(*ty);
+                        match mutability {
+                            Mutability::Not => SolOpcodeAggregate::ImmPtr { pointee_ty },
+                            Mutability::Mut => SolOpcodeAggregate::MutPtr { pointee_ty },
+                        }
+                    }
                     AggregateKind::Closure(..) => {
                         bug!("[assumption] unexpected closure in aggregate conversion");
                     }
                     AggregateKind::Coroutine(..) | AggregateKind::CoroutineClosure(..) => {
                         bug!("[invariant] unexpected coroutine in aggregate conversion");
-                    }
-                    AggregateKind::RawPtr(..) => {
-                        bug!("[assumption] unexpected raw ptr in aggregate conversion");
                     }
                 };
                 let vals = operands
@@ -960,7 +963,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
         // mark start
         self.depth.push();
-        info!("{}-> function {def_desc}", self.depth);
+        warn!("{}-> function {def_desc}", self.depth);
 
         // convert the instance to monomorphised MIR
         let instance_mir = self.tcx.instance_mir(instance.def).clone();
@@ -1013,7 +1016,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         self.fn_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), Some(fn_def));
 
         // mark end
-        info!("{}<- function {def_desc}", self.depth);
+        warn!("{}<- function {def_desc}", self.depth);
         self.depth.pop();
 
         // return the key to the lookup table
@@ -1123,6 +1126,7 @@ pub(crate) enum SolIdent {
     FuncNs { parent: Box<SolIdent>, name: String },
     SelfImpl { parent: Box<SolIdent> },
     TraitImpl { parent: Box<SolIdent>, trait_ident: Box<SolIdent> },
+    Extern { parent: Box<SolIdent> },
 }
 
 /// A field name
@@ -1359,9 +1363,9 @@ pub(crate) enum SolOpcodeNullary {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolOpcodeUnary {
-    SizeOf,
     Not,
     Neg,
+    PtrMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1393,6 +1397,8 @@ pub(crate) enum SolOpcodeAggregate {
     Struct { ty: SolType },
     Union { ty: SolType, field: SolFieldIndex },
     Enum { ty: SolType, variant: SolVariantIndex },
+    ImmPtr { pointee_ty: SolType },
+    MutPtr { pointee_ty: SolType },
 }
 
 /*
@@ -1553,7 +1559,8 @@ impl SolIdent {
             Self::TypeNs { parent, name: _ }
             | Self::FuncNs { parent, name: _ }
             | Self::SelfImpl { parent }
-            | Self::TraitImpl { parent, trait_ident: _ } => parent.krate(),
+            | Self::TraitImpl { parent, trait_ident: _ }
+            | Self::Extern { parent } => parent.krate(),
         }
     }
 }
