@@ -13,6 +13,8 @@ pub(crate) enum BuiltinFunction {
     IntrinsicsRawEq,
     /// core::hint::assert_unchecked::precondition_check
     HintAssertPreconditionCheck,
+    /// core::alloc::layout::|self|::from_size_align_unchecked::precondition_check
+    AllocFromSizeAlignPreconditionCheck,
 }
 
 enum InternalNs {
@@ -21,6 +23,7 @@ enum InternalNs {
     IntrinsicsColdPath,
     IntrinsicsRawEq,
     HintAssertPreconditionCheck,
+    AllocFromSizeAlignPreconditionCheck,
 }
 
 impl InternalNs {
@@ -35,6 +38,9 @@ impl InternalNs {
                 Self::try_to_match(parent, segments)
             }
             SolIdent::TypeNs { parent, name } if name == segment => {
+                Self::try_to_match(parent, segments)
+            }
+            SolIdent::SelfImpl { parent } if segment == "|self|" => {
                 Self::try_to_match(parent, segments)
             }
             _ => false,
@@ -55,6 +61,18 @@ impl InternalNs {
             vec!["core", "hint", "assert_unchecked", "precondition_check"],
         ) {
             Some(Self::HintAssertPreconditionCheck)
+        } else if Self::try_to_match(
+            ident,
+            vec![
+                "core",
+                "alloc",
+                "layout",
+                "|self|",
+                "from_size_align_unchecked",
+                "precondition_check",
+            ],
+        ) {
+            Some(Self::AllocFromSizeAlignPreconditionCheck)
         } else {
             None
         }
@@ -88,6 +106,9 @@ impl BuiltinFunction {
                 InternalNs::IntrinsicsColdPath => Self::IntrinsicsColdPath,
                 InternalNs::IntrinsicsRawEq => Self::IntrinsicsRawEq,
                 InternalNs::HintAssertPreconditionCheck => Self::HintAssertPreconditionCheck,
+                InternalNs::AllocFromSizeAlignPreconditionCheck => {
+                    Self::AllocFromSizeAlignPreconditionCheck
+                }
                 InternalNs::DerefMut => return None,
             };
             return Some(resolved);
@@ -118,7 +139,10 @@ impl Display for BuiltinFunction {
             Self::IntrinsicsAbort => write!(f, "abort"),
             Self::IntrinsicsColdPath => write!(f, "cold_path"),
             Self::IntrinsicsRawEq => write!(f, "raw_eq"),
-            Self::HintAssertPreconditionCheck => write!(f, "precondition_check"),
+            Self::HintAssertPreconditionCheck => write!(f, "assert_unchecked::precondition_check"),
+            Self::AllocFromSizeAlignPreconditionCheck => {
+                write!(f, "from_size_align_unchecked::precondition_check")
+            }
         }
     }
 }
