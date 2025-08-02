@@ -54,7 +54,7 @@ pub(crate) struct SolContextBuilder<'tcx> {
     globals: BTreeMap<SolGlobalSlot, SolGlobalObject>,
 
     /// functions without MIRs available
-    dep_fns: BTreeSet<SolIdent>,
+    dep_fns: BTreeMap<SolIdent, BTreeSet<Vec<SolGenericArg>>>,
 }
 
 impl<'tcx> SolContextBuilder<'tcx> {
@@ -69,7 +69,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             ty_defs: BTreeMap::new(),
             fn_defs: BTreeMap::new(),
             globals: BTreeMap::new(),
-            dep_fns: BTreeSet::new(),
+            dep_fns: BTreeMap::new(),
         }
     }
 
@@ -949,15 +949,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
         // convert the instance to monomorphised MIR
         if !self.tcx.is_mir_available(def_id) {
-            if !ty_args.is_empty() {
-                bug!("[invariant] monomorphized function does not have MIR: {def_desc}");
+            info!("{}-- external dependency: {def_desc}", self.depth);
+            if !self.dep_fns.contains_key(&ident) {
+                warn!("external dependency: {def_desc}");
             }
 
-            info!("{}-- external dependency: {def_desc}", self.depth);
-            let inserted = self.dep_fns.insert(ident.clone());
-            if inserted {
-                warn!("exteranl dependency: {def_desc}");
-            }
+            self.dep_fns.entry(ident.clone()).or_default().insert(ty_args.clone());
             return (ident, ty_args);
         }
 
@@ -965,6 +962,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         self.depth.push();
         info!("{}-> function {def_desc}", self.depth);
 
+        // convert the instance to monomorphised MIR
         let instance_mir = self.tcx.instance_mir(instance.def).clone();
         if instance_mir.phase != MirPhase::Runtime(RuntimePhase::Optimized) {
             bug!("[assumption] converted instance is not runtime optimized: {def_desc}");
