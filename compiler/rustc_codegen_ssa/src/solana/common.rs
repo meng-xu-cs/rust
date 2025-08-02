@@ -128,12 +128,12 @@ impl SolEnv {
         self.output_dir.join(self.phase.to_string())
     }
 
-    /// Return the output directory for a new instance
-    fn instance_output_dir(&self) -> PathBuf {
+    /// Return the output directory for a fresh item
+    fn fresh_output_dir(&self, prefix: &str) -> PathBuf {
         let phase_output = self.phase_output_dir();
         let mut counter = 0;
         loop {
-            let subdir = phase_output.join(counter.to_string());
+            let subdir = phase_output.join(format!("{prefix}{counter}"));
             match fs::create_dir(&subdir) {
                 Ok(()) => return subdir,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -141,7 +141,7 @@ impl SolEnv {
                     continue;
                 }
                 Err(e) => {
-                    bug!("[invariant] failed to create output directory {counter}: {e}");
+                    bug!("[invariant] failed to create output directory {prefix}{counter}: {e}");
                 }
             }
         }
@@ -149,7 +149,7 @@ impl SolEnv {
 
     pub(crate) fn save_instance_info<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
         // prepare for output directory
-        let instance_outdir = self.instance_output_dir();
+        let instance_outdir = self.fresh_output_dir("i");
 
         // dump the MIR to file
         let mut file_mir = File::create(instance_outdir.join("body.mir"))
@@ -171,7 +171,8 @@ impl SolEnv {
     }
 
     pub(crate) fn serialize_to_file<T: Serialize>(&self, tag: &str, data: &T) {
-        let file_path = self.phase_output_dir().join(format!("{tag}.json"));
+        let file_outdir = self.fresh_output_dir("f");
+        let file_path = file_outdir.join(format!("{tag}.json"));
         if file_path.exists() {
             bug!("[invariant] file {file_path:?} already exists");
         }
