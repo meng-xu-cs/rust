@@ -1,10 +1,10 @@
 use std::fmt::Display;
 
-use crate::solana::context::{SolGenericArg, SolIdent};
+use tracing::warn;
+
+use crate::solana::context::SolIdent;
 
 pub(crate) enum BuiltinFunction {
-    /// deref mut from std::ops
-    DerefMut,
     /// core::intrinsics::abort
     IntrinsicsAbort,
     /// core::intrinsics::cold_path
@@ -15,18 +15,13 @@ pub(crate) enum BuiltinFunction {
     HintAssertPreconditionCheck,
     /// core::alloc::layout::|self|::from_size_align_unchecked::precondition_check
     AllocFromSizeAlignPreconditionCheck,
+    /// core::ptr::non_null::|self|::new_unchecked::precondition_check
+    PtrNonNullNewPreconditionCheck,
+    /// core::ptr::copy_nonoverlapping::precondition_check
+    CopyNonOverlappingPreconditionCheck,
 }
 
-enum InternalNs {
-    DerefMut,
-    IntrinsicsAbort,
-    IntrinsicsColdPath,
-    IntrinsicsRawEq,
-    HintAssertPreconditionCheck,
-    AllocFromSizeAlignPreconditionCheck,
-}
-
-impl InternalNs {
+impl BuiltinFunction {
     fn try_to_match(ident: &SolIdent, mut segments: Vec<&'static str>) -> bool {
         let segment = match segments.pop() {
             None => return false,
@@ -47,10 +42,10 @@ impl InternalNs {
         }
     }
 
-    fn try_to_resolve(ident: &SolIdent) -> Option<Self> {
-        if Self::try_to_match(ident, vec!["core", "ops", "deref", "DerefMut"]) {
-            Some(Self::DerefMut)
-        } else if Self::try_to_match(ident, vec!["core", "intrinsics", "abort"]) {
+    pub(crate) fn try_to_resolve(ident: &SolIdent) -> Option<Self> {
+        warn!("trying to resolve builtin function: {ident:#?}");
+
+        if Self::try_to_match(ident, vec!["core", "intrinsics", "abort"]) {
             Some(Self::IntrinsicsAbort)
         } else if Self::try_to_match(ident, vec!["core", "intrinsics", "cold_path"]) {
             Some(Self::IntrinsicsColdPath)
@@ -73,61 +68,18 @@ impl InternalNs {
             ],
         ) {
             Some(Self::AllocFromSizeAlignPreconditionCheck)
+        } else if Self::try_to_match(
+            ident,
+            vec!["core", "ptr", "non_null", "|self|", "new_unchecked", "precondition_check"],
+        ) {
+            Some(Self::PtrNonNullNewPreconditionCheck)
+        } else if Self::try_to_match(
+            ident,
+            vec!["core", "ptr", "copy_nonoverlapping", "precondition_check"],
+        ) {
+            Some(Self::CopyNonOverlappingPreconditionCheck)
         } else {
             None
-        }
-    }
-}
-
-enum InternalTrait {
-    DerefMut,
-}
-
-impl InternalTrait {
-    fn try_to_resolve(ident: &SolIdent) -> Option<Self> {
-        match ident {
-            SolIdent::TraitImpl { parent: _, trait_ident } => {
-                match InternalNs::try_to_resolve(trait_ident)? {
-                    InternalNs::DerefMut => Some(Self::DerefMut),
-                    _ => return None,
-                }
-            }
-            _ => return None,
-        }
-    }
-}
-
-impl BuiltinFunction {
-    /// Try to resolve an instance into a builtin function
-    pub(crate) fn try_to_resolve(ident: &SolIdent, _ty_args: &[SolGenericArg]) -> Option<Self> {
-        if let Some(internal_ns) = InternalNs::try_to_resolve(ident) {
-            let resolved = match internal_ns {
-                InternalNs::IntrinsicsAbort => Self::IntrinsicsAbort,
-                InternalNs::IntrinsicsColdPath => Self::IntrinsicsColdPath,
-                InternalNs::IntrinsicsRawEq => Self::IntrinsicsRawEq,
-                InternalNs::HintAssertPreconditionCheck => Self::HintAssertPreconditionCheck,
-                InternalNs::AllocFromSizeAlignPreconditionCheck => {
-                    Self::AllocFromSizeAlignPreconditionCheck
-                }
-                InternalNs::DerefMut => return None,
-            };
-            return Some(resolved);
-        }
-
-        match ident {
-            SolIdent::FuncNs { parent, name } => {
-                match name.as_str() {
-                    "deref_mut" => {
-                        if matches!(InternalTrait::try_to_resolve(parent)?, InternalTrait::DerefMut)
-                        {
-                            return Some(Self::DerefMut);
-                        }
-                    }
-                    _ => return None,
-                }
-                return None;
-            }
-            _ => return None,
         }
     }
 }
@@ -135,13 +87,20 @@ impl BuiltinFunction {
 impl Display for BuiltinFunction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DerefMut => write!(f, "deref_mut"),
             Self::IntrinsicsAbort => write!(f, "abort"),
             Self::IntrinsicsColdPath => write!(f, "cold_path"),
             Self::IntrinsicsRawEq => write!(f, "raw_eq"),
-            Self::HintAssertPreconditionCheck => write!(f, "assert_unchecked::precondition_check"),
+            Self::HintAssertPreconditionCheck => {
+                write!(f, "hint::assert::precondition_check")
+            }
             Self::AllocFromSizeAlignPreconditionCheck => {
-                write!(f, "from_size_align_unchecked::precondition_check")
+                write!(f, "alloc::from_size_align::precondition_check")
+            }
+            Self::PtrNonNullNewPreconditionCheck => {
+                write!(f, "non_null::new::precondition_check")
+            }
+            Self::CopyNonOverlappingPreconditionCheck => {
+                write!(f, "copy_nonoverlapping::precondition_check")
             }
         }
     }
