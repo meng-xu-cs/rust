@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 
 use rustc_abi::Size;
@@ -14,6 +14,7 @@ use rustc_middle::mir::{
     NonDivergingIntrinsic, NullOp, Operand, Place, PlaceElem, RawPtrKind, RuntimePhase, Rvalue,
     Statement, StatementKind, Terminator, TerminatorKind, UnOp, UnwindAction,
 };
+use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
     self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder, FloatTy,
     GenericArg, GenericArgKind, GenericArgsRef, Instance, IntTy, Ty, TyCtxt, TypingEnv, UintTy,
@@ -21,7 +22,7 @@ use rustc_middle::ty::{
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::solana::builtin::BuiltinFunction;
 use crate::solana::common::SolEnv;
@@ -51,6 +52,9 @@ pub(crate) struct SolContextBuilder<'tcx> {
 
     /// collected definitions of global variables
     globals: BTreeMap<SolGlobalSlot, SolGlobalObject>,
+
+    /// functions without MIRs available
+    dep_fns: BTreeSet<SolIdent>,
 }
 
 impl<'tcx> SolContextBuilder<'tcx> {
@@ -65,6 +69,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             ty_defs: BTreeMap::new(),
             fn_defs: BTreeMap::new(),
             globals: BTreeMap::new(),
+            dep_fns: BTreeSet::new(),
         }
     }
 
@@ -587,9 +592,16 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     CastKind::Transmute | CastKind::PtrToPtr | CastKind::FnPtrToPtr => {
                         SolOpcodeCast::Reinterpret
                     }
-                    CastKind::PointerCoercion(..) => {
-                        bug!("[unsupported] pointer coercision in cast op");
-                    }
+                    CastKind::PointerCoercion(coercion_type, _) => match coercion_type {
+                        PointerCoercion::MutToConstPointer
+                        | PointerCoercion::ArrayToPointer
+                        | PointerCoercion::Unsize => SolOpcodeCast::Reinterpret,
+                        PointerCoercion::ReifyFnPointer
+                        | PointerCoercion::UnsafeFnPointer
+                        | PointerCoercion::ClosureFnPointer(_) => {
+                            bug!("[unsupported] fn pointer coercion in cast op");
+                        }
+                    },
                     CastKind::PointerExposeProvenance | CastKind::PointerWithExposedProvenance => {
                         bug!("[assumption] unexpected cast kind: {cast_kind:?}")
                     }
@@ -923,16 +935,29 @@ impl<'tcx> SolContextBuilder<'tcx> {
         match BuiltinFunction::try_to_resolve(&ident, &ty_args) {
             None => (), /* continue construction */
             Some(_) => {
-                info!("{}-- builtin function {def_desc}", self.depth);
+                info!("{}-- builtin function: {def_desc}", self.depth);
                 return (ident, ty_args);
             }
+        }
+
+        // convert the instance to monomorphised MIR
+        if !self.tcx.is_mir_available(def_id) {
+            if !ty_args.is_empty() {
+                bug!("[invariant] monomorphized function does not have MIR: {def_desc}");
+            }
+
+            info!("{}-- external dependency: {def_desc}", self.depth);
+            let inserted = self.dep_fns.insert(ident.clone());
+            if inserted {
+                warn!("exteranl dependency: {def_desc}");
+            }
+            return (ident, ty_args);
         }
 
         // mark start
         self.depth.push();
         info!("{}-> function {def_desc}", self.depth);
 
-        // convert the instance to monomorphised MIR
         let instance_mir = self.tcx.instance_mir(instance.def).clone();
         if instance_mir.phase != MirPhase::Runtime(RuntimePhase::Optimized) {
             bug!("[assumption] converted instance is not runtime optimized: {def_desc}");
@@ -1009,13 +1034,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let memory = memory.inner();
 
                 let bytes = memory
-                    .get_bytes_strip_provenance(
-                        &self.tcx,
-                        AllocRange { start: Size::ZERO, size: memory.size() },
-                    )
-                    .unwrap_or_else(|_| {
-                        bug!("[invariant] failed to read memory for global allocation {alloc_id:?}")
-                    })
+                    .get_bytes_unchecked(AllocRange { start: Size::ZERO, size: memory.size() })
                     .to_vec();
 
                 let mut prov = BTreeMap::new();
