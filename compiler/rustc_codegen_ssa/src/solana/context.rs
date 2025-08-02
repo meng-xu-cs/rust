@@ -8,7 +8,7 @@ use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_hir::definitions::DefPathData;
 use rustc_middle::bug;
-use rustc_middle::mir::interpret::{AllocId, AllocRange, CtfeProvenance, GlobalAlloc, Scalar};
+use rustc_middle::mir::interpret::{AllocId, AllocRange, GlobalAlloc, Scalar};
 use rustc_middle::mir::{
     AggregateKind, BinOp, BorrowKind, CastKind, Const as OpConst, ConstValue, MirPhase,
     NonDivergingIntrinsic, NullOp, Operand, Place, PlaceElem, RawPtrKind, RuntimePhase, Rvalue,
@@ -456,13 +456,20 @@ impl<'tcx> SolContextBuilder<'tcx> {
             ConstValue::Scalar(Scalar::Ptr(ptr, _ /* pointer size */)) => {
                 let (prov, offset) = ptr.prov_and_relative_offset();
                 SolConst::Pointer {
-                    origin: self.make_global(prov),
+                    origin: self.make_global(prov.alloc_id()),
                     offset: SolOffset(offset.bytes_usize()),
                 }
             }
             ConstValue::ZeroSized => SolConst::ZeroSized,
-            ConstValue::Slice { .. } | ConstValue::Indirect { .. } => {
-                bug!("[assumption] unexpected value constant kind: {val_const:?}");
+            ConstValue::Slice { alloc_id, meta } => {
+                let origin = self.make_global(alloc_id);
+                let length = meta as usize;
+                SolConst::Slice { origin, length }
+            }
+            ConstValue::Indirect { alloc_id, offset } => {
+                let origin = self.make_global(alloc_id);
+                let offset = SolOffset(offset.bytes_usize());
+                SolConst::Indirect { origin, offset }
             }
         }
     }
@@ -1016,9 +1023,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
     }
 
     /// Create a global variable definition
-    pub(crate) fn make_global(&mut self, prov: CtfeProvenance) -> SolGlobalSlot {
-        let alloc_id = prov.alloc_id();
-
+    pub(crate) fn make_global(&mut self, alloc_id: AllocId) -> SolGlobalSlot {
         // if already defined or is being defined, return the key
         if let Some(slot) = self.alloc_map.get(&alloc_id) {
             return slot.clone();
@@ -1039,7 +1044,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
                 let mut prov = BTreeMap::new();
                 for (offset, ptr) in memory.provenance().ptrs().iter() {
-                    prov.insert(SolOffset(offset.bytes_usize()), self.make_global(*ptr));
+                    prov.insert(SolOffset(offset.bytes_usize()), self.make_global(ptr.alloc_id()));
                 }
 
                 let align = SolAlign(memory.align.bytes_usize());
@@ -1502,6 +1507,8 @@ pub(crate) struct SolScalar {
 pub(crate) enum SolConst {
     ZeroSized,
     Scalar(SolScalar),
+    Slice { origin: SolGlobalSlot, length: usize },
+    Indirect { origin: SolGlobalSlot, offset: SolOffset },
     Pointer { origin: SolGlobalSlot, offset: SolOffset },
 }
 
