@@ -9,6 +9,8 @@ pub(crate) enum BuiltinFunction {
     IntrinsicsAbort,
     /// core::intrinsics::cold_path
     IntrinsicsColdPath,
+    /// core::intrinsics::raw_eq
+    IntrinsicsRawEq,
     /// core::hint::assert_unchecked::precondition_check
     HintAssertPreconditionCheck,
 }
@@ -17,6 +19,7 @@ enum InternalNs {
     DerefMut,
     IntrinsicsAbort,
     IntrinsicsColdPath,
+    IntrinsicsRawEq,
     HintAssertPreconditionCheck,
 }
 
@@ -45,6 +48,8 @@ impl InternalNs {
             Some(Self::IntrinsicsAbort)
         } else if Self::try_to_match(ident, vec!["core", "intrinsics", "cold_path"]) {
             Some(Self::IntrinsicsColdPath)
+        } else if Self::try_to_match(ident, vec!["core", "intrinsics", "raw_eq"]) {
+            Some(Self::IntrinsicsRawEq)
         } else if Self::try_to_match(
             ident,
             vec!["core", "hint", "assert_unchecked", "precondition_check"],
@@ -81,6 +86,7 @@ impl BuiltinFunction {
             let resolved = match internal_ns {
                 InternalNs::IntrinsicsAbort => Self::IntrinsicsAbort,
                 InternalNs::IntrinsicsColdPath => Self::IntrinsicsColdPath,
+                InternalNs::IntrinsicsRawEq => Self::IntrinsicsRawEq,
                 InternalNs::HintAssertPreconditionCheck => Self::HintAssertPreconditionCheck,
                 InternalNs::DerefMut => return None,
             };
@@ -111,6 +117,7 @@ impl Display for BuiltinFunction {
             Self::DerefMut => write!(f, "deref_mut"),
             Self::IntrinsicsAbort => write!(f, "abort"),
             Self::IntrinsicsColdPath => write!(f, "cold_path"),
+            Self::IntrinsicsRawEq => write!(f, "raw_eq"),
             Self::HintAssertPreconditionCheck => write!(f, "precondition_check"),
         }
     }
