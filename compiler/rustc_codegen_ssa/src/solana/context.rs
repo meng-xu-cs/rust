@@ -806,8 +806,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 NonDivergingIntrinsic::Assume(operand) => {
                     SolStatement::Assume(self.mk_operand(operand))
                 }
-                NonDivergingIntrinsic::CopyNonOverlapping(..) => {
-                    bug!("[invariant] unexpected intrinsic statement {stmt:?}");
+                NonDivergingIntrinsic::CopyNonOverlapping(details) => {
+                    SolStatement::CopyNonoverlapping {
+                        src: self.mk_operand(&details.src),
+                        dst: self.mk_operand(&details.dst),
+                        count: self.mk_operand(&details.count),
+                    }
                 }
             },
             // no-op
@@ -942,7 +946,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
 
         // check if this is a known function
-        match BuiltinFunction::try_to_resolve(&ident, &ty_args) {
+        match BuiltinFunction::try_to_resolve(&ident) {
             None => (), /* continue construction */
             Some(_) => {
                 info!("{}-- builtin function: {def_desc}", self.depth);
@@ -1422,6 +1426,7 @@ pub(crate) enum SolStatement {
     PlaceMention(SolPlace),
     Assign { lhs: SolPlace, rhs: SolExpr },
     Assume(SolOperand),
+    CopyNonoverlapping { src: SolOperand, dst: SolOperand, count: SolOperand },
     SetDiscriminant { place: SolPlace, variant: SolVariantIndex },
 }
 
