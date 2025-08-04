@@ -15,6 +15,7 @@ use rustc_middle::mir::{
     Statement, StatementKind, Terminator, TerminatorKind, UnOp, UnwindAction,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
+use rustc_middle::ty::fast_reject::SimplifiedType;
 use rustc_middle::ty::{
     self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder, FloatTy,
     GenericArg, GenericArgKind, GenericArgsRef, ImplSubject, Instance, IntTy, Ty, TyCtxt,
@@ -36,11 +37,17 @@ pub(crate) struct SolContextBuilder<'tcx> {
     /// solana environment
     sol: SolEnv,
 
+    /// inherent impls for types
+    inherent_impls: FxHashMap<DefId, LocalDefId>,
+
+    /// incoherent impls for types
+    incoherent_impls: FxHashMap<DefId, SolTagType>,
+
     /// depth of the current context
     depth: Depth,
 
-    /// inherent impls for types
-    inherent_impls: FxHashMap<DefId, LocalDefId>,
+    /// generics context
+    generics: Vec<GenericArgsRef<'tcx>>,
 
     /// a cache of id to identifier mappings
     id_cache: FxHashMap<DefId, SolIdent>,
@@ -65,8 +72,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
     /// Create a new context builder
     pub(crate) fn new(tcx: TyCtxt<'tcx>, sol: SolEnv) -> Self {
         // construct the inherent impl to type mapping
+        let (all_impls, result) = tcx.crate_inherent_impls(());
+        result.unwrap_or_else(|_| bug!("[invariant] failed to retrieve inherent impls"));
+
         let mut inherent_impls = FxHashMap::default();
-        let (all_impls, _) = tcx.crate_inherent_impls(());
         for (local_ty_id, impls) in all_impls.inherent_impls.iter() {
             for impl_id in impls {
                 let existing = inherent_impls.insert(*impl_id, *local_ty_id);
@@ -76,12 +85,25 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
         }
 
+        // construct the incoherent impl to type mapping
+        let mut incoherent_impls = FxHashMap::default();
+        for (tag_ty, simplified_ty) in SolTagType::supported_simplified_types() {
+            for impl_id in tcx.incoherent_impls(simplified_ty) {
+                let existing = incoherent_impls.insert(*impl_id, tag_ty.clone());
+                if existing.is_some() {
+                    bug!("an incoherent impl is mapped to more than one type");
+                }
+            }
+        }
+
         // construct the context builder
         Self {
             tcx,
             sol,
-            depth: Depth::new(),
             inherent_impls,
+            incoherent_impls,
+            depth: Depth::new(),
+            generics: Vec::new(),
             id_cache: FxHashMap::default(),
             alloc_map: FxHashMap::default(),
             ty_defs: BTreeMap::new(),
@@ -140,23 +162,31 @@ impl<'tcx> SolContextBuilder<'tcx> {
             },
             DefPathData::Impl => match self.tcx.trait_id_of_impl(def_id) {
                 None => match self.inherent_impls.get(&def_id) {
-                    None => {
-                        let subject = self.tcx.impl_subject(def_id);
-                        // TODO: do not skip binder
-                        match subject.skip_binder() {
-                            ImplSubject::Trait(..) => bug!(
-                                "[invariant] impl subject is a trait for an inherent impl {def_path_str}"
-                            ),
-                            ImplSubject::Inherent(subject_ty) => {
-                                warn!(
-                                    "[invariant] impl subject is an inherent type {subject_ty} for an inherent impl {def_path_str}"
-                                );
+                    None => match self.incoherent_impls.get(&def_id) {
+                        None => {
+                            let subject = self.tcx.instantiate_and_normalize_erasing_regions(
+                                self.generics.last().unwrap_or_else(|| {
+                                    bug!("[invariant] no generic arguments in context")
+                                }),
+                                TypingEnv::fully_monomorphized(),
+                                self.tcx.impl_subject(def_id),
+                            );
+                            match subject {
+                                ImplSubject::Trait(..) => {
+                                    bug!(
+                                        "[invariant] unexpected trait as impl subject for {def_path_str}"
+                                    )
+                                }
+                                ImplSubject::Inherent(subject_ty) => SolIdent::TypeImpl {
+                                    parent,
+                                    ty: Box::new(self.mk_type(subject_ty)),
+                                },
                             }
                         }
-                        bug!(
-                            "[invariant] unable to find self type for inherent impl {def_path_str}"
-                        );
-                    }
+                        Some(type_tag) => {
+                            SolIdent::OtherImpl { parent, type_tag: type_tag.clone() }
+                        }
+                    },
                     Some(local_ty_id) => {
                         let self_ident = self.mk_ident(local_ty_id.to_def_id());
                         SolIdent::SelfImpl { parent, self_ident: Box::new(self_ident) }
@@ -313,6 +343,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         // mark start
         self.depth.push();
         info!("{}-> adt definition", self.depth);
+        self.generics.push(generics);
 
         // first update the entry to mark that type definition in progress
         self.ty_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), None);
@@ -387,6 +418,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         self.ty_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), Some(ty_def));
 
         // mark end
+        self.generics.pop();
         info!("{}<- adt definition", self.depth);
         self.depth.pop();
 
@@ -1008,6 +1040,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         // mark start
         self.depth.push();
         warn!("{}-> function {def_desc}", self.depth);
+        self.generics.push(instance.args);
 
         // convert the instance to monomorphised MIR
         let instance_mir = self.tcx.instance_mir(instance.def).clone();
@@ -1060,6 +1093,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         self.fn_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), Some(fn_def));
 
         // mark end
+        self.generics.pop();
         warn!("{}<- function {def_desc}", self.depth);
         self.depth.pop();
 
@@ -1170,6 +1204,8 @@ pub(crate) enum SolIdent {
     FuncNs { parent: Box<SolIdent>, name: String },
     SelfImpl { parent: Box<SolIdent>, self_ident: Box<SolIdent> },
     TraitImpl { parent: Box<SolIdent>, trait_ident: Box<SolIdent> },
+    TypeImpl { parent: Box<SolIdent>, ty: Box<SolType> },
+    OtherImpl { parent: Box<SolIdent>, type_tag: SolTagType },
     Extern { parent: Box<SolIdent> },
 }
 
@@ -1290,6 +1326,21 @@ pub(crate) enum SolGenericArg {
     Lifetime,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolTagType {
+    Bool,
+    Char,
+    Int(SolTypeInt),
+    Float(SolTypeFloat),
+    Str,
+    Array,
+    Slice,
+    ImmRef,
+    MutRef,
+    ImmPtr,
+    MutPtr,
+}
+
 impl From<IntTy> for SolTypeInt {
     fn from(t: IntTy) -> Self {
         match t {
@@ -1324,6 +1375,39 @@ impl From<FloatTy> for SolTypeFloat {
             FloatTy::F64 => Self::F64,
             FloatTy::F128 => Self::F128,
         }
+    }
+}
+
+impl SolTagType {
+    /// A mapping of supported simplified types
+    fn supported_simplified_types() -> BTreeMap<Self, SimplifiedType> {
+        let mut map = BTreeMap::new();
+
+        map.insert(Self::Bool, SimplifiedType::Bool);
+        map.insert(Self::Char, SimplifiedType::Char);
+        map.insert(Self::Int(SolTypeInt::I8), SimplifiedType::Int(IntTy::I8));
+        map.insert(Self::Int(SolTypeInt::U8), SimplifiedType::Uint(UintTy::U8));
+        map.insert(Self::Int(SolTypeInt::I16), SimplifiedType::Int(IntTy::I16));
+        map.insert(Self::Int(SolTypeInt::U16), SimplifiedType::Uint(UintTy::U16));
+        map.insert(Self::Int(SolTypeInt::I32), SimplifiedType::Int(IntTy::I32));
+        map.insert(Self::Int(SolTypeInt::U32), SimplifiedType::Uint(UintTy::U32));
+        map.insert(Self::Int(SolTypeInt::I64), SimplifiedType::Int(IntTy::I64));
+        map.insert(Self::Int(SolTypeInt::U64), SimplifiedType::Uint(UintTy::U64));
+        map.insert(Self::Int(SolTypeInt::I128), SimplifiedType::Int(IntTy::I128));
+        map.insert(Self::Int(SolTypeInt::U128), SimplifiedType::Uint(UintTy::U128));
+        map.insert(Self::Float(SolTypeFloat::F16), SimplifiedType::Float(FloatTy::F16));
+        map.insert(Self::Float(SolTypeFloat::F32), SimplifiedType::Float(FloatTy::F32));
+        map.insert(Self::Float(SolTypeFloat::F64), SimplifiedType::Float(FloatTy::F64));
+        map.insert(Self::Float(SolTypeFloat::F128), SimplifiedType::Float(FloatTy::F128));
+        map.insert(Self::Str, SimplifiedType::Str);
+        map.insert(Self::Array, SimplifiedType::Array);
+        map.insert(Self::Slice, SimplifiedType::Slice);
+        map.insert(Self::ImmRef, SimplifiedType::Ref(Mutability::Not));
+        map.insert(Self::MutRef, SimplifiedType::Ref(Mutability::Mut));
+        map.insert(Self::ImmPtr, SimplifiedType::Ptr(Mutability::Not));
+        map.insert(Self::MutPtr, SimplifiedType::Ptr(Mutability::Mut));
+
+        map
     }
 }
 
@@ -1596,8 +1680,6 @@ impl Display for Depth {
     }
 }
 
-// TODO: remove the mark
-#[allow(dead_code)]
 impl SolIdent {
     /// Find the root identifier
     pub(crate) fn krate(&self) -> &str {
@@ -1607,6 +1689,8 @@ impl SolIdent {
             | Self::FuncNs { parent, name: _ }
             | Self::SelfImpl { parent, self_ident: _ }
             | Self::TraitImpl { parent, trait_ident: _ }
+            | Self::TypeImpl { parent, ty: _ }
+            | Self::OtherImpl { parent, type_tag: _ }
             | Self::Extern { parent } => parent.krate(),
         }
     }
@@ -1624,17 +1708,28 @@ impl SolIdent {
         Self::FuncNs { parent: Box::new(self.clone()), name: name.to_string() }
     }
 
-    pub(crate) fn with_self_impl(self: &Self, self_ident: &Self) -> Self {
-        Self::SelfImpl { parent: Box::new(self.clone()), self_ident: Box::new(self_ident.clone()) }
+    // FIXME: remove the mark
+    #[allow(dead_code)]
+    pub(crate) fn with_self_impl(self: &Self, self_ident: Self) -> Self {
+        Self::SelfImpl { parent: Box::new(self.clone()), self_ident: Box::new(self_ident) }
     }
 
-    pub(crate) fn with_trait_impl(self: &Self, trait_ident: &Self) -> Self {
-        Self::TraitImpl {
-            parent: Box::new(self.clone()),
-            trait_ident: Box::new(trait_ident.clone()),
-        }
+    pub(crate) fn with_trait_impl(self: &Self, trait_ident: Self) -> Self {
+        Self::TraitImpl { parent: Box::new(self.clone()), trait_ident: Box::new(trait_ident) }
     }
 
+    pub(crate) fn with_type_impl(self: &Self, ty: SolType) -> Self {
+        Self::TypeImpl { parent: Box::new(self.clone()), ty: Box::new(ty) }
+    }
+
+    // FIXME: remove the mark
+    #[allow(dead_code)]
+    pub(crate) fn with_other_impl(self: &Self, type_tag: SolTagType) -> Self {
+        Self::OtherImpl { parent: Box::new(self.clone()), type_tag }
+    }
+
+    // FIXME: remove the mark
+    #[allow(dead_code)]
     pub(crate) fn with_extern(self: &Self) -> Self {
         Self::Extern { parent: Box::new(self.clone()) }
     }
