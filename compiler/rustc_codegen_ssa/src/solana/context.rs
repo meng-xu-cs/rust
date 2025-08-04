@@ -5,7 +5,7 @@ use rustc_abi::Size;
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::DefKind;
-use rustc_hir::def_id::LOCAL_CRATE;
+use rustc_hir::def_id::{LOCAL_CRATE, LocalDefId};
 use rustc_hir::definitions::DefPathData;
 use rustc_middle::bug;
 use rustc_middle::mir::interpret::{AllocId, AllocRange, GlobalAlloc, Scalar};
@@ -17,7 +17,8 @@ use rustc_middle::mir::{
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
     self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder, FloatTy,
-    GenericArg, GenericArgKind, GenericArgsRef, Instance, IntTy, Ty, TyCtxt, TypingEnv, UintTy,
+    GenericArg, GenericArgKind, GenericArgsRef, ImplSubject, Instance, IntTy, Ty, TyCtxt,
+    TypingEnv, UintTy,
 };
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
@@ -37,6 +38,9 @@ pub(crate) struct SolContextBuilder<'tcx> {
 
     /// depth of the current context
     depth: Depth,
+
+    /// inherent impls for types
+    inherent_impls: FxHashMap<DefId, LocalDefId>,
 
     /// a cache of id to identifier mappings
     id_cache: FxHashMap<DefId, SolIdent>,
@@ -60,10 +64,24 @@ pub(crate) struct SolContextBuilder<'tcx> {
 impl<'tcx> SolContextBuilder<'tcx> {
     /// Create a new context builder
     pub(crate) fn new(tcx: TyCtxt<'tcx>, sol: SolEnv) -> Self {
+        // construct the inherent impl to type mapping
+        let mut inherent_impls = FxHashMap::default();
+        let (all_impls, _) = tcx.crate_inherent_impls(());
+        for (local_ty_id, impls) in all_impls.inherent_impls.iter() {
+            for impl_id in impls {
+                let existing = inherent_impls.insert(*impl_id, *local_ty_id);
+                if existing.is_some() {
+                    bug!("an inherent impl is mapped to more than one type");
+                }
+            }
+        }
+
+        // construct the context builder
         Self {
             tcx,
             sol,
             depth: Depth::new(),
+            inherent_impls,
             id_cache: FxHashMap::default(),
             alloc_map: FxHashMap::default(),
             ty_defs: BTreeMap::new(),
@@ -121,7 +139,29 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
             },
             DefPathData::Impl => match self.tcx.trait_id_of_impl(def_id) {
-                None => SolIdent::SelfImpl { parent },
+                None => match self.inherent_impls.get(&def_id) {
+                    None => {
+                        let subject = self.tcx.impl_subject(def_id);
+                        // TODO: do not skip binder
+                        match subject.skip_binder() {
+                            ImplSubject::Trait(..) => bug!(
+                                "[invariant] impl subject is a trait for an inherent impl {def_path_str}"
+                            ),
+                            ImplSubject::Inherent(subject_ty) => {
+                                warn!(
+                                    "[invariant] impl subject is an inherent type {subject_ty} for an inherent impl {def_path_str}"
+                                );
+                            }
+                        }
+                        bug!(
+                            "[invariant] unable to find self type for inherent impl {def_path_str}"
+                        );
+                    }
+                    Some(local_ty_id) => {
+                        let self_ident = self.mk_ident(local_ty_id.to_def_id());
+                        SolIdent::SelfImpl { parent, self_ident: Box::new(self_ident) }
+                    }
+                },
                 Some(trait_id) => {
                     SolIdent::TraitImpl { parent, trait_ident: Box::new(self.mk_ident(trait_id)) }
                 }
@@ -1128,7 +1168,7 @@ pub(crate) enum SolIdent {
     CrateRoot(String),
     TypeNs { parent: Box<SolIdent>, name: String },
     FuncNs { parent: Box<SolIdent>, name: String },
-    SelfImpl { parent: Box<SolIdent> },
+    SelfImpl { parent: Box<SolIdent>, self_ident: Box<SolIdent> },
     TraitImpl { parent: Box<SolIdent>, trait_ident: Box<SolIdent> },
     Extern { parent: Box<SolIdent> },
 }
@@ -1556,6 +1596,8 @@ impl Display for Depth {
     }
 }
 
+// TODO: remove the mark
+#[allow(dead_code)]
 impl SolIdent {
     /// Find the root identifier
     pub(crate) fn krate(&self) -> &str {
@@ -1563,9 +1605,37 @@ impl SolIdent {
             Self::CrateRoot(name) => name,
             Self::TypeNs { parent, name: _ }
             | Self::FuncNs { parent, name: _ }
-            | Self::SelfImpl { parent }
+            | Self::SelfImpl { parent, self_ident: _ }
             | Self::TraitImpl { parent, trait_ident: _ }
             | Self::Extern { parent } => parent.krate(),
         }
+    }
+
+    /// Create a new identifier for the crate root
+    pub(crate) fn from_root(name: &str) -> Self {
+        Self::CrateRoot(name.to_string())
+    }
+
+    pub(crate) fn with_type_ns(self: &Self, name: &str) -> Self {
+        Self::TypeNs { parent: Box::new(self.clone()), name: name.to_string() }
+    }
+
+    pub(crate) fn with_func_ns(self: &Self, name: &str) -> Self {
+        Self::FuncNs { parent: Box::new(self.clone()), name: name.to_string() }
+    }
+
+    pub(crate) fn with_self_impl(self: &Self, self_ident: &Self) -> Self {
+        Self::SelfImpl { parent: Box::new(self.clone()), self_ident: Box::new(self_ident.clone()) }
+    }
+
+    pub(crate) fn with_trait_impl(self: &Self, trait_ident: &Self) -> Self {
+        Self::TraitImpl {
+            parent: Box::new(self.clone()),
+            trait_ident: Box::new(trait_ident.clone()),
+        }
+    }
+
+    pub(crate) fn with_extern(self: &Self) -> Self {
+        Self::Extern { parent: Box::new(self.clone()) }
     }
 }
