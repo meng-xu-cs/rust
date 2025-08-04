@@ -1148,6 +1148,15 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
     /// Build the context
     pub(crate) fn build(self) -> (SolEnv, SolContext) {
+        // check we are balanced on stack
+        if self.depth.level != 0 {
+            bug!("[invariant] depth stack is not balanced");
+        }
+        if !self.generics.is_empty() {
+            bug!("[invariant] generics stack is not empty");
+        }
+
+        // unpack the fields
         let krate = self.tcx.crate_name(LOCAL_CRATE).to_ident_string();
 
         let mut ty_defs = vec![];
@@ -1175,7 +1184,14 @@ impl<'tcx> SolContextBuilder<'tcx> {
             globals.push((slot, global));
         }
 
-        (self.sol, SolContext { krate, ty_defs, fn_defs, globals })
+        let mut dep_fns = vec![];
+        for (ident, mono_set) in self.dep_fns.into_iter() {
+            for mono in mono_set.into_iter() {
+                dep_fns.push((ident.clone(), mono));
+            }
+        }
+
+        (self.sol, SolContext { krate, ty_defs, fn_defs, globals, dep_fns })
     }
 }
 
@@ -1190,6 +1206,7 @@ pub(crate) struct SolContext {
     ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTyDef)>,
     fn_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolFnDef)>,
     globals: Vec<(SolGlobalSlot, SolGlobalObject)>,
+    dep_fns: Vec<(SolIdent, Vec<SolGenericArg>)>,
 }
 
 /*
