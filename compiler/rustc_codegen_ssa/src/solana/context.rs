@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Display;
 
 use rustc_abi::Size;
@@ -65,7 +65,7 @@ pub(crate) struct SolContextBuilder<'tcx> {
     globals: BTreeMap<SolGlobalSlot, SolGlobalObject>,
 
     /// functions without MIRs available
-    dep_fns: BTreeMap<SolIdent, BTreeSet<Vec<SolGenericArg>>>,
+    dep_fns: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, SolInstDesc>>,
 }
 
 impl<'tcx> SolContextBuilder<'tcx> {
@@ -147,10 +147,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
             DefPathData::CrateRoot => {
                 bug!("[invariant] unexpected crate root segment in def path: {def_path_str}");
             }
-            DefPathData::TypeNs(name) => SolIdent::TypeNs { parent, name: name.to_ident_string() },
+            DefPathData::TypeNs(name) => {
+                SolIdent::TypeNs { parent, name: SolTypeNs(name.to_ident_string()) }
+            }
             DefPathData::ValueNs(name) => match self.tcx.def_kind(def_id) {
                 DefKind::Fn | DefKind::AssocFn => {
-                    SolIdent::FuncNs { parent, name: name.to_ident_string() }
+                    SolIdent::FuncNs { parent, name: SolFuncNs(name.to_ident_string()) }
                 }
                 _ => {
                     bug!(
@@ -1029,11 +1031,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
         // convert the instance to monomorphised MIR
         if !self.tcx.is_mir_available(def_id) {
             info!("{}-- external dependency: {def_desc}", self.depth);
-            if !self.dep_fns.contains_key(&ident) {
+            let deps_by_ident = self.dep_fns.entry(ident.clone()).or_default();
+            if !deps_by_ident.contains_key(&ty_args) {
                 warn!("external dependency: {def_desc}");
+                let inst_desc = self.tcx.def_path_str_with_args(def_id, instance.args);
+                deps_by_ident.insert(ty_args.clone(), SolInstDesc(inst_desc));
             }
-
-            self.dep_fns.entry(ident.clone()).or_default().insert(ty_args.clone());
             return (ident, ty_args);
         }
 
@@ -1185,9 +1188,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
 
         let mut dep_fns = vec![];
-        for (ident, mono_set) in self.dep_fns.into_iter() {
-            for mono in mono_set.into_iter() {
-                dep_fns.push((ident.clone(), mono));
+        for (ident, descs) in self.dep_fns.into_iter() {
+            for (mono, desc) in descs.into_iter() {
+                dep_fns.push((ident.clone(), mono, desc));
             }
         }
 
@@ -1206,7 +1209,7 @@ pub(crate) struct SolContext {
     ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTyDef)>,
     fn_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolFnDef)>,
     globals: Vec<(SolGlobalSlot, SolGlobalObject)>,
-    dep_fns: Vec<(SolIdent, Vec<SolGenericArg>)>,
+    dep_fns: Vec<(SolIdent, Vec<SolGenericArg>, SolInstDesc)>,
 }
 
 /*
@@ -1217,14 +1220,26 @@ pub(crate) struct SolContext {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolIdent {
     CrateRoot(String),
-    TypeNs { parent: Box<SolIdent>, name: String },
-    FuncNs { parent: Box<SolIdent>, name: String },
+    TypeNs { parent: Box<SolIdent>, name: SolTypeNs },
+    FuncNs { parent: Box<SolIdent>, name: SolFuncNs },
     SelfImpl { parent: Box<SolIdent>, self_ident: Box<SolIdent> },
     TraitImpl { parent: Box<SolIdent>, trait_ident: Box<SolIdent> },
     TypeImpl { parent: Box<SolIdent>, ty: Box<SolType> },
     OtherImpl { parent: Box<SolIdent>, type_tag: SolTagType },
     Extern { parent: Box<SolIdent> },
 }
+
+/// A description of an instance
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolInstDesc(String);
+
+/// A typing namespace item
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolTypeNs(pub String);
+
+/// A function namespace item
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolFuncNs(pub String);
 
 /// A field name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1718,11 +1733,11 @@ impl SolIdent {
     }
 
     pub(crate) fn with_type_ns(self: &Self, name: &str) -> Self {
-        Self::TypeNs { parent: Box::new(self.clone()), name: name.to_string() }
+        Self::TypeNs { parent: Box::new(self.clone()), name: SolTypeNs(name.to_string()) }
     }
 
     pub(crate) fn with_func_ns(self: &Self, name: &str) -> Self {
-        Self::FuncNs { parent: Box::new(self.clone()), name: name.to_string() }
+        Self::FuncNs { parent: Box::new(self.clone()), name: SolFuncNs(name.to_string()) }
     }
 
     // FIXME: remove the mark
