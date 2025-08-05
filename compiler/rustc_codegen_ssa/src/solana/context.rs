@@ -1059,6 +1059,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
     }
 }
 
+/* --- BEGIN OF SYNC --- */
+
 /*
  * Context
  */
@@ -1216,43 +1218,6 @@ pub(crate) enum SolGenericArg {
     Type(SolType),
     Const(SolTyConst),
     Lifetime,
-}
-
-impl From<IntTy> for SolTypeInt {
-    fn from(t: IntTy) -> Self {
-        match t {
-            IntTy::I8 => Self::I8,
-            IntTy::I16 => Self::I16,
-            IntTy::I32 => Self::I32,
-            IntTy::I64 => Self::I64,
-            IntTy::I128 => Self::I128,
-            IntTy::Isize => Self::Isize,
-        }
-    }
-}
-
-impl From<UintTy> for SolTypeInt {
-    fn from(t: UintTy) -> Self {
-        match t {
-            UintTy::U8 => Self::U8,
-            UintTy::U16 => Self::U16,
-            UintTy::U32 => Self::U32,
-            UintTy::U64 => Self::U64,
-            UintTy::U128 => Self::U128,
-            UintTy::Usize => Self::Usize,
-        }
-    }
-}
-
-impl From<FloatTy> for SolTypeFloat {
-    fn from(t: FloatTy) -> Self {
-        match t {
-            FloatTy::F16 => Self::F16,
-            FloatTy::F32 => Self::F32,
-            FloatTy::F64 => Self::F64,
-            FloatTy::F128 => Self::F128,
-        }
-    }
 }
 
 /*
@@ -1509,6 +1474,49 @@ pub(crate) enum SolBuiltinFunc {
     AllocLayoutFromSizeAlignPreconditionCheck,
     CopyNonOverlappingPreconditionCheck,
     VecSetLenPreconditionCheck,
+}
+
+/* --- END OF SYNC --- */
+
+/*
+ * Implementations
+ */
+
+impl From<IntTy> for SolTypeInt {
+    fn from(t: IntTy) -> Self {
+        match t {
+            IntTy::I8 => Self::I8,
+            IntTy::I16 => Self::I16,
+            IntTy::I32 => Self::I32,
+            IntTy::I64 => Self::I64,
+            IntTy::I128 => Self::I128,
+            IntTy::Isize => Self::Isize,
+        }
+    }
+}
+
+impl From<UintTy> for SolTypeInt {
+    fn from(t: UintTy) -> Self {
+        match t {
+            UintTy::U8 => Self::U8,
+            UintTy::U16 => Self::U16,
+            UintTy::U32 => Self::U32,
+            UintTy::U64 => Self::U64,
+            UintTy::U128 => Self::U128,
+            UintTy::Usize => Self::Usize,
+        }
+    }
+}
+
+impl From<FloatTy> for SolTypeFloat {
+    fn from(t: FloatTy) -> Self {
+        match t {
+            FloatTy::F16 => Self::F16,
+            FloatTy::F32 => Self::F32,
+            FloatTy::F64 => Self::F64,
+            FloatTy::F128 => Self::F128,
+        }
+    }
 }
 
 impl SolBuiltinFunc {
