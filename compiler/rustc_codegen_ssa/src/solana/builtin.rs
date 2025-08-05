@@ -117,11 +117,17 @@ impl BuiltinFunction {
             (
                 SolIdent::FuncNs { parent, name },
                 SolIdent::FuncNs { parent: target_parent, name: target_name },
-            ) => Self::string_match(name, target_name) && Self::ident_match(parent, target_parent),
+            ) => {
+                Self::string_match(&name.0, &target_name.0)
+                    && Self::ident_match(parent, target_parent)
+            }
             (
                 SolIdent::TypeNs { parent, name },
                 SolIdent::TypeNs { parent: target_parent, name: target_name },
-            ) => Self::string_match(name, target_name) && Self::ident_match(parent, target_parent),
+            ) => {
+                Self::string_match(&name.0, &target_name.0)
+                    && Self::ident_match(parent, target_parent)
+            }
             (
                 SolIdent::SelfImpl { parent, self_ident },
                 SolIdent::SelfImpl { parent: target_parent, self_ident: target_self_ident },
