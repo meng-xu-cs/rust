@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 
+use regex::Regex;
 use rustc_abi::Size;
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_hir::definitions::DefPathData;
 use rustc_middle::bug;
 use rustc_middle::mir::interpret::{AllocId, AllocRange, GlobalAlloc, Scalar};
 use rustc_middle::mir::{
@@ -17,15 +16,13 @@ use rustc_middle::mir::{
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
     self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder, FloatTy,
-    GenericArg, GenericArgKind, GenericArgsRef, ImplSubject, Instance, IntTy, Ty, TyCtxt,
-    TypingEnv, UintTy,
+    GenericArg, GenericArgKind, GenericArgsRef, Instance, IntTy, Ty, TyCtxt, TypingEnv, UintTy,
 };
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::solana::builtin::BuiltinFunction;
 use crate::solana::common::SolEnv;
 
 /// A builder for creating a Solana context
@@ -36,11 +33,11 @@ pub(crate) struct SolContextBuilder<'tcx> {
     /// solana environment
     sol: SolEnv,
 
+    /// All built-in functions
+    builtin_funcs: BTreeMap<SolBuiltinFunc, Regex>,
+
     /// depth of the current context
     depth: Depth,
-
-    /// generics context
-    generics: Vec<GenericArgsRef<'tcx>>,
 
     /// a cache of id to identifier mappings
     id_cache: FxHashMap<DefId, SolIdent>,
@@ -67,8 +64,14 @@ impl<'tcx> SolContextBuilder<'tcx> {
         Self {
             tcx,
             sol,
+            builtin_funcs: SolBuiltinFunc::all()
+                .into_iter()
+                .map(|func| {
+                    let regex = func.regex();
+                    (func, regex)
+                })
+                .collect(),
             depth: Depth::new(),
-            generics: Vec::new(),
             id_cache: FxHashMap::default(),
             alloc_map: FxHashMap::default(),
             ty_defs: BTreeMap::new(),
@@ -86,101 +89,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
 
         // now construct the identifier
-        let def_path = self.tcx.def_path(def_id);
         let def_path_str = self.tcx.def_path_str(def_id);
-        let krate = SolCrateName(self.tcx.crate_name(def_path.krate).to_ident_string());
+        let def_path_hash = self.tcx.def_path_hash(def_id);
 
-        // shortcut if we are at the crate root
-        if def_id.is_crate_root() {
-            return SolIdent::CrateRoot(krate);
-        }
-
-        // resolve parent
-        let parent = self.mk_ident(self.tcx.parent(def_id));
-        if parent.krate() != &krate {
-            bug!(
-                "[invariant] parent crate name does not match: {} vs {}",
-                parent.krate().0,
-                krate.0
-            );
-        }
-        let parent = Box::new(parent);
-
-        // resolve the last path segment
-        let segment = match def_path.data.last() {
-            None => bug!("[invariant] no segment in def path: {def_path_str}"),
-            Some(s) => s,
-        };
-
-        let ident = match &segment.data {
-            DefPathData::CrateRoot => {
-                bug!("[invariant] unexpected crate root segment in def path: {def_path_str}");
-            }
-            DefPathData::TypeNs(name) => {
-                SolIdent::TypeNs { parent, name: SolTypeNs(name.to_ident_string()) }
-            }
-            DefPathData::ValueNs(name) => match self.tcx.def_kind(def_id) {
-                DefKind::Fn | DefKind::AssocFn => {
-                    SolIdent::FuncNs { parent, name: SolFuncNs(name.to_ident_string()) }
-                }
-                _ => {
-                    bug!(
-                        "[invariant] unexpected value name {} for def kind {}",
-                        name.to_ident_string(),
-                        self.tcx.def_kind_descr(self.tcx.def_kind(def_id), def_id)
-                    );
-                }
-            },
-            DefPathData::Impl => {
-                let subject = self.tcx.impl_subject(def_id).skip_binder();
-                match subject {
-                    ImplSubject::Trait(trait_ref) => {
-                        let trait_ident = self.mk_ident(trait_ref.def_id);
-                        let mut trait_ty_args = vec![];
-                        for ty_arg in trait_ref.args {
-                            trait_ty_args.push(self.mk_ty_arg(ty_arg));
-                        }
-                        SolIdent::TraitImpl {
-                            parent,
-                            ident: Box::new(trait_ident),
-                            ty_args: trait_ty_args,
-                        }
-                    }
-                    ImplSubject::Inherent(ty) => {
-                        let impl_ty = self.mk_type(ty);
-                        SolIdent::TypeImpl { parent, ty: Box::new(impl_ty) }
-                    }
-                }
-            }
-            DefPathData::ForeignMod => SolIdent::Extern { parent },
-
-            // unsupported or unrelated
-            DefPathData::MacroNs(name) => {
-                bug!("[assumption] unexpected macro segment {name} in def path: {def_path_str}");
-            }
-            DefPathData::LifetimeNs(name) => {
-                bug!("[assumption] unexpected lifetime segment {name} in def path: {def_path_str}");
-            }
-            DefPathData::Use => {
-                bug!("[assumption] unexpected use segment in def path: {def_path_str}");
-            }
-            DefPathData::Closure => {
-                bug!("[assumption] unexpected closure segment in def path: {def_path_str}");
-            }
-            DefPathData::Ctor => {
-                bug!("[assumption] unexpected ctor segment in def path: {def_path_str}");
-            }
-            DefPathData::GlobalAsm => {
-                bug!("[unsupported] global asm segment in def path: {def_path_str}");
-            }
-            DefPathData::AnonConst
-            | DefPathData::OpaqueTy
-            | DefPathData::OpaqueLifetime(..)
-            | DefPathData::AnonAssocTy(..)
-            | DefPathData::SyntheticCoroutineBody
-            | DefPathData::NestedStatic => {
-                bug!("[invariant] unexpected segment {segment:?} in def path: {def_path_str}");
-            }
+        let ident = SolIdent {
+            krate: SolHash64(def_path_hash.stable_crate_id().as_u64()),
+            local: SolHash64(def_path_hash.local_hash().as_u64()),
+            desc: SolPathDesc(def_path_str),
         };
 
         // insert into the cache
@@ -249,10 +164,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let (ident, ty_args) = self.make_type_closure(def_id, generics);
                 SolType::Closure(ident, ty_args)
             }
-            ty::Param(param) => SolType::Param(
-                SolGenericIndex(param.index as usize),
-                SolGenericName(param.name.to_ident_string()),
-            ),
             ty::FnPtr(..) => {
                 bug!("[unsupported] function pointer type: {ty}");
             }
@@ -271,7 +182,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             ty::Alias(..) => {
                 bug!("[invariant] unexpected alias type {ty}");
             }
-            ty::Bound(..) | ty::UnsafeBinder(..) => {
+            ty::Param(..) | ty::Bound(..) | ty::UnsafeBinder(..) => {
                 bug!("[invariant] unexpected generic type: {ty}");
             }
             ty::Infer(..) | ty::Placeholder(..) | ty::Error(..) => {
@@ -303,7 +214,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
         // mark start
         self.depth.push();
         info!("{}-> adt definition", self.depth);
-        self.generics.push(generics);
 
         // first update the entry to mark that type definition in progress
         self.ty_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), None);
@@ -378,7 +288,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
         self.ty_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), Some(ty_def));
 
         // mark end
-        self.generics.pop();
         info!("{}<- adt definition", self.depth);
         self.depth.pop();
 
@@ -966,7 +875,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         instance: Instance<'tcx>,
     ) -> (SolIdent, Vec<SolGenericArg>) {
         let def_id = instance.def_id();
-        let def_desc = self.tcx.def_path_str(def_id);
+        let def_desc = self.tcx.def_path_str_with_args(def_id, instance.args);
 
         // locate the key of the definition
         let ident = self.mk_ident(def_id);
@@ -977,11 +886,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
             return (ident, ty_args);
         }
 
-        // check if this is a known function
-        match BuiltinFunction::try_to_resolve(&ident) {
-            None => (), /* continue construction */
-            Some(_) => {
-                info!("{}-- builtin function: {def_desc}", self.depth);
+        // check if this is a builtin function
+        for (builtin, regex) in self.builtin_funcs.iter() {
+            if regex.is_match(&def_desc) {
+                info!("{}-- builtin function {builtin:?}: {def_desc}", self.depth);
                 return (ident, ty_args);
             }
         }
@@ -1001,7 +909,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
         // mark start
         self.depth.push();
         warn!("{}-> function {def_desc}", self.depth);
-        self.generics.push(instance.args);
 
         // convert the instance to monomorphised MIR
         let instance_mir = self.tcx.instance_mir(instance.def).clone();
@@ -1054,7 +961,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
         self.fn_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), Some(fn_def));
 
         // mark end
-        self.generics.pop();
         warn!("{}<- function {def_desc}", self.depth);
         self.depth.pop();
 
@@ -1112,9 +1018,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
         // check we are balanced on stack
         if self.depth.level != 0 {
             bug!("[invariant] depth stack is not balanced");
-        }
-        if !self.generics.is_empty() {
-            bug!("[invariant] generics stack is not empty");
         }
 
         // unpack the fields
@@ -1176,38 +1079,27 @@ pub(crate) struct SolContext {
 
 /// An identifier in the Solana context
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) enum SolIdent {
-    CrateRoot(SolCrateName),
-    TypeNs { parent: Box<SolIdent>, name: SolTypeNs },
-    FuncNs { parent: Box<SolIdent>, name: SolFuncNs },
-    TraitImpl { parent: Box<SolIdent>, ident: Box<SolIdent>, ty_args: Vec<SolGenericArg> },
-    TypeImpl { parent: Box<SolIdent>, ty: Box<SolType> },
-    Extern { parent: Box<SolIdent> },
+pub(crate) struct SolIdent {
+    krate: SolHash64,
+    local: SolHash64,
+    desc: SolPathDesc,
 }
 
-/// A description of an instance
+/// A 64-bit hash
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolHash64(u64);
+
+/// A description of a definition path
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolPathDesc(String);
+
+/// A description of an instant path with generic arguments
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolInstDesc(String);
-
-/// A typing namespace item
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolTypeNs(pub String);
-
-/// A function namespace item
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolFuncNs(pub String);
 
 /// A crate name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolCrateName(pub String);
-
-/// A type parameter name
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolGenericName(String);
-
-/// A type paramater index
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolGenericIndex(usize);
 
 /// A field name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1286,7 +1178,6 @@ pub(crate) enum SolType {
     MutPtr(Box<SolType>),
     Function(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
-    Param(SolGenericIndex, SolGenericName),
 }
 
 /// User-defined type, i.e., an algebraic data type (ADT)
@@ -1599,6 +1490,68 @@ pub(crate) enum SolConst {
 }
 
 /*
+ * Builtins
+ */
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolBuiltinFunc {
+    /* operations */
+    IntrinsicsAbort,
+    IntrinsicsRawEq,
+    IntrinsicsColdPath,
+
+    /* alloc */
+    AllocGlobalAllocImpl,
+    SpecToString,
+
+    /* precondition checks */
+    HintAssertPreconditionCheck,
+    AllocLayoutFromSizeAlignPreconditionCheck,
+    CopyNonOverlappingPreconditionCheck,
+    VecSetLenPreconditionCheck,
+}
+
+impl SolBuiltinFunc {
+    fn regex(&self) -> Regex {
+        let pattern = match self {
+            Self::IntrinsicsAbort => r"std::intrinsics::abort",
+            Self::IntrinsicsRawEq => r"raw_eq::<.*>",
+            Self::IntrinsicsColdPath => r"std::intrinsics::cold_path",
+
+            Self::AllocGlobalAllocImpl => r"std::alloc::Global::alloc_impl",
+            Self::SpecToString => r"<.* as string::SpecToString>::spec_to_string",
+
+            Self::HintAssertPreconditionCheck => r"assert_unchecked::precondition_check",
+            Self::AllocLayoutFromSizeAlignPreconditionCheck => {
+                r"Layout::from_size_align_unchecked::precondition_check"
+            }
+            Self::CopyNonOverlappingPreconditionCheck => {
+                r"std::ptr::copy_nonoverlapping::precondition_check"
+            }
+            Self::VecSetLenPreconditionCheck => r"Vec::<.*>::set_len::precondition_check",
+        };
+
+        Regex::new(pattern).unwrap_or_else(|e| {
+            bug!("[invariant] failed to compile regex for builtin function: {e}")
+        })
+    }
+
+    fn all() -> Vec<Self> {
+        vec![
+            Self::IntrinsicsAbort,
+            Self::IntrinsicsRawEq,
+            Self::IntrinsicsColdPath,
+            Self::AllocGlobalAllocImpl,
+            Self::SpecToString,
+            Self::HintAssertPreconditionCheck,
+            Self::AllocLayoutFromSizeAlignPreconditionCheck,
+            Self::CopyNonOverlappingPreconditionCheck,
+            Self::VecSetLenPreconditionCheck,
+        ]
+    }
+}
+
+/*
  * Utilities
  */
 
@@ -1630,46 +1583,5 @@ impl Depth {
 impl Display for Depth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", "  ".repeat(self.level))
-    }
-}
-
-impl SolIdent {
-    /// Find the root identifier
-    pub(crate) fn krate(&self) -> &SolCrateName {
-        match self {
-            Self::CrateRoot(name) => name,
-            Self::TypeNs { parent, name: _ }
-            | Self::FuncNs { parent, name: _ }
-            | Self::TraitImpl { parent, ident: _, ty_args: _ }
-            | Self::TypeImpl { parent, ty: _ }
-            | Self::Extern { parent } => parent.krate(),
-        }
-    }
-
-    /// Create a new identifier for the crate root
-    pub(crate) fn from_root(name: &str) -> Self {
-        Self::CrateRoot(SolCrateName(name.to_string()))
-    }
-
-    pub(crate) fn with_type_ns(self: &Self, name: &str) -> Self {
-        Self::TypeNs { parent: Box::new(self.clone()), name: SolTypeNs(name.to_string()) }
-    }
-
-    pub(crate) fn with_func_ns(self: &Self, name: &str) -> Self {
-        Self::FuncNs { parent: Box::new(self.clone()), name: SolFuncNs(name.to_string()) }
-    }
-
-    pub(crate) fn with_trait_impl(self: &Self, ident: Self, ty_args: Vec<SolGenericArg>) -> Self {
-        Self::TraitImpl { parent: Box::new(self.clone()), ident: Box::new(ident), ty_args }
-    }
-
-    pub(crate) fn with_type_impl(self: &Self, ty: SolType) -> Self {
-        Self::TypeImpl { parent: Box::new(self.clone()), ty: Box::new(ty) }
-    }
-
-    // FIXME: remove the mark
-    #[allow(dead_code)]
-    pub(crate) fn with_extern(self: &Self) -> Self {
-        Self::Extern { parent: Box::new(self.clone()) }
     }
 }
