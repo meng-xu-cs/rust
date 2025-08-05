@@ -123,7 +123,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         // now construct the identifier
         let def_path = self.tcx.def_path(def_id);
         let def_path_str = self.tcx.def_path_str(def_id);
-        let krate = self.tcx.crate_name(def_path.krate).to_ident_string();
+        let krate = SolCrateName(self.tcx.crate_name(def_path.krate).to_ident_string());
 
         // shortcut if we are at the crate root
         if def_id.is_crate_root() {
@@ -132,8 +132,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
         // resolve parent
         let parent = self.mk_ident(self.tcx.parent(def_id));
-        if parent.krate() != krate {
-            bug!("[invariant] parent crate name does not match: {} vs {krate}", parent.krate());
+        if parent.krate() != &krate {
+            bug!(
+                "[invariant] parent crate name does not match: {} vs {}",
+                parent.krate().0,
+                krate.0
+            );
         }
         let parent = Box::new(parent);
 
@@ -1160,7 +1164,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
 
         // unpack the fields
-        let krate = self.tcx.crate_name(LOCAL_CRATE).to_ident_string();
+        let krate = SolCrateName(self.tcx.crate_name(LOCAL_CRATE).to_ident_string());
 
         let mut ty_defs = vec![];
         for (ident, defs) in self.ty_defs.into_iter() {
@@ -1205,7 +1209,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
 /// A complete Solana context
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolContext {
-    krate: String,
+    krate: SolCrateName,
     ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTyDef)>,
     fn_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolFnDef)>,
     globals: Vec<(SolGlobalSlot, SolGlobalObject)>,
@@ -1219,7 +1223,7 @@ pub(crate) struct SolContext {
 /// An identifier in the Solana context
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolIdent {
-    CrateRoot(String),
+    CrateRoot(SolCrateName),
     TypeNs { parent: Box<SolIdent>, name: SolTypeNs },
     FuncNs { parent: Box<SolIdent>, name: SolFuncNs },
     SelfImpl { parent: Box<SolIdent>, self_ident: Box<SolIdent> },
@@ -1240,6 +1244,10 @@ pub(crate) struct SolTypeNs(pub String);
 /// A function namespace item
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolFuncNs(pub String);
+
+/// A crate name
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolCrateName(pub String);
 
 /// A field name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1714,7 +1722,7 @@ impl Display for Depth {
 
 impl SolIdent {
     /// Find the root identifier
-    pub(crate) fn krate(&self) -> &str {
+    pub(crate) fn krate(&self) -> &SolCrateName {
         match self {
             Self::CrateRoot(name) => name,
             Self::TypeNs { parent, name: _ }
@@ -1729,7 +1737,7 @@ impl SolIdent {
 
     /// Create a new identifier for the crate root
     pub(crate) fn from_root(name: &str) -> Self {
-        Self::CrateRoot(name.to_string())
+        Self::CrateRoot(SolCrateName(name.to_string()))
     }
 
     pub(crate) fn with_type_ns(self: &Self, name: &str) -> Self {

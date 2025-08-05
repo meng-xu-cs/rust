@@ -107,12 +107,12 @@ impl BuiltinFunction {
     }
 
     fn ident_match(ident: &SolIdent, target: &SolIdent) -> bool {
-        if matches!(target, SolIdent::CrateRoot(symbol) if symbol == "**") {
+        if matches!(target, SolIdent::CrateRoot(symbol) if symbol.0 == "**") {
             return true;
         }
         match (ident, target) {
             (SolIdent::CrateRoot(name), SolIdent::CrateRoot(target_name)) => {
-                Self::string_match(name, target_name)
+                Self::string_match(&name.0, &target_name.0)
             }
             (
                 SolIdent::FuncNs { parent, name },
