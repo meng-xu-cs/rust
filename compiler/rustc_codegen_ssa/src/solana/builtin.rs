@@ -1,4 +1,4 @@
-use crate::solana::context::{SolIdent, SolType};
+use crate::solana::context::{SolGenericArg, SolIdent, SolType};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum BuiltinFunction {
@@ -50,6 +50,7 @@ impl BuiltinFunction {
                     SolIdent::from_root("alloc")
                         .with_type_ns("string")
                         .with_type_ns("SpecToString"),
+                    vec![],
                 )
                 .with_func_ns("spec_to_string"),
 
@@ -106,6 +107,18 @@ impl BuiltinFunction {
         matches!(target, SolType::Never) || ty == target
     }
 
+    fn trait_match(
+        ident: &SolIdent,
+        ty_args: &[SolGenericArg],
+        target_ident: &SolIdent,
+        target_ty_args: &[SolGenericArg],
+    ) -> bool {
+        if matches!(target_ident, SolIdent::CrateRoot(symbol) if symbol.0 == "*") {
+            return true;
+        }
+        Self::ident_match(ident, target_ident) && ty_args == target_ty_args
+    }
+
     fn ident_match(ident: &SolIdent, target: &SolIdent) -> bool {
         if matches!(target, SolIdent::CrateRoot(symbol) if symbol.0 == "**") {
             return true;
@@ -129,27 +142,20 @@ impl BuiltinFunction {
                     && Self::ident_match(parent, target_parent)
             }
             (
-                SolIdent::SelfImpl { parent, self_ident },
-                SolIdent::SelfImpl { parent: target_parent, self_ident: target_self_ident },
+                SolIdent::TraitImpl { parent, ident, ty_args },
+                SolIdent::TraitImpl {
+                    parent: target_parent,
+                    ident: target_ident,
+                    ty_args: target_ty_args,
+                },
             ) => {
-                Self::ident_match(self_ident, target_self_ident)
-                    && Self::ident_match(parent, target_parent)
-            }
-            (
-                SolIdent::TraitImpl { parent, trait_ident },
-                SolIdent::TraitImpl { parent: target_parent, trait_ident: target_trait_ident },
-            ) => {
-                Self::ident_match(trait_ident, target_trait_ident)
+                Self::trait_match(ident, ty_args, target_ident, target_ty_args)
                     && Self::ident_match(parent, target_parent)
             }
             (
                 SolIdent::TypeImpl { parent, ty },
                 SolIdent::TypeImpl { parent: target_parent, ty: target_ty },
             ) => Self::type_match(ty, target_ty) && Self::ident_match(parent, target_parent),
-            (
-                SolIdent::OtherImpl { parent, type_tag },
-                SolIdent::OtherImpl { parent: target_parent, type_tag: target_type_tag },
-            ) => type_tag == target_type_tag && Self::ident_match(parent, target_parent),
             (SolIdent::Extern { parent }, SolIdent::Extern { parent: target_parent }) => {
                 Self::ident_match(parent, target_parent)
             }
