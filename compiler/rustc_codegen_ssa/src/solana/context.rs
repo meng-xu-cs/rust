@@ -1068,11 +1068,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
 /// A complete Solana context
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolContext {
-    krate: SolCrateName,
-    ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTyDef)>,
-    fn_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolFnDef)>,
-    globals: Vec<(SolGlobalSlot, SolGlobalObject)>,
-    dep_fns: Vec<(SolIdent, Vec<SolGenericArg>, SolInstDesc)>,
+    pub(crate) krate: SolCrateName,
+    pub(crate) ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTyDef)>,
+    pub(crate) fn_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolFnDef)>,
+    pub(crate) globals: Vec<(SolGlobalSlot, SolGlobalObject)>,
+    pub(crate) dep_fns: Vec<(SolIdent, Vec<SolGenericArg>, SolInstDesc)>,
 }
 
 /*
@@ -1082,54 +1082,54 @@ pub(crate) struct SolContext {
 /// An identifier in the Solana context
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolIdent {
-    krate: SolHash64,
-    local: SolHash64,
-    desc: SolPathDesc,
+    pub(crate) krate: SolHash64,
+    pub(crate) local: SolHash64,
+    pub(crate) desc: SolPathDesc,
 }
 
 /// A 64-bit hash
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolHash64(u64);
+pub(crate) struct SolHash64(pub(crate) u64);
 
 /// A description of a definition path
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolPathDesc(String);
+pub(crate) struct SolPathDesc(pub(crate) String);
 
 /// A description of an instant path with generic arguments
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolInstDesc(String);
+pub(crate) struct SolInstDesc(pub(crate) String);
 
 /// A crate name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolCrateName(pub String);
+pub(crate) struct SolCrateName(pub(crate) String);
 
 /// A field name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolFieldName(String);
+pub(crate) struct SolFieldName(pub(crate) String);
 
 /// A field index
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolFieldIndex(usize);
+pub(crate) struct SolFieldIndex(pub(crate) usize);
 
 /// A variant name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolVariantName(String);
+pub(crate) struct SolVariantName(pub(crate) String);
 
 /// A variant index
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolVariantIndex(usize);
+pub(crate) struct SolVariantIndex(pub(crate) usize);
 
 /// A slot number for locals
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolLocalSlot(usize);
+pub(crate) struct SolLocalSlot(pub(crate) usize);
 
 /// A basic block index
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolBlockId(usize);
+pub(crate) struct SolBlockId(pub(crate) usize);
 
 /// A location id for global values
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolGlobalSlot(usize);
+pub(crate) struct SolGlobalSlot(pub(crate) usize);
 
 /*
  * Typing
@@ -1193,17 +1193,17 @@ pub(crate) enum SolTyDef {
 /// A field definition in an ADT
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolField {
-    index: SolFieldIndex,
-    name: SolFieldName,
-    ty: SolType,
+    pub(crate) index: SolFieldIndex,
+    pub(crate) name: SolFieldName,
+    pub(crate) ty: SolType,
 }
 
 /// A field definition in an ADT
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolVariant {
-    index: SolVariantIndex,
-    name: SolVariantName,
-    fields: Vec<SolField>,
+    pub(crate) index: SolVariantIndex,
+    pub(crate) name: SolVariantName,
+    pub(crate) fields: Vec<SolField>,
 }
 
 /// A constant known in the type system
@@ -1227,8 +1227,8 @@ pub(crate) enum SolGenericArg {
 /// A place
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolPlace {
-    local: SolLocalSlot,
-    projection: Vec<SolProjection>,
+    pub(crate) local: SolLocalSlot,
+    pub(crate) projection: Vec<SolProjection>,
 }
 
 /// A projection operation
@@ -1403,17 +1403,17 @@ pub(crate) enum SolTerminator {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolBasicBlock {
-    id: SolBlockId,
-    statements: Vec<SolStatement>,
-    terminator: SolTerminator,
+    pub(crate) id: SolBlockId,
+    pub(crate) statements: Vec<SolStatement>,
+    pub(crate) terminator: SolTerminator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolFnDef {
-    args: Vec<SolType>,
-    ret_ty: SolType,
-    locals: Vec<SolType>,
-    blocks: Vec<SolBasicBlock>,
+    pub(crate) args: Vec<SolType>,
+    pub(crate) ret_ty: SolType,
+    pub(crate) locals: Vec<SolType>,
+    pub(crate) blocks: Vec<SolBasicBlock>,
 }
 
 /*
@@ -1432,16 +1432,16 @@ pub(crate) enum SolGlobalObject {
  */
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolOffset(usize);
+pub(crate) struct SolOffset(pub(crate) usize);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolAlign(usize);
+pub(crate) struct SolAlign(pub(crate) usize);
 
 /// A scalar value
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolScalar {
-    bits: usize,
-    value: u128,
+    pub(crate) bits: usize,
+    pub(crate) value: u128,
 }
 
 /// A constant, used by both the type system and the value system
