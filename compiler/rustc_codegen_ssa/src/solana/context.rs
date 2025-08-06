@@ -200,8 +200,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let (ident, ty_args) = self.make_type_closure(def_id, generics);
                 SolType::Closure(ident, ty_args)
             }
-            ty::FnPtr(..) => {
-                bug!("[unsupported] function pointer type: {ty}");
+            ty::FnPtr(sig, _header) => {
+                let sig = self.tcx.instantiate_bound_regions_with_erased(sig);
+                let inputs = sig.inputs().iter().map(|ty| self.mk_type(*ty)).collect();
+                let output = self.mk_type(sig.output());
+                SolType::FnPtr(inputs, Box::new(output))
             }
             ty::Dynamic(..) => {
                 bug!("[unsupported] dynamic type: {ty}");
@@ -936,6 +939,19 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
         }
 
+        // check if this is an intrinsics function
+        match self.tcx.intrinsic(def_id) {
+            None => (),
+            Some(intrinsic_def) => {
+                info!(
+                    "{}-- intrinsic function {}: {def_desc}",
+                    self.depth,
+                    intrinsic_def.name.to_ident_string()
+                );
+                return (ident, ty_args);
+            }
+        }
+
         // convert the instance to monomorphised MIR
         if !self.tcx.is_mir_available(def_id) {
             info!("{}-- external dependency: {def_desc}", self.depth);
@@ -1228,6 +1244,7 @@ pub(crate) enum SolType {
     MutPtr(Box<SolType>),
     Function(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
+    FnPtr(Vec<SolType>, Box<SolType>),
 }
 
 /// User-defined type, i.e., an algebraic data type (ADT)
