@@ -968,6 +968,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
         self.depth.push();
         warn!("{}-> function {def_desc}", self.depth);
 
+        // first update the entry to mark that instance definition in progress
+        self.fn_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), None);
+
         // convert the instance to monomorphised MIR
         let instance_mir = self.tcx.instance_mir(instance.def).clone();
         if instance_mir.phase != MirPhase::Runtime(RuntimePhase::Optimized) {
