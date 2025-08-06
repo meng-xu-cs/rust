@@ -31,12 +31,14 @@ impl Display for BuildSystem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Phase {
     Bootstrap,
+    Expansion(usize),
 }
 
 impl Display for Phase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Bootstrap => write!(f, "bootstrap"),
+            Self::Expansion(n) => write!(f, "expansion{n}"),
         }
     }
 }
@@ -82,10 +84,21 @@ pub(crate) fn retrieve_env(tcx: TyCtxt<'_>) -> Option<SolEnv> {
         Err(e) => bug!("[user-input] unable to locate build system in environment variables: {e}"),
     };
     let phase = match env::var(format!("{env_prefix}_PHASE")) {
-        Ok(val) => match val.as_str() {
-            "bootstrap" => Phase::Bootstrap,
-            _ => bug!("[user-input] unexpected phase: {val}"),
-        },
+        Ok(val) => {
+            if val.as_str() == "bootstrap" {
+                Phase::Bootstrap
+            } else {
+                match val.strip_prefix("expansion") {
+                    None => bug!("[user-input] unexpected phase: {val}"),
+                    Some(num) => {
+                        let n: usize = num.parse().unwrap_or_else(|_| {
+                            bug!("[user-input] unable to parse phase number from {val}")
+                        });
+                        Phase::Expansion(n)
+                    }
+                }
+            }
+        }
         Err(e) => bug!("[user-input] unable to locate phase in environment variables: {e}"),
     };
     let output_dir = match env::var_os(format!("{env_prefix}_OUTPUT_DIR")) {
@@ -145,6 +158,15 @@ impl SolEnv {
                 }
             }
         }
+    }
+
+    pub(crate) fn prev_phase_output_dir(&self) -> PathBuf {
+        let phase = match self.phase {
+            Phase::Bootstrap => bug!("[invariant] no phase before bootstrap"),
+            Phase::Expansion(0) => Phase::Bootstrap,
+            Phase::Expansion(n) => Phase::Expansion(n - 1),
+        };
+        self.output_dir.join(phase.to_string())
     }
 
     pub(crate) fn save_instance_info<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
