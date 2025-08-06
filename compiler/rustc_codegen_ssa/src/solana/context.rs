@@ -36,6 +36,9 @@ pub(crate) struct SolContextBuilder<'tcx> {
     /// All built-in functions
     builtin_funcs: BTreeMap<SolBuiltinFunc, Regex>,
 
+    /// All built-in datatypes
+    builtin_types: BTreeMap<SolBuiltinType, Regex>,
+
     /// depth of the current context
     depth: Depth,
 
@@ -66,9 +69,16 @@ impl<'tcx> SolContextBuilder<'tcx> {
             sol,
             builtin_funcs: SolBuiltinFunc::all()
                 .into_iter()
-                .map(|func| {
-                    let regex = func.regex();
-                    (func, regex)
+                .map(|item| {
+                    let regex = item.regex();
+                    (item, regex)
+                })
+                .collect(),
+            builtin_types: SolBuiltinType::all()
+                .into_iter()
+                .map(|item| {
+                    let regex = item.regex();
+                    (item, regex)
                 })
                 .collect(),
             depth: Depth::new(),
@@ -81,6 +91,34 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
     }
 
+    /// Create a fully qualified path description
+    fn mk_path_desc(tcx: TyCtxt<'tcx>, def_id: DefId) -> SolPathDesc {
+        let path_str = tcx.def_path_str(def_id);
+        let path_str_with_crate = if def_id.is_local() {
+            let krate = tcx.crate_name(LOCAL_CRATE).to_ident_string();
+            format!("{krate}::{path_str}")
+        } else {
+            path_str
+        };
+        SolPathDesc(path_str_with_crate)
+    }
+
+    /// Create a fully qualified instance description
+    pub(crate) fn mk_inst_desc(
+        tcx: TyCtxt<'tcx>,
+        def_id: DefId,
+        ty_args: GenericArgsRef<'tcx>,
+    ) -> SolInstDesc {
+        let path_str = tcx.def_path_str_with_args(def_id, ty_args);
+        let path_str_with_crate = if def_id.is_local() {
+            let krate = tcx.crate_name(LOCAL_CRATE).to_ident_string();
+            format!("{krate}::{path_str}")
+        } else {
+            path_str
+        };
+        SolInstDesc(path_str_with_crate)
+    }
+
     /// Create an identifier
     fn mk_ident(&mut self, def_id: DefId) -> SolIdent {
         // check cache first
@@ -89,13 +127,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
 
         // now construct the identifier
-        let def_path_str = self.tcx.def_path_str(def_id);
         let def_path_hash = self.tcx.def_path_hash(def_id);
-
         let ident = SolIdent {
             krate: SolHash64(def_path_hash.stable_crate_id().as_u64()),
             local: SolHash64(def_path_hash.local_hash().as_u64()),
-            desc: SolPathDesc(def_path_str),
+            desc: Self::mk_path_desc(self.tcx, def_id),
         };
 
         // insert into the cache
@@ -203,12 +239,24 @@ impl<'tcx> SolContextBuilder<'tcx> {
         adt_def: AdtDef<'tcx>,
         generics: GenericArgsRef<'tcx>,
     ) -> (SolIdent, Vec<SolGenericArg>) {
+        let def_id = adt_def.did();
+        let def_desc = self.tcx.def_path_str_with_args(def_id, generics);
+
+        // locate the key of the definition
         let ident = self.mk_ident(adt_def.did());
         let ty_args: Vec<_> = generics.iter().map(|ty_arg| self.mk_ty_arg(ty_arg)).collect();
 
         // if already defined or is being defined, return the key
         if self.ty_defs.get(&ident).map_or(false, |inner| inner.contains_key(&ty_args)) {
             return (ident, ty_args);
+        }
+
+        // check if this is a builtin datatype
+        for (builtin, regex) in self.builtin_types.iter() {
+            if regex.is_match(&def_desc) {
+                info!("{}-- builtin datatype {builtin:?}: {def_desc}", self.depth);
+                return (ident, ty_args);
+            }
         }
 
         // mark start
@@ -222,10 +270,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         let ty_def = match adt_def.adt_kind() {
             AdtKind::Struct => {
                 if adt_def.variants().len() != 1 {
-                    bug!(
-                        "[invariant] struct {} has multiple variants",
-                        self.tcx.def_path_str(adt_def.did())
-                    );
+                    bug!("[invariant] struct {def_desc} has multiple variants");
                 }
                 let fields = adt_def
                     .non_enum_variant()
@@ -242,10 +287,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
             AdtKind::Union => {
                 if adt_def.variants().len() != 1 {
-                    bug!(
-                        "[invariant] union {} has multiple variants",
-                        self.tcx.def_path_str(adt_def.did())
-                    );
+                    bug!("[invariant] union {def_desc} has multiple variants");
                 }
                 let fields = adt_def
                     .non_enum_variant()
@@ -900,8 +942,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
             let deps_by_ident = self.dep_fns.entry(ident.clone()).or_default();
             if !deps_by_ident.contains_key(&ty_args) {
                 warn!("external dependency: {def_desc}");
-                let inst_desc = self.tcx.def_path_str_with_args(def_id, instance.args);
-                deps_by_ident.insert(ty_args.clone(), SolInstDesc(inst_desc));
+                deps_by_ident
+                    .insert(ty_args.clone(), Self::mk_inst_desc(self.tcx, def_id, instance.args));
             }
             return (ident, ty_args);
         }
@@ -1480,6 +1522,13 @@ pub(crate) enum SolBuiltinFunc {
     AllocLayoutFromSizeAlignPreconditionCheck,
     CopyNonOverlappingPreconditionCheck,
     VecSetLenPreconditionCheck,
+    OffsetFromUnsignedPreconditionCheck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolBuiltinType {
+    /* error */
+    StdIoError,
 }
 
 /* --- END OF SYNC --- */
@@ -1543,6 +1592,9 @@ impl SolBuiltinFunc {
                 r"std::ptr::copy_nonoverlapping::precondition_check"
             }
             Self::VecSetLenPreconditionCheck => r"Vec::<.*>::set_len::precondition_check",
+            Self::OffsetFromUnsignedPreconditionCheck => {
+                r"std::ptr::const_ptr::<.*>::offset_from_unsigned::precondition_check"
+            }
         };
 
         Regex::new(pattern).unwrap_or_else(|e| {
@@ -1561,7 +1613,24 @@ impl SolBuiltinFunc {
             Self::AllocLayoutFromSizeAlignPreconditionCheck,
             Self::CopyNonOverlappingPreconditionCheck,
             Self::VecSetLenPreconditionCheck,
+            Self::OffsetFromUnsignedPreconditionCheck,
         ]
+    }
+}
+
+impl SolBuiltinType {
+    fn regex(&self) -> Regex {
+        let pattern = match self {
+            Self::StdIoError => r"std::io::Error",
+        };
+
+        Regex::new(pattern).unwrap_or_else(|e| {
+            bug!("[invariant] failed to compile regex for builtin datatype: {e}")
+        })
+    }
+
+    fn all() -> Vec<Self> {
+        vec![Self::StdIoError]
     }
 }
 
