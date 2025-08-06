@@ -1510,7 +1510,10 @@ pub(crate) enum SolConst {
 pub(crate) enum SolBuiltinFunc {
     /* operations */
     IntrinsicsAbort,
+    IntrinsicsAssertFailed,
     IntrinsicsRawEq,
+    IntrinsicsPtrOffsetFromUnsigned,
+    IntrinsicsCtpop,
     IntrinsicsColdPath,
 
     /* alloc */
@@ -1522,6 +1525,7 @@ pub(crate) enum SolBuiltinFunc {
     AllocLayoutFromSizeAlignPreconditionCheck,
     CopyNonOverlappingPreconditionCheck,
     VecSetLenPreconditionCheck,
+    SliceFromRawPartsPreconditionCheck,
     OffsetFromUnsignedPreconditionCheck,
 }
 
@@ -1529,6 +1533,9 @@ pub(crate) enum SolBuiltinFunc {
 pub(crate) enum SolBuiltinType {
     /* error */
     StdIoError,
+    /* format arguments */
+    FmtArgument,
+    FmtArguments,
 }
 
 /* --- END OF SYNC --- */
@@ -1578,7 +1585,10 @@ impl SolBuiltinFunc {
     fn regex(&self) -> Regex {
         let pattern = match self {
             Self::IntrinsicsAbort => r"std::intrinsics::abort",
+            Self::IntrinsicsAssertFailed => r"assert_failed::<.*>",
             Self::IntrinsicsRawEq => r"raw_eq::<.*>",
+            Self::IntrinsicsPtrOffsetFromUnsigned => r"ptr_offset_from_unsigned::<.*>",
+            Self::IntrinsicsCtpop => r"ctpop::<.*>",
             Self::IntrinsicsColdPath => r"std::intrinsics::cold_path",
 
             Self::AllocGlobalAllocImpl => r"std::alloc::Global::alloc_impl",
@@ -1592,6 +1602,9 @@ impl SolBuiltinFunc {
                 r"std::ptr::copy_nonoverlapping::precondition_check"
             }
             Self::VecSetLenPreconditionCheck => r"Vec::<.*>::set_len::precondition_check",
+            Self::SliceFromRawPartsPreconditionCheck => {
+                r"std::slice::from_raw_parts::precondition_check"
+            }
             Self::OffsetFromUnsignedPreconditionCheck => {
                 r"std::ptr::const_ptr::<.*>::offset_from_unsigned::precondition_check"
             }
@@ -1605,7 +1618,10 @@ impl SolBuiltinFunc {
     fn all() -> Vec<Self> {
         vec![
             Self::IntrinsicsAbort,
+            Self::IntrinsicsAssertFailed,
             Self::IntrinsicsRawEq,
+            Self::IntrinsicsPtrOffsetFromUnsigned,
+            Self::IntrinsicsCtpop,
             Self::IntrinsicsColdPath,
             Self::AllocGlobalAllocImpl,
             Self::SpecToString,
@@ -1613,6 +1629,7 @@ impl SolBuiltinFunc {
             Self::AllocLayoutFromSizeAlignPreconditionCheck,
             Self::CopyNonOverlappingPreconditionCheck,
             Self::VecSetLenPreconditionCheck,
+            Self::SliceFromRawPartsPreconditionCheck,
             Self::OffsetFromUnsignedPreconditionCheck,
         ]
     }
@@ -1622,6 +1639,8 @@ impl SolBuiltinType {
     fn regex(&self) -> Regex {
         let pattern = match self {
             Self::StdIoError => r"std::io::Error",
+            Self::FmtArgument => r"core::fmt::rt::Argument<.*>",
+            Self::FmtArguments => r"Arguments<.*>",
         };
 
         Regex::new(pattern).unwrap_or_else(|e| {
@@ -1630,7 +1649,7 @@ impl SolBuiltinType {
     }
 
     fn all() -> Vec<Self> {
-        vec![Self::StdIoError]
+        vec![Self::StdIoError, Self::FmtArgument, Self::FmtArguments]
     }
 }
 
