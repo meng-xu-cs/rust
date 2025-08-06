@@ -122,6 +122,29 @@ pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     let def_desc = tcx.def_path_str_with_args(def_id, instance.args);
     info!("processing {def_desc}");
 
+    // skip source files that are not under the local source prefix
+    if !sol.src_path_full.starts_with(&sol.source_dir) {
+        info!("- skipped, not a local source file");
+        return;
+    }
+
+    // skip non-local items (e.g., generics from external crates)
+    if !def_id.is_local() {
+        info!("- skipped, not a local definition");
+        return;
+    }
+
+    // an instruction must be a `fn` or `assoc fn` item
+    match instance.def {
+        InstanceKind::Item(did) if matches!(tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn) => {}
+        _ => {
+            info!("- skipped, not a fn-alike item");
+            return;
+        }
+    };
+
+    let inst_desc = SolContextBuilder::mk_inst_desc(tcx, def_id, instance.args);
+
     // load the deps
     let path = sol.prev_phase_output_dir().join("deps.json");
     let content = fs::read_to_string(path).unwrap_or_else(|e| {
@@ -134,12 +157,12 @@ pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     let mut builder = SolContextBuilder::new(tcx, sol);
     let mut matched = false;
     for (dep_ident, dep_args, dep_desc) in &deps.fn_deps {
-        if dep_desc.0 != def_desc {
+        if dep_desc != &inst_desc {
             continue;
         }
 
         // now build the context around this instance
-        info!("- found dependency {def_desc}");
+        warn!("- found dependency {def_desc}");
         let (def_ident, def_args) = builder.make_instance(instance);
 
         // now also check if the ident and type arguments match
