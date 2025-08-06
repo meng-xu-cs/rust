@@ -1,4 +1,5 @@
 //! This pass encapsulate all the transformations related to Solana's Anchor framework.
+use std::fs;
 
 use rustc_hir::def::DefKind;
 use rustc_middle::ty::{Instance, InstanceKind, TyCtxt};
@@ -6,7 +7,7 @@ use rustc_middle::{bug, ty};
 use tracing::{info, warn};
 
 use crate::solana::common::SolEnv;
-use crate::solana::context::SolContextBuilder;
+use crate::solana::context::{SolContextBuilder, SolDeps};
 
 pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: Instance<'tcx>) {
     info!(
@@ -18,7 +19,7 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
 
     // debug marking
     let def_id = instance.def_id();
-    let def_desc = tcx.def_path_str(def_id);
+    let def_desc = tcx.def_path_str_with_args(def_id, instance.args);
     info!("processing {def_desc}");
 
     // skip source files that are not under the local source prefix
@@ -105,5 +106,58 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     let (sol, context) = builder.build();
 
     // serialize the information to file
-    sol.serialize_to_file(&def_desc, &context);
+    sol.serialize_to_file("context", &context);
+}
+
+pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: Instance<'tcx>) {
+    info!(
+        "phase: {} on {} with source {}",
+        sol.phase,
+        sol.build_system,
+        sol.src_file_name.display()
+    );
+
+    // debug marking
+    let def_id = instance.def_id();
+    let def_desc = tcx.def_path_str_with_args(def_id, instance.args);
+    info!("processing {def_desc}");
+
+    // load the deps
+    let path = sol.prev_phase_output_dir().join("deps.json");
+    let content = fs::read_to_string(path).unwrap_or_else(|e| {
+        bug!("[invariant] failed to read previous phase output file deps.json: {e}")
+    });
+    let deps: SolDeps = serde_json::from_str(&content)
+        .unwrap_or_else(|e| bug!("[invariant] failed to deserialize deps.json: {e}"));
+
+    // check if the current instance is a dependency
+    let mut builder = SolContextBuilder::new(tcx, sol);
+    let mut matched = false;
+    for (dep_ident, dep_args, dep_desc) in &deps.fn_deps {
+        if dep_desc.0 != def_desc {
+            continue;
+        }
+
+        // now build the context around this instance
+        info!("- found dependency {def_desc}");
+        let (def_ident, def_args) = builder.make_instance(instance);
+
+        // now also check if the ident and type arguments match
+        if dep_ident != &def_ident {
+            bug!("[invariant] dependency ident mismatch on {def_desc}");
+        }
+        if dep_args != &def_args {
+            bug!("[invariant] dependency type arguments mismatch on {def_desc}");
+        }
+
+        // end of the loop
+        matched = true;
+        break;
+    }
+
+    // serialize the context
+    if matched {
+        let (sol, context) = builder.build();
+        sol.serialize_to_file("context", &context);
+    }
 }
