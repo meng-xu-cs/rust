@@ -969,7 +969,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
     }
 
     /// Create a global variable definition
-    pub(crate) fn make_global(&mut self, alloc_id: AllocId) -> SolGlobalSlot {
+    fn make_global(&mut self, alloc_id: AllocId) -> SolGlobalSlot {
         // if already defined or is being defined, return the key
         if let Some(slot) = self.alloc_map.get(&alloc_id) {
             return slot.clone();
@@ -1073,6 +1073,12 @@ pub(crate) struct SolContext {
     pub(crate) fn_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolFnDef)>,
     pub(crate) globals: Vec<(SolGlobalSlot, SolGlobalObject)>,
     pub(crate) dep_fns: Vec<(SolIdent, Vec<SolGenericArg>, SolInstDesc)>,
+}
+
+/// Dependencies
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolDeps {
+    pub(crate) fn_deps: Vec<(SolIdent, Vec<SolGenericArg>, SolInstDesc)>,
 }
 
 /*

@@ -17,6 +17,9 @@ pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
             common::Phase::Bootstrap => {
                 pipeline_anchor::phase_bootstrap(tcx, sol, instance);
             }
+            common::Phase::Expansion(_) => {
+                pipeline_anchor::phase_expansion(tcx, sol, instance);
+            }
         },
     }
 }
