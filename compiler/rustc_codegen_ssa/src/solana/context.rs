@@ -587,11 +587,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     CastKind::PointerCoercion(coercion_type, _) => match coercion_type {
                         PointerCoercion::MutToConstPointer
                         | PointerCoercion::ArrayToPointer
-                        | PointerCoercion::Unsize => SolOpcodeCast::Reinterpret,
-                        PointerCoercion::ReifyFnPointer
                         | PointerCoercion::UnsafeFnPointer
-                        | PointerCoercion::ClosureFnPointer(_) => {
-                            bug!("[unsupported] fn pointer coercion in cast op");
+                        | PointerCoercion::Unsize => SolOpcodeCast::Reinterpret,
+                        PointerCoercion::ReifyFnPointer | PointerCoercion::ClosureFnPointer(_) => {
+                            SolOpcodeCast::ReifyFnPtr
                         }
                     },
                     CastKind::PointerExposeProvenance | CastKind::PointerWithExposedProvenance => {
@@ -1355,6 +1354,7 @@ pub(crate) enum SolOpcodeCast {
     IntToFloat,
     FloatToInt,
     Reinterpret,
+    ReifyFnPtr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1556,6 +1556,8 @@ pub(crate) enum SolBuiltinType {
     /* format arguments */
     FmtArgument,
     FmtArguments,
+    FmtArgumentType,
+    FmtFormatter,
 }
 
 /* --- END OF SYNC --- */
@@ -1661,6 +1663,8 @@ impl SolBuiltinType {
             Self::StdIoError => r"std::io::Error",
             Self::FmtArgument => r"core::fmt::rt::Argument<.*>",
             Self::FmtArguments => r"Arguments<.*>",
+            Self::FmtArgumentType => r"core::fmt::rt::ArgumentType<.*>",
+            Self::FmtFormatter => r"Formatter<.*>",
         };
 
         Regex::new(pattern).unwrap_or_else(|e| {
@@ -1669,7 +1673,13 @@ impl SolBuiltinType {
     }
 
     fn all() -> Vec<Self> {
-        vec![Self::StdIoError, Self::FmtArgument, Self::FmtArguments]
+        vec![
+            Self::StdIoError,
+            Self::FmtArgument,
+            Self::FmtArguments,
+            Self::FmtArgumentType,
+            Self::FmtFormatter,
+        ]
     }
 }
 
