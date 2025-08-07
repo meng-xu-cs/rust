@@ -122,19 +122,13 @@ pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     let def_desc = tcx.def_path_str_with_args(def_id, instance.args);
     info!("processing {def_desc}");
 
-    // skip source files that are not under the local source prefix
-    if !sol.src_path_full.starts_with(&sol.source_dir) {
-        info!("- skipped, not a local source file");
-        return;
-    }
-
     // skip non-local items (e.g., generics from external crates)
     if !def_id.is_local() {
         info!("- skipped, not a local definition");
         return;
     }
 
-    // an instruction must be a `fn` or `assoc fn` item
+    // a dependency must be a `fn` or `assoc fn` item
     match instance.def {
         InstanceKind::Item(did) if matches!(tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn) => {}
         _ => {
@@ -142,8 +136,6 @@ pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
             return;
         }
     };
-
-    let inst_desc = SolContextBuilder::mk_inst_desc(tcx, def_id, instance.args);
 
     // load the deps
     let path = sol.prev_phase_output_dir().join("deps.json");
@@ -153,11 +145,14 @@ pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     let deps: SolDeps = serde_json::from_str(&content)
         .unwrap_or_else(|e| bug!("[invariant] failed to deserialize deps.json: {e}"));
 
-    // check if the current instance is a dependency
+    // derive the identifier
+    let inst_ident = SolContextBuilder::mk_ident_no_cache(tcx, def_id);
+
+    // compare with the dependencies
     let mut builder = SolContextBuilder::new(tcx, sol);
     let mut matched = false;
-    for (dep_ident, dep_args, dep_desc) in &deps.fn_deps {
-        if dep_desc != &inst_desc {
+    for (dep_ident, dep_args, _) in &deps.fn_deps {
+        if dep_ident != &inst_ident {
             continue;
         }
 
@@ -182,5 +177,7 @@ pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     if matched {
         let (sol, context) = builder.build();
         sol.serialize_to_file("context", &context);
+    } else {
+        info!("- skipped, not in the dependency list");
     }
 }
