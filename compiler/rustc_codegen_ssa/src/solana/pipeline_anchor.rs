@@ -122,12 +122,6 @@ pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     let def_desc = tcx.def_path_str_with_args(def_id, instance.args);
     info!("processing {def_desc}");
 
-    // skip non-local items (e.g., generics from external crates)
-    if !def_id.is_local() {
-        info!("- skipped, not a local definition");
-        return;
-    }
-
     // a dependency must be a `fn` or `assoc fn` item
     match instance.def {
         InstanceKind::Item(did) if matches!(tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn) => {}
