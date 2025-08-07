@@ -721,8 +721,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             Mutability::Mut => SolOpcodeAggregate::MutPtr { pointee_ty },
                         }
                     }
-                    AggregateKind::Closure(..) => {
-                        bug!("[assumption] unexpected closure in aggregate conversion");
+                    AggregateKind::Closure(def_id, generics) => {
+                        let (ident, ty_args) = self.make_type_closure(*def_id, *generics);
+                        SolOpcodeAggregate::Closure(ident, ty_args)
                     }
                     AggregateKind::Coroutine(..) | AggregateKind::CoroutineClosure(..) => {
                         bug!("[invariant] unexpected coroutine in aggregate conversion");
@@ -1404,6 +1405,7 @@ pub(crate) enum SolOpcodeAggregate {
     Enum { ty: SolType, variant: SolVariantIndex },
     ImmPtr { pointee_ty: SolType },
     MutPtr { pointee_ty: SolType },
+    Closure(SolIdent, Vec<SolGenericArg>),
 }
 
 /*
@@ -1540,6 +1542,9 @@ pub(crate) enum SolBuiltinFunc {
     AllocGlobalAllocImpl,
     SpecToString,
 
+    /* formatter */
+    DebugFmt,
+
     /* precondition checks */
     HintAssertPreconditionCheck,
     AllocLayoutFromSizeAlignPreconditionCheck,
@@ -1616,6 +1621,8 @@ impl SolBuiltinFunc {
             Self::AllocGlobalAllocImpl => r"std::alloc::Global::alloc_impl",
             Self::SpecToString => r"<.* as string::SpecToString>::spec_to_string",
 
+            Self::DebugFmt => r"<.* as Debug>::fmt",
+
             Self::HintAssertPreconditionCheck => r"assert_unchecked::precondition_check",
             Self::AllocLayoutFromSizeAlignPreconditionCheck => {
                 r"Layout::from_size_align_unchecked::precondition_check"
@@ -1647,6 +1654,7 @@ impl SolBuiltinFunc {
             Self::IntrinsicsColdPath,
             Self::AllocGlobalAllocImpl,
             Self::SpecToString,
+            Self::DebugFmt,
             Self::HintAssertPreconditionCheck,
             Self::AllocLayoutFromSizeAlignPreconditionCheck,
             Self::CopyNonOverlappingPreconditionCheck,
