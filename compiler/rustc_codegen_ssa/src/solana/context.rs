@@ -43,7 +43,7 @@ pub(crate) struct SolContextBuilder<'tcx> {
     depth: Depth,
 
     /// a cache of id to identifier mappings
-    id_cache: FxHashMap<DefId, SolIdent>,
+    id_cache: FxHashMap<DefId, (SolIdent, SolPathDesc)>,
 
     /// a cache of alloc id to global slot mappings
     alloc_map: FxHashMap<AllocId, SolGlobalSlot>,
@@ -91,20 +91,39 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
     }
 
-    /// Create a fully qualified path description
-    fn mk_path_desc(tcx: TyCtxt<'tcx>, def_id: DefId) -> SolPathDesc {
-        let path_str = tcx.def_path_str(def_id);
-        let path_str_with_crate = if def_id.is_local() {
-            let krate = tcx.crate_name(LOCAL_CRATE).to_ident_string();
-            format!("{krate}::{path_str}")
-        } else {
-            path_str
+    /// Create an identifier without cacheing it
+    pub(crate) fn mk_ident_no_cache(tcx: TyCtxt<'tcx>, def_id: DefId) -> SolIdent {
+        let def_path_hash = tcx.def_path_hash(def_id);
+        SolIdent {
+            krate: SolHash64(def_path_hash.stable_crate_id().as_u64()),
+            local: SolHash64(def_path_hash.local_hash().as_u64()),
+        }
+    }
+
+    /// Create an identifier
+    fn mk_ident(&mut self, def_id: DefId) -> SolIdent {
+        // check cache first
+        if let Some((ident, _)) = self.id_cache.get(&def_id) {
+            return ident.clone();
+        }
+
+        // now construct the identifier
+        let def_path_hash = self.tcx.def_path_hash(def_id);
+        let ident = SolIdent {
+            krate: SolHash64(def_path_hash.stable_crate_id().as_u64()),
+            local: SolHash64(def_path_hash.local_hash().as_u64()),
         };
-        SolPathDesc(path_str_with_crate)
+
+        // insert into the cache
+        let desc = SolPathDesc(self.tcx.def_path_debug_str(def_id));
+        self.id_cache.insert(def_id, (ident.clone(), desc));
+
+        // return ident
+        ident
     }
 
     /// Create a fully qualified instance description
-    pub(crate) fn mk_inst_desc(
+    fn mk_inst_desc(
         tcx: TyCtxt<'tcx>,
         def_id: DefId,
         ty_args: GenericArgsRef<'tcx>,
@@ -117,28 +136,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
             path_str
         };
         SolInstDesc(path_str_with_crate)
-    }
-
-    /// Create an identifier
-    fn mk_ident(&mut self, def_id: DefId) -> SolIdent {
-        // check cache first
-        if let Some(ident) = self.id_cache.get(&def_id) {
-            return ident.clone();
-        }
-
-        // now construct the identifier
-        let def_path_hash = self.tcx.def_path_hash(def_id);
-        let ident = SolIdent {
-            krate: SolHash64(def_path_hash.stable_crate_id().as_u64()),
-            local: SolHash64(def_path_hash.local_hash().as_u64()),
-            desc: Self::mk_path_desc(self.tcx, def_id),
-        };
-
-        // insert into the cache
-        self.id_cache.insert(def_id, ident.clone());
-
-        // return ident
-        ident
     }
 
     /// Create a type
@@ -599,6 +596,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 };
                 SolExpr::Cast { opcode, place: self.mk_operand(operand), ty: self.mk_type(*ty) }
             }
+            Rvalue::ShallowInitBox(operand, ty) => SolExpr::Cast {
+                opcode: SolOpcodeCast::Reinterpret,
+                place: self.mk_operand(operand),
+                ty: self.mk_type(*ty),
+            },
             Rvalue::NullaryOp(op, ty) => {
                 let opcode = match op {
                     NullOp::SizeOf => SolOpcodeNullary::SizeOf,
@@ -740,9 +742,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
             Rvalue::CopyForDeref(place) => SolExpr::Load(self.mk_place(*place)),
             Rvalue::ThreadLocalRef(..) => {
                 bug!("[assumption] unexpected thread-local reference in rvalue conversion");
-            }
-            Rvalue::ShallowInitBox(..) => {
-                bug!("[unsupported] unexpected shallow initialization of box in rvalue conversion");
             }
             Rvalue::WrapUnsafeBinder(..) => {
                 bug!("[invariant] unexpected wrap unsafe binder in rvalue conversion");
@@ -1151,7 +1150,6 @@ pub(crate) struct SolDeps {
 pub(crate) struct SolIdent {
     pub(crate) krate: SolHash64,
     pub(crate) local: SolHash64,
-    pub(crate) desc: SolPathDesc,
 }
 
 /// A 64-bit hash
@@ -1533,6 +1531,7 @@ pub(crate) enum SolBuiltinFunc {
     /* operations */
     IntrinsicsAbort,
     IntrinsicsAssertFailed,
+    IntrinsicsPanicNounwindFmt,
     IntrinsicsRawEq,
     IntrinsicsPtrOffsetFromUnsigned,
     IntrinsicsCtpop,
@@ -1613,6 +1612,7 @@ impl SolBuiltinFunc {
         let pattern = match self {
             Self::IntrinsicsAbort => r"std::intrinsics::abort",
             Self::IntrinsicsAssertFailed => r"assert_failed::<.*>",
+            Self::IntrinsicsPanicNounwindFmt => r"panic_nounwind_fmt",
             Self::IntrinsicsRawEq => r"raw_eq::<.*>",
             Self::IntrinsicsPtrOffsetFromUnsigned => r"ptr_offset_from_unsigned::<.*>",
             Self::IntrinsicsCtpop => r"ctpop::<.*>",
@@ -1648,6 +1648,7 @@ impl SolBuiltinFunc {
         vec![
             Self::IntrinsicsAbort,
             Self::IntrinsicsAssertFailed,
+            Self::IntrinsicsPanicNounwindFmt,
             Self::IntrinsicsRawEq,
             Self::IntrinsicsPtrOffsetFromUnsigned,
             Self::IntrinsicsCtpop,
