@@ -956,7 +956,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
             info!("{}-- external dependency: {def_desc}", self.depth);
             let deps_by_ident = self.dep_fns.entry(ident.clone()).or_default();
             if !deps_by_ident.contains_key(&ty_args) {
-                warn!("external dependency: {def_desc}");
                 deps_by_ident
                     .insert(ty_args.clone(), Self::mk_inst_desc(self.tcx, def_id, instance.args));
             }
@@ -1531,6 +1530,8 @@ pub(crate) enum SolBuiltinFunc {
     /* operations */
     IntrinsicsAbort,
     IntrinsicsAssertFailed,
+    IntrinsicsPanic,
+    IntrinsicsPanicFmt,
     IntrinsicsPanicNounwindFmt,
     IntrinsicsRawEq,
     IntrinsicsPtrOffsetFromUnsigned,
@@ -1539,6 +1540,9 @@ pub(crate) enum SolBuiltinFunc {
 
     /* alloc */
     AllocGlobalAllocImpl,
+    AllocRustRealloc,
+    AllocRustDealloc,
+    AllocRawVecHandleError,
     SpecToString,
 
     /* formatter */
@@ -1612,6 +1616,8 @@ impl SolBuiltinFunc {
         let pattern = match self {
             Self::IntrinsicsAbort => r"std::intrinsics::abort",
             Self::IntrinsicsAssertFailed => r"assert_failed::<.*>",
+            Self::IntrinsicsPanic => r"panic",
+            Self::IntrinsicsPanicFmt => r"panic_fmt",
             Self::IntrinsicsPanicNounwindFmt => r"panic_nounwind_fmt",
             Self::IntrinsicsRawEq => r"raw_eq::<.*>",
             Self::IntrinsicsPtrOffsetFromUnsigned => r"ptr_offset_from_unsigned::<.*>",
@@ -1619,6 +1625,9 @@ impl SolBuiltinFunc {
             Self::IntrinsicsColdPath => r"std::intrinsics::cold_path",
 
             Self::AllocGlobalAllocImpl => r"std::alloc::Global::alloc_impl",
+            Self::AllocRustRealloc => r"alloc::alloc::__rust_realloc",
+            Self::AllocRustDealloc => r"alloc::alloc::__rust_dealloc",
+            Self::AllocRawVecHandleError => r"alloc::raw_vec::handle_error",
             Self::SpecToString => r"<.* as string::SpecToString>::spec_to_string",
 
             Self::DebugFmt => r"<.* as Debug>::fmt",
@@ -1648,12 +1657,17 @@ impl SolBuiltinFunc {
         vec![
             Self::IntrinsicsAbort,
             Self::IntrinsicsAssertFailed,
+            Self::IntrinsicsPanic,
+            Self::IntrinsicsPanicFmt,
             Self::IntrinsicsPanicNounwindFmt,
             Self::IntrinsicsRawEq,
             Self::IntrinsicsPtrOffsetFromUnsigned,
             Self::IntrinsicsCtpop,
             Self::IntrinsicsColdPath,
             Self::AllocGlobalAllocImpl,
+            Self::AllocRustRealloc,
+            Self::AllocRustDealloc,
+            Self::AllocRawVecHandleError,
             Self::SpecToString,
             Self::DebugFmt,
             Self::HintAssertPreconditionCheck,
