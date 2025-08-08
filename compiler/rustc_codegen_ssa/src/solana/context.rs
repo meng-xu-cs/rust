@@ -146,7 +146,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
     }
 
     /// Create a type
-    fn mk_type(&mut self, ty: Ty<'tcx>) -> SolType {
+    pub(crate) fn mk_type(&mut self, ty: Ty<'tcx>) -> SolType {
         // mark start
         self.depth.push();
         info!("{}-> type {ty}", self.depth);
@@ -390,7 +390,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
     }
 
     /// Create a generic argument
-    fn mk_ty_arg(&mut self, ty_arg: GenericArg<'tcx>) -> SolGenericArg {
+    pub(crate) fn mk_ty_arg(&mut self, ty_arg: GenericArg<'tcx>) -> SolGenericArg {
         match ty_arg.kind() {
             GenericArgKind::Type(ty) => SolGenericArg::Type(self.mk_type(ty)),
             GenericArgKind::Const(ty_const) => SolGenericArg::Const(self.mk_ty_const(ty_const)),
