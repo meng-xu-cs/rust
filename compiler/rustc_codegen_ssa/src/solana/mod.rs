@@ -1,3 +1,4 @@
+use rustc_middle::bug;
 use rustc_middle::ty::{Instance, TyCtxt};
 
 pub(crate) mod common;
@@ -20,6 +21,7 @@ pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
             common::Phase::Expansion(_) => {
                 pipeline_anchor::phase_expansion(tcx, sol, instance);
             }
+            common::Phase::Temporary => bug!("[invariant] unexpected temporary phase"),
         },
     }
 }
