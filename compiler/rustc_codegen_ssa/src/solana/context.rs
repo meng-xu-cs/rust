@@ -15,9 +15,9 @@ use rustc_middle::mir::{
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
-    self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder, FloatTy,
-    GenericArg, GenericArgKind, GenericArgsRef, Instance, InstanceKind, IntTy, Ty, TyCtxt,
-    TypingEnv, UintTy,
+    self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder,
+    ExistentialPredicate, FloatTy, GenericArg, GenericArgKind, GenericArgsRef, Instance,
+    InstanceKind, IntTy, Ty, TyCtxt, TypingEnv, UintTy,
 };
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
@@ -210,8 +210,31 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let output = self.mk_type(sig.output());
                 SolType::FnPtr(inputs, Box::new(output))
             }
-            ty::Dynamic(..) => {
-                bug!("[unsupported] dynamic type: {ty}");
+            ty::Dynamic(predicates, _, _) => {
+                let mut trait_refs = vec![];
+                for pred_bounded in predicates {
+                    let pred_instiated =
+                        self.tcx.instantiate_bound_regions_with_erased(pred_bounded);
+                    match pred_instiated {
+                        ExistentialPredicate::Trait(trait_ref) => {
+                            let trait_ident = self.mk_ident(trait_ref.def_id);
+                            let trait_ty_args = trait_ref
+                                .args
+                                .iter()
+                                .map(|ty_arg| self.mk_ty_arg(ty_arg))
+                                .collect();
+                            trait_refs.push((trait_ident, trait_ty_args));
+                        }
+                        ExistentialPredicate::AutoTrait(auto_trait_id) => {
+                            let trait_ident = self.mk_ident(auto_trait_id);
+                            trait_refs.push((trait_ident, vec![]));
+                        }
+                        ExistentialPredicate::Projection(..) => {
+                            bug!("[unsupported] unsupported dynamic type: {ty}");
+                        }
+                    }
+                }
+                SolType::Dynamic(trait_refs)
             }
             ty::Pat(..) => {
                 bug!("[assumption] unexpected pattern type: {ty}");
@@ -1028,7 +1051,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
         // convert the instance to monomorphised MIR
         let instance_mir = self.tcx.instance_mir(instance.def).clone();
         if instance_mir.phase != MirPhase::Runtime(RuntimePhase::Optimized) {
-            bug!("[assumption] converted instance is not runtime optimized: {def_desc}");
+            // FIXME: if we allow `regular` fn items only, this should hold
+            info!("-{}converted instance is not runtime optimized: {def_desc}", self.depth);
         }
 
         // NOTE: lazy normalization seems to be in effect here, at least associated types
@@ -1119,7 +1143,33 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     Mutability::Mut => SolGlobalObject::MutData { bytes, provenance: prov, align },
                 }
             }
-            GlobalAlloc::Static(..) => bug!("[invariant] unexpected static global variable"),
+            GlobalAlloc::Static(def_id) => {
+                let memory = self
+                    .tcx
+                    .eval_static_initializer(def_id)
+                    .unwrap_or_else(|_| {
+                        bug!(
+                            "[invariant] unable to evaluate static initializer for {}",
+                            self.tcx.def_path_str(def_id)
+                        )
+                    })
+                    .inner();
+
+                let bytes = memory
+                    .get_bytes_unchecked(AllocRange { start: Size::ZERO, size: memory.size() })
+                    .to_vec();
+
+                let mut prov = BTreeMap::new();
+                for (offset, ptr) in memory.provenance().ptrs().iter() {
+                    prov.insert(SolOffset(offset.bytes_usize()), self.make_global(ptr.alloc_id()));
+                }
+
+                let align = SolAlign(memory.align.bytes_usize());
+                match memory.mutability {
+                    Mutability::Not => SolGlobalObject::ImmData { bytes, provenance: prov, align },
+                    Mutability::Mut => SolGlobalObject::MutData { bytes, provenance: prov, align },
+                }
+            }
             GlobalAlloc::VTable(..) => bug!("[unsupported] vtable in global variable"),
             GlobalAlloc::TypeId { .. } => bug!("[unsupported] type id in global variable"),
         };
@@ -1310,6 +1360,7 @@ pub(crate) enum SolType {
     Function(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
     Closure(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
     FnPtr(Vec<SolType>, Box<SolType>),
+    Dynamic(Vec<(SolIdent, Vec<SolGenericArg>)>),
 }
 
 /// User-defined type, i.e., an algebraic data type (ADT)
