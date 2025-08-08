@@ -16,7 +16,8 @@ use rustc_middle::mir::{
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
     self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder, FloatTy,
-    GenericArg, GenericArgKind, GenericArgsRef, Instance, IntTy, Ty, TyCtxt, TypingEnv, UintTy,
+    GenericArg, GenericArgKind, GenericArgsRef, Instance, InstanceKind, IntTy, Ty, TyCtxt,
+    TypingEnv, UintTy,
 };
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
@@ -52,13 +53,19 @@ pub(crate) struct SolContextBuilder<'tcx> {
     ty_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolTyDef>>>,
 
     /// collected definitions of functions
-    fn_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolFnDef>>>,
+    fn_defs: BTreeMap<
+        SolIdent,
+        BTreeMap<Vec<SolGenericArg>, BTreeMap<SolInstanceKind, Option<SolFnDef>>>,
+    >,
 
     /// collected definitions of global variables
     globals: BTreeMap<SolGlobalSlot, SolGlobalObject>,
 
     /// functions without MIRs available
-    dep_fns: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, SolInstDesc>>,
+    dep_fns: BTreeMap<
+        SolIdent,
+        BTreeMap<Vec<SolGenericArg>, BTreeMap<SolInstanceKind, SolPathDescWithArgs>>,
+    >,
 }
 
 impl<'tcx> SolContextBuilder<'tcx> {
@@ -123,11 +130,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
     }
 
     /// Create a fully qualified instance description
-    fn mk_inst_desc(
+    fn mk_path_desc_with_args(
         tcx: TyCtxt<'tcx>,
         def_id: DefId,
         ty_args: GenericArgsRef<'tcx>,
-    ) -> SolInstDesc {
+    ) -> SolPathDescWithArgs {
         let path_str = tcx.def_path_str_with_args(def_id, ty_args);
         let path_str_with_crate = if def_id.is_local() {
             let krate = tcx.crate_name(LOCAL_CRATE).to_ident_string();
@@ -135,7 +142,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         } else {
             path_str
         };
-        SolInstDesc(path_str_with_crate)
+        SolPathDescWithArgs(path_str_with_crate)
     }
 
     /// Create a type
@@ -190,12 +197,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
             }
             ty::FnDef(def_id, generics) => {
-                let (ident, ty_args) = self.make_type_function(def_id, generics);
-                SolType::Function(ident, ty_args)
+                let (kind, ident, ty_args) = self.make_type_function(def_id, generics);
+                SolType::Function(kind, ident, ty_args)
             }
             ty::Closure(def_id, generics) => {
-                let (ident, ty_args) = self.make_type_closure(def_id, generics);
-                SolType::Closure(ident, ty_args)
+                let (kind, ident, ty_args) = self.make_type_closure(def_id, generics);
+                SolType::Closure(kind, ident, ty_args)
             }
             ty::FnPtr(sig, _header) => {
                 let sig = self.tcx.instantiate_bound_regions_with_erased(sig);
@@ -341,7 +348,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         &mut self,
         def_id: DefId,
         generics: GenericArgsRef<'tcx>,
-    ) -> (SolIdent, Vec<SolGenericArg>) {
+    ) -> (SolInstanceKind, SolIdent, Vec<SolGenericArg>) {
         // resolve the function instance
         let instance = match Instance::try_resolve(
             self.tcx,
@@ -372,7 +379,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         &mut self,
         def_id: DefId,
         generics: GenericArgsRef<'tcx>,
-    ) -> (SolIdent, Vec<SolGenericArg>) {
+    ) -> (SolInstanceKind, SolIdent, Vec<SolGenericArg>) {
         // resolve the closure instance
         let closure_ty_args = generics.as_closure();
         let instance =
@@ -724,8 +731,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         }
                     }
                     AggregateKind::Closure(def_id, generics) => {
-                        let (ident, ty_args) = self.make_type_closure(*def_id, *generics);
-                        SolOpcodeAggregate::Closure(ident, ty_args)
+                        let (kind, ident, ty_args) = self.make_type_closure(*def_id, *generics);
+                        SolOpcodeAggregate::Closure(kind, ident, ty_args)
                     }
                     AggregateKind::Coroutine(..) | AggregateKind::CoroutineClosure(..) => {
                         bug!("[invariant] unexpected coroutine in aggregate conversion");
@@ -917,7 +924,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
     pub(crate) fn make_instance(
         &mut self,
         instance: Instance<'tcx>,
-    ) -> (SolIdent, Vec<SolGenericArg>) {
+    ) -> (SolInstanceKind, SolIdent, Vec<SolGenericArg>) {
         let def_id = instance.def_id();
         let def_desc = self.tcx.def_path_str_with_args(def_id, instance.args);
 
@@ -925,41 +932,85 @@ impl<'tcx> SolContextBuilder<'tcx> {
         let ident = self.mk_ident(def_id);
         let ty_args: Vec<_> = instance.args.iter().map(|ty_arg| self.mk_ty_arg(ty_arg)).collect();
 
+        // derive the kind of the instance
+        let kind = match instance.def {
+            InstanceKind::Item(_) => {
+                // check if this is a builtin
+                for (builtin, regex) in self.builtin_funcs.iter() {
+                    if regex.is_match(&def_desc) {
+                        info!("{}-- builtin {builtin:?}: {def_desc}", self.depth);
+                        return (SolInstanceKind::Builtin(builtin.clone()), ident, ty_args);
+                    }
+                }
+
+                // not a builtin, continue processing
+                SolInstanceKind::Regular
+            }
+
+            // drop operation
+            InstanceKind::DropGlue(_, None) => SolInstanceKind::DropEmpty,
+            InstanceKind::DropGlue(_, Some(drop_ty)) => {
+                SolInstanceKind::DropGlued(Box::new(self.mk_type(drop_ty)))
+            }
+
+            // shims
+            InstanceKind::VTableShim(_) => SolInstanceKind::VTableShim,
+            InstanceKind::ReifyShim(_, _) => SolInstanceKind::ReifyShim,
+            InstanceKind::FnPtrShim(_, fn_ty) => {
+                SolInstanceKind::FnPtrShim(Box::new(self.mk_type(fn_ty)))
+            }
+            InstanceKind::FnPtrAddrShim(_, fn_ty) => {
+                SolInstanceKind::FnPtrAddrShim(Box::new(self.mk_type(fn_ty)))
+            }
+            InstanceKind::CloneShim(_, clone_ty) => {
+                SolInstanceKind::CloneShim(Box::new(self.mk_type(clone_ty)))
+            }
+            InstanceKind::ClosureOnceShim { call_once: _, track_caller: _ } => {
+                SolInstanceKind::ClosureOnceShim
+            }
+
+            // instance that does not have a MIR body
+            InstanceKind::Intrinsic(_) => {
+                info!("{}-- intrinsic: {def_desc}", self.depth);
+                return (SolInstanceKind::Intrinsic, ident, ty_args);
+            }
+            InstanceKind::Virtual(_, idx) => {
+                info!("{}-- virtual: {def_desc}", self.depth);
+                return (SolInstanceKind::Virtual(idx), ident, ty_args);
+            }
+
+            // unexpected instance kind
+            InstanceKind::ConstructCoroutineInClosureShim { .. }
+            | InstanceKind::ThreadLocalShim(..)
+            | InstanceKind::FutureDropPollShim(..)
+            | InstanceKind::AsyncDropGlueCtorShim(..)
+            | InstanceKind::AsyncDropGlue(..) => {
+                bug!("[invariant] unexpected instance kind: {def_desc}");
+            }
+        };
+
         // if already defined or is being defined, return the key
-        if self.fn_defs.get(&ident).map_or(false, |inner| inner.contains_key(&ty_args)) {
-            return (ident, ty_args);
-        }
-
-        // check if this is a builtin function
-        for (builtin, regex) in self.builtin_funcs.iter() {
-            if regex.is_match(&def_desc) {
-                info!("{}-- builtin function {builtin:?}: {def_desc}", self.depth);
-                return (ident, ty_args);
-            }
-        }
-
-        // check if this is an intrinsics function
-        match self.tcx.intrinsic(def_id) {
-            None => (),
-            Some(intrinsic_def) => {
-                info!(
-                    "{}-- intrinsic function {}: {def_desc}",
-                    self.depth,
-                    intrinsic_def.name.to_ident_string()
-                );
-                return (ident, ty_args);
-            }
+        if self
+            .fn_defs
+            .get(&ident)
+            .and_then(|inner| inner.get(&ty_args))
+            .map_or(false, |inner| inner.contains_key(&kind))
+        {
+            return (kind, ident, ty_args);
         }
 
         // convert the instance to monomorphised MIR
         if !self.tcx.is_mir_available(def_id) {
             info!("{}-- external dependency: {def_desc}", self.depth);
-            let deps_by_ident = self.dep_fns.entry(ident.clone()).or_default();
-            if !deps_by_ident.contains_key(&ty_args) {
-                deps_by_ident
-                    .insert(ty_args.clone(), Self::mk_inst_desc(self.tcx, def_id, instance.args));
+            let deps_inner =
+                self.dep_fns.entry(ident.clone()).or_default().entry(ty_args.clone()).or_default();
+            if !deps_inner.contains_key(&kind) {
+                deps_inner.insert(
+                    kind.clone(),
+                    Self::mk_path_desc_with_args(self.tcx, def_id, instance.args),
+                );
             }
-            return (ident, ty_args);
+            return (kind, ident, ty_args);
         }
 
         // mark start
@@ -967,7 +1018,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
         warn!("{}-> function {def_desc}", self.depth);
 
         // first update the entry to mark that instance definition in progress
-        self.fn_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), None);
+        self.fn_defs
+            .entry(ident.clone())
+            .or_default()
+            .entry(ty_args.clone())
+            .or_default()
+            .insert(kind.clone(), None);
 
         // convert the instance to monomorphised MIR
         let instance_mir = self.tcx.instance_mir(instance.def).clone();
@@ -1017,14 +1073,19 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
         // update the function definition lookup table
         let fn_def = SolFnDef { args, ret_ty, locals, blocks };
-        self.fn_defs.entry(ident.clone()).or_default().insert(ty_args.clone(), Some(fn_def));
+        self.fn_defs
+            .entry(ident.clone())
+            .or_default()
+            .entry(ty_args.clone())
+            .or_default()
+            .insert(kind.clone(), Some(fn_def));
 
         // mark end
         warn!("{}<- function {def_desc}", self.depth);
         self.depth.pop();
 
         // return the key to the lookup table
-        (ident, ty_args)
+        (kind, ident, ty_args)
     }
 
     /// Create a global variable definition
@@ -1037,8 +1098,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
         // now analyze the global variable
         let global = match self.tcx.global_alloc(alloc_id) {
             GlobalAlloc::Function { instance } => {
-                let (ident, ty_args) = self.make_instance(instance);
-                SolGlobalObject::Function(ident, ty_args)
+                let (kind, ident, ty_args) = self.make_instance(instance);
+                SolGlobalObject::Function(kind, ident, ty_args)
             }
             GlobalAlloc::Memory(memory) => {
                 let memory = memory.inner();
@@ -1083,8 +1144,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
         let krate = SolCrateName(self.tcx.crate_name(LOCAL_CRATE).to_ident_string());
 
         let mut ty_defs = vec![];
-        for (ident, defs) in self.ty_defs.into_iter() {
-            for (mono, def) in defs.into_iter() {
+        for (ident, l1) in self.ty_defs.into_iter() {
+            for (mono, def) in l1.into_iter() {
                 match def {
                     None => bug!("[invariant] missing type definition"),
                     Some(val) => ty_defs.push((ident.clone(), mono, val)),
@@ -1093,11 +1154,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
 
         let mut fn_defs = vec![];
-        for (ident, defs) in self.fn_defs.into_iter() {
-            for (mono, def) in defs.into_iter() {
-                match def {
-                    None => bug!("[invariant] missing function definition"),
-                    Some(val) => fn_defs.push((ident.clone(), mono, val)),
+        for (ident, l1) in self.fn_defs.into_iter() {
+            for (mono, l2) in l1.into_iter() {
+                for (kind, def) in l2.into_iter() {
+                    match def {
+                        None => bug!("[invariant] missing function definition"),
+                        Some(val) => fn_defs.push((kind, ident.clone(), mono.clone(), val)),
+                    }
                 }
             }
         }
@@ -1108,9 +1171,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
 
         let mut dep_fns = vec![];
-        for (ident, descs) in self.dep_fns.into_iter() {
-            for (mono, desc) in descs.into_iter() {
-                dep_fns.push((ident.clone(), mono, desc));
+        for (ident, l1) in self.dep_fns.into_iter() {
+            for (mono, l2) in l1.into_iter() {
+                for (kind, desc) in l2.into_iter() {
+                    dep_fns.push((kind, ident.clone(), mono.clone(), desc));
+                }
             }
         }
 
@@ -1129,15 +1194,15 @@ impl<'tcx> SolContextBuilder<'tcx> {
 pub(crate) struct SolContext {
     pub(crate) krate: SolCrateName,
     pub(crate) ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTyDef)>,
-    pub(crate) fn_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolFnDef)>,
+    pub(crate) fn_defs: Vec<(SolInstanceKind, SolIdent, Vec<SolGenericArg>, SolFnDef)>,
     pub(crate) globals: Vec<(SolGlobalSlot, SolGlobalObject)>,
-    pub(crate) dep_fns: Vec<(SolIdent, Vec<SolGenericArg>, SolInstDesc)>,
+    pub(crate) dep_fns: Vec<(SolInstanceKind, SolIdent, Vec<SolGenericArg>, SolPathDescWithArgs)>,
 }
 
 /// Dependencies
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolDeps {
-    pub(crate) fn_deps: Vec<(SolIdent, Vec<SolGenericArg>, SolInstDesc)>,
+    pub(crate) fn_deps: Vec<(SolIdent, Vec<SolGenericArg>, SolPathDescWithArgs)>,
 }
 
 /*
@@ -1159,9 +1224,9 @@ pub(crate) struct SolHash64(pub(crate) u64);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolPathDesc(pub(crate) String);
 
-/// A description of an instant path with generic arguments
+/// A description of an instance path with generic arguments
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolInstDesc(pub(crate) String);
+pub(crate) struct SolPathDescWithArgs(pub(crate) String);
 
 /// A crate name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1242,8 +1307,8 @@ pub(crate) enum SolType {
     MutRef(Box<SolType>),
     ImmPtr(Box<SolType>),
     MutPtr(Box<SolType>),
-    Function(SolIdent, Vec<SolGenericArg>),
-    Closure(SolIdent, Vec<SolGenericArg>),
+    Function(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
+    Closure(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
     FnPtr(Vec<SolType>, Box<SolType>),
 }
 
@@ -1402,7 +1467,7 @@ pub(crate) enum SolOpcodeAggregate {
     Enum { ty: SolType, variant: SolVariantIndex },
     ImmPtr { pointee_ty: SolType },
     MutPtr { pointee_ty: SolType },
-    Closure(SolIdent, Vec<SolGenericArg>),
+    Closure(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
 }
 
 /*
@@ -1491,7 +1556,7 @@ pub(crate) struct SolFnDef {
 pub(crate) enum SolGlobalObject {
     ImmData { bytes: Vec<u8>, provenance: BTreeMap<SolOffset, SolGlobalSlot>, align: SolAlign },
     MutData { bytes: Vec<u8>, provenance: BTreeMap<SolOffset, SolGlobalSlot>, align: SolAlign },
-    Function(SolIdent, Vec<SolGenericArg>),
+    Function(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
 }
 
 /*
@@ -1524,6 +1589,28 @@ pub(crate) enum SolConst {
 /*
  * Builtins
  */
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolInstanceKind {
+    Regular,
+    Builtin(SolBuiltinFunc),
+
+    /* drop operation */
+    DropEmpty,
+    DropGlued(Box<SolType>),
+
+    /* instance that has a MIR body */
+    VTableShim,
+    ReifyShim,
+    FnPtrShim(Box<SolType>),
+    FnPtrAddrShim(Box<SolType>),
+    CloneShim(Box<SolType>),
+    ClosureOnceShim,
+
+    /* instance that does not have a MIR body */
+    Intrinsic,
+    Virtual(usize),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolBuiltinFunc {
