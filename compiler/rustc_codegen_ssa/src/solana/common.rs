@@ -32,6 +32,7 @@ impl Display for BuildSystem {
 pub(crate) enum Phase {
     Bootstrap,
     Expansion(usize),
+    Temporary,
 }
 
 impl Display for Phase {
@@ -39,12 +40,12 @@ impl Display for Phase {
         match self {
             Self::Bootstrap => write!(f, "bootstrap"),
             Self::Expansion(n) => write!(f, "expansion{n}"),
+            Self::Temporary => write!(f, "temporary"),
         }
     }
 }
 
 /// Build context for Solana
-#[derive(Clone)]
 pub(crate) struct SolEnv {
     pub build_system: BuildSystem,
     pub phase: Phase,
@@ -165,6 +166,7 @@ impl SolEnv {
             Phase::Bootstrap => bug!("[invariant] no phase before bootstrap"),
             Phase::Expansion(0) => Phase::Bootstrap,
             Phase::Expansion(n) => Phase::Expansion(n - 1),
+            Phase::Temporary => bug!("[invariant] no phase before temporary"),
         };
         self.output_dir.join(phase.to_string())
     }
@@ -204,5 +206,30 @@ impl SolEnv {
         fs::write(&file_path, json_data).unwrap_or_else(|e| {
             bug!("[invariant] failed to write JSON to file {}: {e}", file_path.display())
         });
+    }
+
+    pub(crate) fn with_temporary_phase(&self) -> Self {
+        let result = Self {
+            build_system: self.build_system,
+            phase: Phase::Temporary,
+            source_dir: self.source_dir.clone(),
+            src_file_name: self.src_file_name.clone(),
+            src_path_full: self.src_path_full.clone(),
+            output_dir: self.output_dir.clone(),
+        };
+
+        // re-create phase output directory
+        let workdir = result.phase_output_dir();
+        if workdir.exists() {
+            fs::remove_dir_all(&workdir).unwrap_or_else(|e| {
+                bug!("[invariant] failed to remove previous phase output directory: {e}")
+            });
+        }
+        fs::create_dir(workdir).unwrap_or_else(|e| {
+            bug!("[invariant] failed to create temporary phase output directory: {e}")
+        });
+
+        // return the updated env
+        result
     }
 }
