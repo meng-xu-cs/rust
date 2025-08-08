@@ -1202,7 +1202,7 @@ pub(crate) struct SolContext {
 /// Dependencies
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolDeps {
-    pub(crate) fn_deps: Vec<(SolIdent, Vec<SolGenericArg>, SolPathDescWithArgs)>,
+    pub(crate) fn_deps: Vec<(SolInstanceKind, SolIdent, Vec<SolGenericArg>, SolPathDescWithArgs)>,
 }
 
 /*
