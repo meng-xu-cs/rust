@@ -152,7 +152,7 @@ pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
 
         // now build the context around this instance
         warn!("- found dependency {def_desc}");
-        let (def_ident, def_args) = builder.make_instance(instance);
+        let (_, def_ident, def_args) = builder.make_instance(instance);
 
         // now also check if the ident and type arguments match
         if dep_ident != &def_ident {
