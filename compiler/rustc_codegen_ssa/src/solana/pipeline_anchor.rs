@@ -145,7 +145,7 @@ pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     // compare with the dependencies
     let mut builder = SolContextBuilder::new(tcx, sol);
     let mut matched = false;
-    for (dep_ident, dep_args, _) in &deps.fn_deps {
+    for (_, dep_ident, dep_args, _) in &deps.fn_deps {
         if dep_ident != &inst_ident {
             continue;
         }
