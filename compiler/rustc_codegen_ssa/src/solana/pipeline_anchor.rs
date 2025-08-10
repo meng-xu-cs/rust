@@ -106,7 +106,8 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     let (sol, context) = builder.build();
 
     // serialize the information to file
-    sol.serialize_to_file("context", &context);
+    let ctxt_file = sol.serialize_to_file("context", &context);
+    info!("- done with instruction {def_desc}, context saved at {}", ctxt_file.display());
 }
 
 pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: Instance<'tcx>) {
@@ -220,5 +221,6 @@ pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     builder.make_instance(instance);
 
     let (sol, context) = builder.build();
-    sol.serialize_to_file("context", &context);
+    let ctxt_file = sol.serialize_to_file("context", &context);
+    info!("- done with dependency {def_desc}, context saved at {}", ctxt_file.display());
 }

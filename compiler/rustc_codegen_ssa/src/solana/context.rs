@@ -1039,7 +1039,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
         // convert the instance to monomorphised MIR
         if !self.tcx.is_mir_available(def_id) {
-            info!("{}-- external dependency: {def_desc}", self.depth);
+            info!("{}-- external dependency {def_desc} of kind {kind:#?}", self.depth);
             let deps_inner =
                 self.dep_fns.entry(ident.clone()).or_default().entry(ty_args.clone()).or_default();
             if !deps_inner.contains_key(&kind) {

@@ -194,7 +194,7 @@ impl SolEnv {
             .unwrap_or_else(|e| bug!("[invariant] failed to write Dot to file: {e}"));
     }
 
-    pub(crate) fn serialize_to_file<T: Serialize>(&self, tag: &str, data: &T) {
+    pub(crate) fn serialize_to_file<T: Serialize>(&self, tag: &str, data: &T) -> PathBuf {
         let file_outdir = self.fresh_output_dir("f");
         let file_path = file_outdir.join(format!("{tag}.json"));
         if file_path.exists() {
@@ -206,6 +206,8 @@ impl SolEnv {
         fs::write(&file_path, json_data).unwrap_or_else(|e| {
             bug!("[invariant] failed to write JSON to file {}: {e}", file_path.display())
         });
+
+        file_path
     }
 
     pub(crate) fn with_temporary_phase(&self) -> Self {
