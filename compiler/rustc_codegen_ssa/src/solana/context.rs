@@ -1709,7 +1709,9 @@ pub(crate) enum SolBuiltinFunc {
     /* operations */
     IntrinsicsAbort,
     IntrinsicsAssertFailed,
+    IntrinsicsAssertFailedInner,
     IntrinsicsPanic,
+    IntrinsicsPanicNounwind,
     IntrinsicsPanicFmt,
     IntrinsicsPanicNounwindFmt,
     IntrinsicsRawEq,
@@ -1718,6 +1720,8 @@ pub(crate) enum SolBuiltinFunc {
     IntrinsicsColdPath,
     /* alloc */
     AllocGlobalAllocImpl,
+    AllocRustAlloc,
+    AllocRustAllocZeroed,
     AllocRustRealloc,
     AllocRustDealloc,
     AllocHandleAllocError,
@@ -1788,27 +1792,31 @@ impl SolBuiltinFunc {
     fn regex(&self) -> Regex {
         let pattern = match self {
             /* operations */
-            Self::IntrinsicsAbort => r"std::intrinsics::abort",
-            Self::IntrinsicsAssertFailed => r"assert_failed::<.*>",
+            Self::IntrinsicsAbort => r"-X:::X-", //  r"std::intrinsics::abort",
+            Self::IntrinsicsAssertFailed => r"-X:::X-", //  r"assert_failed::<.*>",
+            Self::IntrinsicsAssertFailedInner => r"panicking::assert_failed_inner",
             Self::IntrinsicsPanic => r"panic",
+            Self::IntrinsicsPanicNounwind => r"panic_nounwind",
             Self::IntrinsicsPanicFmt => r"panic_fmt",
             Self::IntrinsicsPanicNounwindFmt => r"panic_nounwind_fmt",
-            Self::IntrinsicsRawEq => r"raw_eq::<.*>",
-            Self::IntrinsicsPtrOffsetFromUnsigned => r"ptr_offset_from_unsigned::<.*>",
-            Self::IntrinsicsCtpop => r"ctpop::<.*>",
-            Self::IntrinsicsColdPath => r"std::intrinsics::cold_path",
+            Self::IntrinsicsRawEq => r"-X:::X-", // r"raw_eq::<.*>",
+            Self::IntrinsicsPtrOffsetFromUnsigned => r"-X:::X-", //  r"ptr_offset_from_unsigned::<.*>",
+            Self::IntrinsicsCtpop => r"-X:::X-",                 // r"ctpop::<.*>",
+            Self::IntrinsicsColdPath => r"-X:::X-",              //  r"std::intrinsics::cold_path",
             /* alloc */
-            Self::AllocGlobalAllocImpl => r"std::alloc::Global::alloc_impl",
+            Self::AllocGlobalAllocImpl => r"-X:::X-", //  r"std::alloc::Global::alloc_impl",
+            Self::AllocRustAlloc => r"alloc::alloc::__rust_alloc",
+            Self::AllocRustAllocZeroed => r"alloc::alloc::__rust_alloc_zeroed",
             Self::AllocRustRealloc => r"alloc::alloc::__rust_realloc",
             Self::AllocRustDealloc => r"alloc::alloc::__rust_dealloc",
-            Self::AllocHandleAllocError => r"handle_alloc_error",
+            Self::AllocHandleAllocError => r"-X:::X-", //  r"handle_alloc_error",
             Self::AllocRawVecHandleError => r"alloc::raw_vec::handle_error",
             Self::LayoutIsSizeAlignValid => r"Layout::is_size_align_valid",
-            Self::SpecToString => r"<.* as string::SpecToString>::spec_to_string",
+            Self::SpecToString => r"-X:::X-", // r"<.* as string::SpecToString>::spec_to_string",
             /* formatter */
-            Self::DebugFmt => r"<.* as Debug>::fmt",
+            Self::DebugFmt => r"-X:::X-", //  r"<.* as Debug>::fmt",
             /* solana */
-            Self::SolInvokeSigned => r"sol_invoke_signed",
+            Self::SolInvokeSigned => r"-X:::X-", // r"sol_invoke_signed",
         };
 
         Regex::new(pattern).unwrap_or_else(|e| {
@@ -1821,7 +1829,9 @@ impl SolBuiltinFunc {
             /* operations */
             Self::IntrinsicsAbort,
             Self::IntrinsicsAssertFailed,
+            Self::IntrinsicsAssertFailedInner,
             Self::IntrinsicsPanic,
+            Self::IntrinsicsPanicNounwind,
             Self::IntrinsicsPanicFmt,
             Self::IntrinsicsPanicNounwindFmt,
             Self::IntrinsicsRawEq,
@@ -1830,6 +1840,8 @@ impl SolBuiltinFunc {
             Self::IntrinsicsColdPath,
             /* alloc */
             Self::AllocGlobalAllocImpl,
+            Self::AllocRustAlloc,
+            Self::AllocRustAllocZeroed,
             Self::AllocRustRealloc,
             Self::AllocRustDealloc,
             Self::AllocHandleAllocError,
@@ -1847,11 +1859,11 @@ impl SolBuiltinFunc {
 impl SolBuiltinType {
     fn regex(&self) -> Regex {
         let pattern = match self {
-            Self::StdIoError => r"std::io::Error",
-            Self::FmtArgument => r"core::fmt::rt::Argument<.*>",
-            Self::FmtArguments => r"Arguments<.*>",
-            Self::FmtArgumentType => r"core::fmt::rt::ArgumentType<.*>",
-            Self::FmtFormatter => r"Formatter<.*>",
+            Self::StdIoError => r"-X:::X-",      // r"std::io::Error",
+            Self::FmtArgument => r"-X:::X-",     // r"core::fmt::rt::Argument<.*>",
+            Self::FmtArguments => r"-X:::X-",    // r"Arguments<.*>",
+            Self::FmtArgumentType => r"-X:::X-", // r"core::fmt::rt::ArgumentType<.*>",
+            Self::FmtFormatter => r"-X:::X-",    // r"Formatter<.*>",
         };
 
         Regex::new(pattern).unwrap_or_else(|e| {
