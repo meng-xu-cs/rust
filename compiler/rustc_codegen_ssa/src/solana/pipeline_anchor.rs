@@ -215,6 +215,7 @@ pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     }
 
     // now resolve the context
+    info!("- processing dependency {def_desc}");
     let mut builder = SolContextBuilder::new(tcx, sol);
     builder.make_instance(instance);
 
