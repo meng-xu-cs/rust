@@ -1721,11 +1721,15 @@ pub(crate) enum SolBuiltinFunc {
     AllocGlobalAllocImpl,
     AllocRustRealloc,
     AllocRustDealloc,
+    AllocHandleAllocError,
     AllocRawVecHandleError,
     SpecToString,
 
     /* formatter */
     DebugFmt,
+
+    /* solana */
+    SolInvokeSigned,
 
     /* precondition checks */
     HintAssertPreconditionCheck,
@@ -1806,10 +1810,13 @@ impl SolBuiltinFunc {
             Self::AllocGlobalAllocImpl => r"std::alloc::Global::alloc_impl",
             Self::AllocRustRealloc => r"alloc::alloc::__rust_realloc",
             Self::AllocRustDealloc => r"alloc::alloc::__rust_dealloc",
+            Self::AllocHandleAllocError => r"handle_alloc_error",
             Self::AllocRawVecHandleError => r"alloc::raw_vec::handle_error",
             Self::SpecToString => r"<.* as string::SpecToString>::spec_to_string",
 
             Self::DebugFmt => r"<.* as Debug>::fmt",
+
+            Self::SolInvokeSigned => r"sol_invoke_signed",
 
             Self::HintAssertPreconditionCheck => r"assert_unchecked::precondition_check",
             Self::AllocLayoutFromSizeAlignPreconditionCheck => {
@@ -1846,9 +1853,11 @@ impl SolBuiltinFunc {
             Self::AllocGlobalAllocImpl,
             Self::AllocRustRealloc,
             Self::AllocRustDealloc,
+            Self::AllocHandleAllocError,
             Self::AllocRawVecHandleError,
             Self::SpecToString,
             Self::DebugFmt,
+            Self::SolInvokeSigned,
             Self::HintAssertPreconditionCheck,
             Self::AllocLayoutFromSizeAlignPreconditionCheck,
             Self::CopyNonOverlappingPreconditionCheck,
