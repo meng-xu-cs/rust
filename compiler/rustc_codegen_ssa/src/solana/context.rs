@@ -1038,18 +1038,49 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
 
         // convert the instance to monomorphised MIR
-        if !self.tcx.is_mir_available(def_id) {
-            info!("{}-- external dependency {def_desc} of kind {kind:#?}", self.depth);
-            let deps_inner =
-                self.dep_fns.entry(ident.clone()).or_default().entry(ty_args.clone()).or_default();
-            if !deps_inner.contains_key(&kind) {
-                deps_inner.insert(
-                    kind.clone(),
-                    Self::mk_path_desc_with_args(self.tcx, def_id, instance.args),
-                );
+        let instance_mir = match kind {
+            SolInstanceKind::Regular => {
+                if !self.tcx.is_mir_available(def_id) {
+                    info!("{}-- external dependency {def_desc} of kind {kind:#?}", self.depth);
+                    let deps_inner = self
+                        .dep_fns
+                        .entry(ident.clone())
+                        .or_default()
+                        .entry(ty_args.clone())
+                        .or_default();
+                    if !deps_inner.contains_key(&kind) {
+                        deps_inner.insert(
+                            kind.clone(),
+                            Self::mk_path_desc_with_args(self.tcx, def_id, instance.args),
+                        );
+                    }
+                    return (kind, ident, ty_args);
+                }
+
+                // this is a regular function definition
+                let body = self.tcx.instance_mir(instance.def).clone();
+                if body.phase != MirPhase::Runtime(RuntimePhase::Optimized) {
+                    bug!("converted instance is not runtime optimized: {def_desc}");
+                }
+                body
             }
-            return (kind, ident, ty_args);
-        }
+
+            SolInstanceKind::DropEmpty
+            | SolInstanceKind::DropGlued(_)
+            | SolInstanceKind::VTableShim
+            | SolInstanceKind::ReifyShim
+            | SolInstanceKind::FnPtrShim(_)
+            | SolInstanceKind::FnPtrAddrShim(_)
+            | SolInstanceKind::CloneShim(_)
+            | SolInstanceKind::ClosureOnceShim => self.tcx.mir_shims(instance.def).clone(),
+
+            // already handled before
+            SolInstanceKind::Builtin(_)
+            | SolInstanceKind::Intrinsic
+            | SolInstanceKind::Virtual(_) => {
+                bug!("[invariant] unexpected instance kind");
+            }
+        };
 
         // mark start
         self.depth.push();
@@ -1062,13 +1093,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
             .entry(ty_args.clone())
             .or_default()
             .insert(kind.clone(), None);
-
-        // convert the instance to monomorphised MIR
-        let instance_mir = self.tcx.instance_mir(instance.def).clone();
-        if instance_mir.phase != MirPhase::Runtime(RuntimePhase::Optimized) {
-            // FIXME: if we allow `regular` fn items only, this should hold
-            info!("-{}converted instance is not runtime optimized: {def_desc}", self.depth);
-        }
 
         // NOTE: lazy normalization seems to be in effect here, at least associated types
         // are not easily resolved after this transformation.
