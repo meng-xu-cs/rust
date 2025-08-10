@@ -24,7 +24,7 @@ use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::solana::common::SolEnv;
+use crate::solana::common::{Phase, SolEnv};
 
 /// A builder for creating a Solana context
 pub(crate) struct SolContextBuilder<'tcx> {
@@ -98,8 +98,14 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
     }
 
-    /// Create an identifier without cacheing it
+    /// Whether we are in the dry-run mode
+    fn is_dry_run(&self) -> bool {
+        matches!(self.sol.phase, Phase::Temporary)
+    }
+
+    /// Create an identifier without caching it
     pub(crate) fn mk_ident_no_cache(tcx: TyCtxt<'tcx>, def_id: DefId) -> SolIdent {
+        // now construct the identifier
         let def_path_hash = tcx.def_path_hash(def_id);
         SolIdent {
             krate: SolHash64(def_path_hash.stable_crate_id().as_u64()),
@@ -276,8 +282,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
         let ident = self.mk_ident(adt_def.did());
         let ty_args: Vec<_> = generics.iter().map(|ty_arg| self.mk_ty_arg(ty_arg)).collect();
 
-        // if already defined or is being defined, return the key
-        if self.ty_defs.get(&ident).map_or(false, |inner| inner.contains_key(&ty_args)) {
+        // in dry-run mode, do not analyze the defs
+        if self.is_dry_run() {
             return (ident, ty_args);
         }
 
@@ -287,6 +293,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 info!("{}-- builtin datatype {builtin:?}: {def_desc}", self.depth);
                 return (ident, ty_args);
             }
+        }
+
+        // if already defined or is being defined, return the key
+        if self.ty_defs.get(&ident).map_or(false, |inner| inner.contains_key(&ty_args)) {
+            return (ident, ty_args);
         }
 
         // mark start
@@ -620,9 +631,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             SolOpcodeCast::ReifyFnPtr
                         }
                     },
-                    CastKind::PointerExposeProvenance | CastKind::PointerWithExposedProvenance => {
-                        bug!("[assumption] unexpected cast kind: {cast_kind:?}")
-                    }
+                    CastKind::PointerExposeProvenance => SolOpcodeCast::PtrToAddr,
+                    CastKind::PointerWithExposedProvenance => SolOpcodeCast::AddrToPtr,
                 };
                 SolExpr::Cast { opcode, place: self.mk_operand(operand), ty: self.mk_type(*ty) }
             }
@@ -1011,6 +1021,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 bug!("[invariant] unexpected instance kind: {def_desc}");
             }
         };
+
+        // skip if we are in dry-run mode
+        if self.is_dry_run() {
+            return (kind, ident, ty_args);
+        }
 
         // if already defined or is being defined, return the key
         if self
@@ -1469,6 +1484,8 @@ pub(crate) enum SolOpcodeCast {
     FloatToInt,
     Reinterpret,
     ReifyFnPtr,
+    PtrToAddr,
+    AddrToPtr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
