@@ -276,7 +276,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         generics: GenericArgsRef<'tcx>,
     ) -> (SolIdent, Vec<SolGenericArg>) {
         let def_id = adt_def.did();
-        let def_desc = self.tcx.def_path_str_with_args(def_id, generics);
+        let def_desc = Self::mk_path_desc_with_args(self.tcx, def_id, generics);
 
         // locate the key of the definition
         let ident = self.mk_ident(adt_def.did());
@@ -289,7 +289,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
         // check if this is a builtin datatype
         for (builtin, regex) in self.builtin_types.iter() {
-            if regex.is_match(&def_desc) {
+            if regex.is_match(&def_desc.0) {
                 info!("{}-- builtin datatype {builtin:?}: {def_desc}", self.depth);
                 return (ident, ty_args);
             }
@@ -959,7 +959,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         instance: Instance<'tcx>,
     ) -> (SolInstanceKind, SolIdent, Vec<SolGenericArg>) {
         let def_id = instance.def_id();
-        let def_desc = self.tcx.def_path_str_with_args(def_id, instance.args);
+        let def_desc = Self::mk_path_desc_with_args(self.tcx, def_id, instance.args);
 
         // locate the key of the definition
         let ident = self.mk_ident(def_id);
@@ -970,7 +970,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             InstanceKind::Item(_) => {
                 // check if this is a builtin
                 for (builtin, regex) in self.builtin_funcs.iter() {
-                    if regex.is_match(&def_desc) {
+                    if regex.is_match(&def_desc.0) {
                         info!("{}-- builtin {builtin:?}: {def_desc}", self.depth);
                         return (SolInstanceKind::Builtin(builtin.clone()), ident, ty_args);
                     }
@@ -1867,6 +1867,12 @@ impl SolBuiltinType {
             Self::FmtArgumentType,
             Self::FmtFormatter,
         ]
+    }
+}
+
+impl Display for SolPathDescWithArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
