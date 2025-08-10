@@ -1716,28 +1716,18 @@ pub(crate) enum SolBuiltinFunc {
     IntrinsicsPtrOffsetFromUnsigned,
     IntrinsicsCtpop,
     IntrinsicsColdPath,
-
     /* alloc */
     AllocGlobalAllocImpl,
     AllocRustRealloc,
     AllocRustDealloc,
     AllocHandleAllocError,
     AllocRawVecHandleError,
+    LayoutIsSizeAlignValid,
     SpecToString,
-
     /* formatter */
     DebugFmt,
-
     /* solana */
     SolInvokeSigned,
-
-    /* precondition checks */
-    HintAssertPreconditionCheck,
-    AllocLayoutFromSizeAlignPreconditionCheck,
-    CopyNonOverlappingPreconditionCheck,
-    VecSetLenPreconditionCheck,
-    SliceFromRawPartsPreconditionCheck,
-    OffsetFromUnsignedPreconditionCheck,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1797,6 +1787,7 @@ impl From<FloatTy> for SolTypeFloat {
 impl SolBuiltinFunc {
     fn regex(&self) -> Regex {
         let pattern = match self {
+            /* operations */
             Self::IntrinsicsAbort => r"std::intrinsics::abort",
             Self::IntrinsicsAssertFailed => r"assert_failed::<.*>",
             Self::IntrinsicsPanic => r"panic",
@@ -1806,32 +1797,18 @@ impl SolBuiltinFunc {
             Self::IntrinsicsPtrOffsetFromUnsigned => r"ptr_offset_from_unsigned::<.*>",
             Self::IntrinsicsCtpop => r"ctpop::<.*>",
             Self::IntrinsicsColdPath => r"std::intrinsics::cold_path",
-
+            /* alloc */
             Self::AllocGlobalAllocImpl => r"std::alloc::Global::alloc_impl",
             Self::AllocRustRealloc => r"alloc::alloc::__rust_realloc",
             Self::AllocRustDealloc => r"alloc::alloc::__rust_dealloc",
             Self::AllocHandleAllocError => r"handle_alloc_error",
             Self::AllocRawVecHandleError => r"alloc::raw_vec::handle_error",
+            Self::LayoutIsSizeAlignValid => r"Layout::is_size_align_valid",
             Self::SpecToString => r"<.* as string::SpecToString>::spec_to_string",
-
+            /* formatter */
             Self::DebugFmt => r"<.* as Debug>::fmt",
-
+            /* solana */
             Self::SolInvokeSigned => r"sol_invoke_signed",
-
-            Self::HintAssertPreconditionCheck => r"assert_unchecked::precondition_check",
-            Self::AllocLayoutFromSizeAlignPreconditionCheck => {
-                r"Layout::from_size_align_unchecked::precondition_check"
-            }
-            Self::CopyNonOverlappingPreconditionCheck => {
-                r"std::ptr::copy_nonoverlapping::precondition_check"
-            }
-            Self::VecSetLenPreconditionCheck => r"Vec::<.*>::set_len::precondition_check",
-            Self::SliceFromRawPartsPreconditionCheck => {
-                r"std::slice::from_raw_parts::precondition_check"
-            }
-            Self::OffsetFromUnsignedPreconditionCheck => {
-                r"std::ptr::const_ptr::<.*>::offset_from_unsigned::precondition_check"
-            }
         };
 
         Regex::new(pattern).unwrap_or_else(|e| {
@@ -1841,6 +1818,7 @@ impl SolBuiltinFunc {
 
     fn all() -> Vec<Self> {
         vec![
+            /* operations */
             Self::IntrinsicsAbort,
             Self::IntrinsicsAssertFailed,
             Self::IntrinsicsPanic,
@@ -1850,20 +1828,18 @@ impl SolBuiltinFunc {
             Self::IntrinsicsPtrOffsetFromUnsigned,
             Self::IntrinsicsCtpop,
             Self::IntrinsicsColdPath,
+            /* alloc */
             Self::AllocGlobalAllocImpl,
             Self::AllocRustRealloc,
             Self::AllocRustDealloc,
             Self::AllocHandleAllocError,
             Self::AllocRawVecHandleError,
+            Self::LayoutIsSizeAlignValid,
             Self::SpecToString,
+            /* formatter */
             Self::DebugFmt,
+            /* solana */
             Self::SolInvokeSigned,
-            Self::HintAssertPreconditionCheck,
-            Self::AllocLayoutFromSizeAlignPreconditionCheck,
-            Self::CopyNonOverlappingPreconditionCheck,
-            Self::VecSetLenPreconditionCheck,
-            Self::SliceFromRawPartsPreconditionCheck,
-            Self::OffsetFromUnsignedPreconditionCheck,
         ]
     }
 }
