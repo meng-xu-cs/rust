@@ -211,27 +211,13 @@ impl SolEnv {
     }
 
     pub(crate) fn with_temporary_phase(&self) -> Self {
-        let result = Self {
+        Self {
             build_system: self.build_system,
             phase: Phase::Temporary,
             source_dir: self.source_dir.clone(),
             src_file_name: self.src_file_name.clone(),
             src_path_full: self.src_path_full.clone(),
             output_dir: self.output_dir.clone(),
-        };
-
-        // re-create phase output directory
-        let workdir = result.phase_output_dir();
-        if workdir.exists() {
-            fs::remove_dir_all(&workdir).unwrap_or_else(|e| {
-                bug!("[invariant] failed to remove previous phase output directory: {e}")
-            });
         }
-        fs::create_dir(workdir).unwrap_or_else(|e| {
-            bug!("[invariant] failed to create temporary phase output directory: {e}")
-        });
-
-        // return the updated env
-        result
     }
 }
