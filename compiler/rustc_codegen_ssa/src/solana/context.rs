@@ -7,7 +7,7 @@ use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::bug;
-use rustc_middle::mir::interpret::{AllocId, AllocRange, GlobalAlloc, Scalar};
+use rustc_middle::mir::interpret::{AllocId, AllocRange, Allocation, GlobalAlloc, Scalar};
 use rustc_middle::mir::{
     AggregateKind, BinOp, BorrowKind, CastKind, Const as OpConst, ConstValue, MirPhase,
     NonDivergingIntrinsic, NullOp, Operand, Place, PlaceElem, RawPtrKind, RuntimePhase, Rvalue,
@@ -43,9 +43,6 @@ pub(crate) struct SolContextBuilder<'tcx> {
     /// a cache of id to identifier mappings
     id_cache: FxHashMap<DefId, (SolIdent, SolPathDesc)>,
 
-    /// a cache of alloc id to global slot mappings
-    alloc_map: FxHashMap<AllocId, SolGlobalSlot>,
-
     /// collected definitions of datatypes
     ty_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolTyDef>>>,
 
@@ -56,7 +53,7 @@ pub(crate) struct SolContextBuilder<'tcx> {
     >,
 
     /// collected definitions of global variables
-    globals: BTreeMap<SolGlobalSlot, SolGlobalObject>,
+    globals: BTreeMap<SolIdent, SolGlobalMemory>,
 
     /// functions without MIRs available
     dep_fns: BTreeMap<
@@ -80,7 +77,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 .collect(),
             depth: Depth::new(),
             id_cache: FxHashMap::default(),
-            alloc_map: FxHashMap::default(),
             ty_defs: BTreeMap::new(),
             fn_defs: BTreeMap::new(),
             globals: BTreeMap::new(),
@@ -1134,74 +1130,56 @@ impl<'tcx> SolContextBuilder<'tcx> {
     }
 
     /// Create a global variable definition
-    fn make_global(&mut self, alloc_id: AllocId) -> SolGlobalSlot {
-        // if already defined or is being defined, return the key
-        if let Some(slot) = self.alloc_map.get(&alloc_id) {
-            return slot.clone();
-        }
-
-        // now analyze the global variable
-        let global = match self.tcx.global_alloc(alloc_id) {
+    fn make_global(&mut self, alloc_id: AllocId) -> SolGlobalObject {
+        match self.tcx.global_alloc(alloc_id) {
             GlobalAlloc::Function { instance } => {
                 let (kind, ident, ty_args) = self.make_instance(instance);
                 SolGlobalObject::Function(kind, ident, ty_args)
             }
-            GlobalAlloc::Memory(memory) => {
-                let memory = memory.inner();
-
-                let bytes = memory
-                    .get_bytes_unchecked(AllocRange { start: Size::ZERO, size: memory.size() })
-                    .to_vec();
-
-                let mut prov = BTreeMap::new();
-                for (offset, ptr) in memory.provenance().ptrs().iter() {
-                    prov.insert(SolOffset(offset.bytes_usize()), self.make_global(ptr.alloc_id()));
-                }
-
-                let align = SolAlign(memory.align.bytes_usize());
-                match memory.mutability {
-                    Mutability::Not => SolGlobalObject::ImmData { bytes, provenance: prov, align },
-                    Mutability::Mut => SolGlobalObject::MutData { bytes, provenance: prov, align },
-                }
+            GlobalAlloc::Memory(allocated) => {
+                SolGlobalObject::Memory(self.mk_allocation(allocated.inner()))
             }
             GlobalAlloc::Static(def_id) => {
-                let memory = self
-                    .tcx
-                    .eval_static_initializer(def_id)
-                    .unwrap_or_else(|_| {
-                        bug!(
-                            "[invariant] unable to evaluate static initializer for {}",
-                            self.tcx.def_path_str(def_id)
-                        )
-                    })
-                    .inner();
+                let ident = self.mk_ident(def_id);
 
-                let bytes = memory
-                    .get_bytes_unchecked(AllocRange { start: Size::ZERO, size: memory.size() })
-                    .to_vec();
+                // check if we have a static memory allocation
+                if !self.globals.contains_key(&ident) {
+                    let initializer =
+                        self.tcx.eval_static_initializer(def_id).unwrap_or_else(|_| {
+                            bug!(
+                                "[invariant] unable to evaluate static initializer for {}",
+                                self.tcx.def_path_str(def_id)
+                            )
+                        });
 
-                let mut prov = BTreeMap::new();
-                for (offset, ptr) in memory.provenance().ptrs().iter() {
-                    prov.insert(SolOffset(offset.bytes_usize()), self.make_global(ptr.alloc_id()));
+                    let memory = self.mk_allocation(initializer.inner());
+                    self.globals.insert(ident.clone(), memory);
                 }
 
-                let align = SolAlign(memory.align.bytes_usize());
-                match memory.mutability {
-                    Mutability::Not => SolGlobalObject::ImmData { bytes, provenance: prov, align },
-                    Mutability::Mut => SolGlobalObject::MutData { bytes, provenance: prov, align },
-                }
+                SolGlobalObject::Static(ident)
             }
             GlobalAlloc::VTable(..) => bug!("[unsupported] vtable in global variable"),
             GlobalAlloc::TypeId { .. } => bug!("[unsupported] type id in global variable"),
+        }
+    }
+
+    /// Create a global memory allocation
+    fn mk_allocation(&mut self, memory: &Allocation) -> SolGlobalMemory {
+        let bytes = memory
+            .get_bytes_unchecked(AllocRange { start: Size::ZERO, size: memory.size() })
+            .to_vec();
+
+        let mut prov = BTreeMap::new();
+        for (offset, ptr) in memory.provenance().ptrs().iter() {
+            prov.insert(SolOffset(offset.bytes_usize()), self.make_global(ptr.alloc_id()));
+        }
+
+        let align = SolAlign(memory.align.bytes_usize());
+        let mutable = match memory.mutability {
+            Mutability::Not => false,
+            Mutability::Mut => true,
         };
-
-        // update the global variable lookup table
-        let key = SolGlobalSlot(self.globals.len());
-        self.globals.insert(key.clone(), global);
-        self.alloc_map.insert(alloc_id, key.clone());
-
-        // return the key
-        key
+        SolGlobalMemory { bytes, prov, align, mutable }
     }
 
     /// Build the context
@@ -1237,8 +1215,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
 
         let mut globals = vec![];
-        for (slot, global) in self.globals.into_iter() {
-            globals.push((slot, global));
+        for (ident, memory) in self.globals.into_iter() {
+            globals.push((ident, memory));
         }
 
         let mut dep_fns = vec![];
@@ -1266,7 +1244,7 @@ pub(crate) struct SolContext {
     pub(crate) krate: SolCrateName,
     pub(crate) ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTyDef)>,
     pub(crate) fn_defs: Vec<(SolInstanceKind, SolIdent, Vec<SolGenericArg>, SolFnDef)>,
-    pub(crate) globals: Vec<(SolGlobalSlot, SolGlobalObject)>,
+    pub(crate) globals: Vec<(SolIdent, SolGlobalMemory)>,
     pub(crate) dep_fns: Vec<(SolInstanceKind, SolIdent, Vec<SolGenericArg>, SolPathDescWithArgs)>,
 }
 
@@ -1326,10 +1304,6 @@ pub(crate) struct SolLocalSlot(pub(crate) usize);
 /// A basic block index
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolBlockId(pub(crate) usize);
-
-/// A location id for global values
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolGlobalSlot(pub(crate) usize);
 
 /*
  * Typing
@@ -1627,9 +1601,17 @@ pub(crate) struct SolFnDef {
  */
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolGlobalMemory {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) prov: BTreeMap<SolOffset, SolGlobalObject>,
+    pub(crate) align: SolAlign,
+    pub(crate) mutable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolGlobalObject {
-    ImmData { bytes: Vec<u8>, provenance: BTreeMap<SolOffset, SolGlobalSlot>, align: SolAlign },
-    MutData { bytes: Vec<u8>, provenance: BTreeMap<SolOffset, SolGlobalSlot>, align: SolAlign },
+    Memory(SolGlobalMemory),
+    Static(SolIdent),
     Function(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
 }
 
@@ -1655,9 +1637,9 @@ pub(crate) struct SolScalar {
 pub(crate) enum SolConst {
     ZeroSized,
     Scalar(SolScalar),
-    Slice { origin: SolGlobalSlot, length: usize },
-    Indirect { origin: SolGlobalSlot, offset: SolOffset },
-    Pointer { origin: SolGlobalSlot, offset: SolOffset },
+    Slice { origin: SolGlobalObject, length: usize },
+    Indirect { origin: SolGlobalObject, offset: SolOffset },
+    Pointer { origin: SolGlobalObject, offset: SolOffset },
 }
 
 /*
