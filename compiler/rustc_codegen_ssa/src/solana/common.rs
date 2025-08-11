@@ -194,8 +194,8 @@ impl SolEnv {
             .unwrap_or_else(|e| bug!("[invariant] failed to write Dot to file: {e}"));
     }
 
-    pub(crate) fn serialize_to_file<T: Serialize>(&self, tag: &str, data: &T) -> PathBuf {
-        let file_outdir = self.fresh_output_dir("f");
+    fn serialize_to_file<T: Serialize>(&self, dpx: &str, tag: &str, data: &T) -> PathBuf {
+        let file_outdir = self.fresh_output_dir(dpx);
         let file_path = file_outdir.join(format!("{tag}.json"));
         if file_path.exists() {
             bug!("[invariant] file {file_path:?} already exists");
@@ -208,6 +208,14 @@ impl SolEnv {
         });
 
         file_path
+    }
+
+    pub(crate) fn context_to_file<T: Serialize>(&self, data: &T) -> PathBuf {
+        self.serialize_to_file("f", "context", data)
+    }
+
+    pub(crate) fn summary_to_file<T: Serialize>(&self, tag: &str, data: &T) -> PathBuf {
+        self.serialize_to_file("s", tag, data)
     }
 
     pub(crate) fn with_temporary_phase(&self) -> Self {

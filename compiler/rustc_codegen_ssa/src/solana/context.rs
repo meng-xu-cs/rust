@@ -1702,6 +1702,16 @@ pub(crate) enum SolBuiltinFunc {
     SolInvokeSigned,
 }
 
+/*
+ * Platform-specifics
+ */
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolAnchorInstruction {
+    pub(crate) function: SolIdent,
+    pub(crate) ty_state: SolIdent,
+}
+
 /* --- END OF SYNC --- */
 
 /*
