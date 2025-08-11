@@ -1706,7 +1706,7 @@ pub(crate) enum SolInstanceKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolBuiltinFunc {
-    /* operations */
+    /* panics */
     IntrinsicsAbort,
     IntrinsicsAssertFailed,
     IntrinsicsAssertFailedInner,
@@ -1714,6 +1714,8 @@ pub(crate) enum SolBuiltinFunc {
     IntrinsicsPanicNounwind,
     IntrinsicsPanicFmt,
     IntrinsicsPanicNounwindFmt,
+    IntrinsicsResultUnwrapFailed,
+    /* operations */
     IntrinsicsRawEq,
     IntrinsicsPtrOffsetFromUnsigned,
     IntrinsicsCtpop,
@@ -1729,6 +1731,7 @@ pub(crate) enum SolBuiltinFunc {
     LayoutIsSizeAlignValid,
     SpecToString,
     /* formatter */
+    StdFmtWrite,
     DebugFmt,
     /* solana */
     SolInvokeSigned,
@@ -1791,7 +1794,7 @@ impl From<FloatTy> for SolTypeFloat {
 impl SolBuiltinFunc {
     fn regex(&self) -> Regex {
         let pattern = match self {
-            /* operations */
+            /* panics */
             Self::IntrinsicsAbort => r"-X:::X-", //  r"std::intrinsics::abort",
             Self::IntrinsicsAssertFailed => r"-X:::X-", //  r"assert_failed::<.*>",
             Self::IntrinsicsAssertFailedInner => r"panicking::assert_failed_inner",
@@ -1799,6 +1802,8 @@ impl SolBuiltinFunc {
             Self::IntrinsicsPanicNounwind => r"panic_nounwind",
             Self::IntrinsicsPanicFmt => r"panic_fmt",
             Self::IntrinsicsPanicNounwindFmt => r"panic_nounwind_fmt",
+            Self::IntrinsicsResultUnwrapFailed => r"result::unwrap_failed",
+            /* operations */
             Self::IntrinsicsRawEq => r"-X:::X-", // r"raw_eq::<.*>",
             Self::IntrinsicsPtrOffsetFromUnsigned => r"-X:::X-", //  r"ptr_offset_from_unsigned::<.*>",
             Self::IntrinsicsCtpop => r"-X:::X-",                 // r"ctpop::<.*>",
@@ -1814,9 +1819,10 @@ impl SolBuiltinFunc {
             Self::LayoutIsSizeAlignValid => r"Layout::is_size_align_valid",
             Self::SpecToString => r"-X:::X-", // r"<.* as string::SpecToString>::spec_to_string",
             /* formatter */
+            Self::StdFmtWrite => r"std::fmt::write",
             Self::DebugFmt => r"<.* as Debug>::fmt",
             /* solana */
-            Self::SolInvokeSigned => r"-X:::X-", // r"sol_invoke_signed",
+            Self::SolInvokeSigned => r"sol_invoke_signed",
         };
 
         Regex::new(pattern).unwrap_or_else(|e| {
@@ -1826,7 +1832,7 @@ impl SolBuiltinFunc {
 
     fn all() -> Vec<Self> {
         vec![
-            /* operations */
+            /* panics */
             Self::IntrinsicsAbort,
             Self::IntrinsicsAssertFailed,
             Self::IntrinsicsAssertFailedInner,
@@ -1834,6 +1840,8 @@ impl SolBuiltinFunc {
             Self::IntrinsicsPanicNounwind,
             Self::IntrinsicsPanicFmt,
             Self::IntrinsicsPanicNounwindFmt,
+            Self::IntrinsicsResultUnwrapFailed,
+            /* operations */
             Self::IntrinsicsRawEq,
             Self::IntrinsicsPtrOffsetFromUnsigned,
             Self::IntrinsicsCtpop,
@@ -1849,6 +1857,7 @@ impl SolBuiltinFunc {
             Self::LayoutIsSizeAlignValid,
             Self::SpecToString,
             /* formatter */
+            Self::StdFmtWrite,
             Self::DebugFmt,
             /* solana */
             Self::SolInvokeSigned,
