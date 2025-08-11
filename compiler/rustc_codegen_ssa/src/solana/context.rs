@@ -1041,7 +1041,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         let instance_mir = match kind {
             SolInstanceKind::Regular => {
                 if !self.tcx.is_mir_available(def_id) {
-                    info!("{}-- external dependency {def_desc} of kind {kind:#?}", self.depth);
+                    warn!("{}-- external dependency: {def_desc}", self.depth);
                     let deps_inner = self
                         .dep_fns
                         .entry(ident.clone())
@@ -1804,17 +1804,17 @@ impl SolBuiltinFunc {
             Self::IntrinsicsCtpop => r"-X:::X-",                 // r"ctpop::<.*>",
             Self::IntrinsicsColdPath => r"-X:::X-",              //  r"std::intrinsics::cold_path",
             /* alloc */
-            Self::AllocGlobalAllocImpl => r"-X:::X-", //  r"std::alloc::Global::alloc_impl",
+            Self::AllocGlobalAllocImpl => r"std::alloc::Global::alloc_impl",
             Self::AllocRustAlloc => r"alloc::alloc::__rust_alloc",
             Self::AllocRustAllocZeroed => r"alloc::alloc::__rust_alloc_zeroed",
             Self::AllocRustRealloc => r"alloc::alloc::__rust_realloc",
             Self::AllocRustDealloc => r"alloc::alloc::__rust_dealloc",
-            Self::AllocHandleAllocError => r"-X:::X-", //  r"handle_alloc_error",
+            Self::AllocHandleAllocError => r"handle_alloc_error",
             Self::AllocRawVecHandleError => r"alloc::raw_vec::handle_error",
             Self::LayoutIsSizeAlignValid => r"Layout::is_size_align_valid",
             Self::SpecToString => r"-X:::X-", // r"<.* as string::SpecToString>::spec_to_string",
             /* formatter */
-            Self::DebugFmt => r"-X:::X-", //  r"<.* as Debug>::fmt",
+            Self::DebugFmt => r"<.* as Debug>::fmt",
             /* solana */
             Self::SolInvokeSigned => r"-X:::X-", // r"sol_invoke_signed",
         };
