@@ -95,21 +95,9 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
 
     // assert that the state type must be user-defined
     let ty_state_def_id = match ty_state.kind() {
-        ty::Adt(ty_state_def, ty_state_args) => {
-            if !ty_state_args.is_empty() {
-                bug!("[assumption] expect the state type to be non-generic, found: {ty_state}");
-            }
-            ty_state_def.did()
-        }
-        _ => {
-            bug!("[assumption] expect the state type to be an adt, found: {ty_state}");
-        }
+        ty::Adt(ty_state_def, _) => ty_state_def.did(),
+        _ => bug!("[assumption] expect the state type to be an adt, found: {ty_state}"),
     };
-
-    // assert that the instruction function must be non-generic
-    if !instance.args.is_empty() {
-        bug!("[assumption] expect the instruction to be non-generic, found: {def_desc}");
-    }
 
     // collect information
     warn!("- found instruction {def_desc} with argument {ty_state}");
