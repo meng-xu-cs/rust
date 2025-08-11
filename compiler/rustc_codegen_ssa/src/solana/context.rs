@@ -1192,6 +1192,14 @@ impl<'tcx> SolContextBuilder<'tcx> {
         // unpack the fields
         let krate = SolCrateName(self.tcx.crate_name(LOCAL_CRATE).to_ident_string());
 
+        let mut id_desc = vec![];
+
+        // we don't care about the ordering of the values
+        #[allow(rustc::potential_query_instability)]
+        for (ident, desc) in self.id_cache.into_values() {
+            id_desc.push((ident, desc));
+        }
+
         let mut ty_defs = vec![];
         for (ident, l1) in self.ty_defs.into_iter() {
             for (mono, def) in l1.into_iter() {
@@ -1228,7 +1236,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
         }
 
-        (self.sol, SolContext { krate, ty_defs, fn_defs, globals, dep_fns })
+        (self.sol, SolContext { krate, id_desc, ty_defs, fn_defs, globals, dep_fns })
     }
 }
 
@@ -1242,6 +1250,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolContext {
     pub(crate) krate: SolCrateName,
+    pub(crate) id_desc: Vec<(SolIdent, SolPathDesc)>,
     pub(crate) ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTyDef)>,
     pub(crate) fn_defs: Vec<(SolInstanceKind, SolIdent, Vec<SolGenericArg>, SolFnDef)>,
     pub(crate) globals: Vec<(SolIdent, SolGlobalMemory)>,
