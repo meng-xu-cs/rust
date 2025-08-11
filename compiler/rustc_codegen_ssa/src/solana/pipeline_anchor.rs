@@ -7,7 +7,7 @@ use rustc_middle::{bug, ty};
 use tracing::{info, warn};
 
 use crate::solana::common::SolEnv;
-use crate::solana::context::{SolContextBuilder, SolDeps, SolInstanceKind};
+use crate::solana::context::{SolAnchorInstruction, SolContextBuilder, SolDeps, SolInstanceKind};
 
 pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: Instance<'tcx>) {
     info!(
@@ -94,19 +94,41 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     };
 
     // assert that the state type must be user-defined
-    if !matches!(ty_state.kind(), ty::Adt(_, _)) {
-        bug!("[assumption] expect the state type to be an adt, found: {ty_state}");
+    let ty_state_def_id = match ty_state.kind() {
+        ty::Adt(ty_state_def, ty_state_args) => {
+            if !ty_state_args.is_empty() {
+                bug!("[assumption] expect the state type to be non-generic, found: {ty_state}");
+            }
+            ty_state_def.did()
+        }
+        _ => {
+            bug!("[assumption] expect the state type to be an adt, found: {ty_state}");
+        }
+    };
+
+    // assert that the instruction function must be non-generic
+    if !instance.args.is_empty() {
+        bug!("[assumption] expect the instruction to be non-generic, found: {def_desc}");
     }
 
     // collect information
     warn!("- found instruction {def_desc} with argument {ty_state}");
 
     let mut builder = SolContextBuilder::new(tcx, sol);
-    builder.make_instance(instance);
+    let (_, inst_ident, _) = builder.make_instance(instance);
     let (sol, context) = builder.build();
 
-    // serialize the information to file
-    let ctxt_file = sol.serialize_to_file("context", &context);
+    // serialize the context to file
+    let ctxt_file = sol.context_to_file(&context);
+
+    // save the instruction to file
+    let instruction = SolAnchorInstruction {
+        function: inst_ident,
+        ty_state: SolContextBuilder::mk_ident_no_cache(tcx, ty_state_def_id),
+    };
+    sol.summary_to_file("instruction", &instruction);
+
+    // done
     info!("- done with instruction {def_desc}, context saved at {}", ctxt_file.display());
 }
 
@@ -221,6 +243,6 @@ pub(crate) fn phase_expansion<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     builder.make_instance(instance);
 
     let (sol, context) = builder.build();
-    let ctxt_file = sol.serialize_to_file("context", &context);
+    let ctxt_file = sol.context_to_file(&context);
     info!("- done with dependency {def_desc}, context saved at {}", ctxt_file.display());
 }
