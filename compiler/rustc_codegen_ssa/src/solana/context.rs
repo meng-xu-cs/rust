@@ -35,10 +35,7 @@ pub(crate) struct SolContextBuilder<'tcx> {
     sol: SolEnv,
 
     /// All built-in functions
-    builtin_funcs: BTreeMap<SolBuiltinFunc, Regex>,
-
-    /// All built-in datatypes
-    builtin_types: BTreeMap<SolBuiltinType, Regex>,
+    builtin_fns: BTreeMap<SolBuiltinFunc, Regex>,
 
     /// depth of the current context
     depth: Depth,
@@ -74,14 +71,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         Self {
             tcx,
             sol,
-            builtin_funcs: SolBuiltinFunc::all()
-                .into_iter()
-                .map(|item| {
-                    let regex = item.regex();
-                    (item, regex)
-                })
-                .collect(),
-            builtin_types: SolBuiltinType::all()
+            builtin_fns: SolBuiltinFunc::all()
                 .into_iter()
                 .map(|item| {
                     let regex = item.regex();
@@ -285,14 +275,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
         // in dry-run mode, do not analyze the defs
         if self.is_dry_run() {
             return (ident, ty_args);
-        }
-
-        // check if this is a builtin datatype
-        for (builtin, regex) in self.builtin_types.iter() {
-            if regex.is_match(&def_desc.0) {
-                info!("{}-- builtin datatype {builtin:?}: {def_desc}", self.depth);
-                return (ident, ty_args);
-            }
         }
 
         // if already defined or is being defined, return the key
@@ -969,7 +951,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         let kind = match instance.def {
             InstanceKind::Item(_) => {
                 // check if this is a builtin
-                for (builtin, regex) in self.builtin_funcs.iter() {
+                for (builtin, regex) in self.builtin_fns.iter() {
                     if regex.is_match(&def_desc.0) {
                         info!("{}-- builtin {builtin:?}: {def_desc}", self.depth);
                         return (SolInstanceKind::Builtin(builtin.clone()), ident, ty_args);
@@ -1707,19 +1689,12 @@ pub(crate) enum SolInstanceKind {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolBuiltinFunc {
     /* panics */
-    IntrinsicsAbort,
-    IntrinsicsAssertFailed,
     IntrinsicsAssertFailedInner,
     IntrinsicsPanic,
     IntrinsicsPanicNounwind,
     IntrinsicsPanicFmt,
     IntrinsicsPanicNounwindFmt,
     IntrinsicsResultUnwrapFailed,
-    /* operations */
-    IntrinsicsRawEq,
-    IntrinsicsPtrOffsetFromUnsigned,
-    IntrinsicsCtpop,
-    IntrinsicsColdPath,
     /* alloc */
     AllocGlobalAllocImpl,
     AllocRustAlloc,
@@ -1729,23 +1704,11 @@ pub(crate) enum SolBuiltinFunc {
     AllocHandleAllocError,
     AllocRawVecHandleError,
     LayoutIsSizeAlignValid,
-    SpecToString,
     /* formatter */
     StdFmtWrite,
     DebugFmt,
     /* solana */
     SolInvokeSigned,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) enum SolBuiltinType {
-    /* error */
-    StdIoError,
-    /* format arguments */
-    FmtArgument,
-    FmtArguments,
-    FmtArgumentType,
-    FmtFormatter,
 }
 
 /* --- END OF SYNC --- */
@@ -1795,19 +1758,12 @@ impl SolBuiltinFunc {
     fn regex(&self) -> Regex {
         let pattern = match self {
             /* panics */
-            Self::IntrinsicsAbort => r"-X:::X-", //  r"std::intrinsics::abort",
-            Self::IntrinsicsAssertFailed => r"-X:::X-", //  r"assert_failed::<.*>",
             Self::IntrinsicsAssertFailedInner => r"panicking::assert_failed_inner",
             Self::IntrinsicsPanic => r"panic",
             Self::IntrinsicsPanicNounwind => r"panic_nounwind",
             Self::IntrinsicsPanicFmt => r"panic_fmt",
             Self::IntrinsicsPanicNounwindFmt => r"panic_nounwind_fmt",
             Self::IntrinsicsResultUnwrapFailed => r"result::unwrap_failed",
-            /* operations */
-            Self::IntrinsicsRawEq => r"-X:::X-", // r"raw_eq::<.*>",
-            Self::IntrinsicsPtrOffsetFromUnsigned => r"-X:::X-", //  r"ptr_offset_from_unsigned::<.*>",
-            Self::IntrinsicsCtpop => r"-X:::X-",                 // r"ctpop::<.*>",
-            Self::IntrinsicsColdPath => r"-X:::X-",              //  r"std::intrinsics::cold_path",
             /* alloc */
             Self::AllocGlobalAllocImpl => r"std::alloc::Global::alloc_impl",
             Self::AllocRustAlloc => r"alloc::alloc::__rust_alloc",
@@ -1817,7 +1773,6 @@ impl SolBuiltinFunc {
             Self::AllocHandleAllocError => r"handle_alloc_error",
             Self::AllocRawVecHandleError => r"alloc::raw_vec::handle_error",
             Self::LayoutIsSizeAlignValid => r"Layout::is_size_align_valid",
-            Self::SpecToString => r"-X:::X-", // r"<.* as string::SpecToString>::spec_to_string",
             /* formatter */
             Self::StdFmtWrite => r"std::fmt::write",
             Self::DebugFmt => r"<.* as Debug>::fmt",
@@ -1833,19 +1788,12 @@ impl SolBuiltinFunc {
     fn all() -> Vec<Self> {
         vec![
             /* panics */
-            Self::IntrinsicsAbort,
-            Self::IntrinsicsAssertFailed,
             Self::IntrinsicsAssertFailedInner,
             Self::IntrinsicsPanic,
             Self::IntrinsicsPanicNounwind,
             Self::IntrinsicsPanicFmt,
             Self::IntrinsicsPanicNounwindFmt,
             Self::IntrinsicsResultUnwrapFailed,
-            /* operations */
-            Self::IntrinsicsRawEq,
-            Self::IntrinsicsPtrOffsetFromUnsigned,
-            Self::IntrinsicsCtpop,
-            Self::IntrinsicsColdPath,
             /* alloc */
             Self::AllocGlobalAllocImpl,
             Self::AllocRustAlloc,
@@ -1855,38 +1803,11 @@ impl SolBuiltinFunc {
             Self::AllocHandleAllocError,
             Self::AllocRawVecHandleError,
             Self::LayoutIsSizeAlignValid,
-            Self::SpecToString,
             /* formatter */
             Self::StdFmtWrite,
             Self::DebugFmt,
             /* solana */
             Self::SolInvokeSigned,
-        ]
-    }
-}
-
-impl SolBuiltinType {
-    fn regex(&self) -> Regex {
-        let pattern = match self {
-            Self::StdIoError => r"-X:::X-",      // r"std::io::Error",
-            Self::FmtArgument => r"-X:::X-",     // r"core::fmt::rt::Argument<.*>",
-            Self::FmtArguments => r"-X:::X-",    // r"Arguments<.*>",
-            Self::FmtArgumentType => r"-X:::X-", // r"core::fmt::rt::ArgumentType<.*>",
-            Self::FmtFormatter => r"-X:::X-",    // r"Formatter<.*>",
-        };
-
-        Regex::new(pattern).unwrap_or_else(|e| {
-            bug!("[invariant] failed to compile regex for builtin datatype: {e}")
-        })
-    }
-
-    fn all() -> Vec<Self> {
-        vec![
-            Self::StdIoError,
-            Self::FmtArgument,
-            Self::FmtArguments,
-            Self::FmtArgumentType,
-            Self::FmtFormatter,
         ]
     }
 }
