@@ -535,9 +535,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
             PlaceElem::Subslice { from, to, from_end } => {
                 SolProjection::Subslice { from: from as usize, to: to as usize, from_end }
             }
-            PlaceElem::Downcast(_, variant) => {
+            PlaceElem::Downcast(sym_opt, variant) => {
+                let symbol = match sym_opt {
+                    None => bug!("[invariant] missing variant symbol for downcast projection"),
+                    Some(sym) => SolVariantName(sym.to_ident_string()),
+                };
                 let variant_index = SolVariantIndex(variant.index());
-                SolProjection::Downcast { variant: variant_index }
+                SolProjection::Downcast { symbol, variant: variant_index }
             }
             PlaceElem::Subtype(ty) => SolProjection::Subtype(self.mk_type(ty)),
             PlaceElem::OpaqueCast(ty) => {
@@ -1424,7 +1428,7 @@ pub(crate) enum SolProjection {
     VariableIndex { local: SolLocalSlot },
     ConstantIndex { offset: usize, min_length: usize, from_end: bool },
     Subslice { from: usize, to: usize, from_end: bool },
-    Downcast { variant: SolVariantIndex },
+    Downcast { symbol: SolVariantName, variant: SolVariantIndex },
     Subtype(SolType),
 }
 
