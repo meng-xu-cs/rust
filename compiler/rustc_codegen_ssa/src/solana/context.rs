@@ -468,9 +468,54 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 SolConst::Slice { origin, length }
             }
             ConstValue::Indirect { alloc_id, offset } => {
-                let origin = self.make_global(alloc_id);
+                let memory = match self.tcx.global_alloc(alloc_id) {
+                    GlobalAlloc::Memory(a) => a.inner(),
+                    _ => bug!("[invariant] indirect const should be of the memory allocation type"),
+                };
+
+                let ptr_size = self.tcx.data_layout.pointer_size();
+                if memory.size() < offset + 2 * ptr_size {
+                    bug!("[invariant] dangling reference in indirect const");
+                }
+
+                // read the pointer component
+                let ptr = memory
+                    .read_scalar(&self.tcx, AllocRange { start: offset, size: ptr_size }, true)
+                    .unwrap_or_else(|e| {
+                        bug!("[invariant] failed to read pointer in indirect const: {e:?}")
+                    })
+                    .to_pointer(&self.tcx)
+                    .unwrap_or_else(|e| {
+                        bug!("[invariant] failed to convert pointer in direct const: {e:?}")
+                    })
+                    .into_pointer_or_addr()
+                    .unwrap_or_else(|e| {
+                        bug!(
+                            "[invariant] expect a pointer got an address 0x{:x} in indirect const",
+                            e.bytes_usize()
+                        )
+                    });
+
+                // read the length component
+                let len = memory
+                    .read_scalar(
+                        &self.tcx,
+                        AllocRange { start: offset + ptr_size, size: ptr_size },
+                        false,
+                    )
+                    .unwrap_or_else(|e| {
+                        bug!("[invariant] failed to read length in indirect const: {e:?}")
+                    })
+                    .to_target_usize(&self.tcx)
+                    .unwrap_or_else(|e| {
+                        bug!("[invariant] expect a target usize of length in indirect const: {e:?}")
+                    });
+
+                // resolve the targetted object
+                let (prov, offset) = ptr.prov_and_relative_offset();
+                let origin = self.make_global(prov.alloc_id());
                 let offset = SolOffset(offset.bytes_usize());
-                SolConst::Indirect { origin, offset }
+                SolConst::Indirect { origin, offset, length: len as usize }
             }
         }
     }
@@ -1651,7 +1696,7 @@ pub(crate) enum SolConst {
     ZeroSized,
     Scalar(SolScalar),
     Slice { origin: SolGlobalObject, length: usize },
-    Indirect { origin: SolGlobalObject, offset: SolOffset },
+    Indirect { origin: SolGlobalObject, offset: SolOffset, length: usize },
     Pointer { origin: SolGlobalObject, offset: SolOffset },
 }
 
