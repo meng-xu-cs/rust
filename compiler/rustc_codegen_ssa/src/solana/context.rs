@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 
 use regex::Regex;
-use rustc_abi::Size;
+use rustc_abi::{
+    FieldIdx, FieldsShape, Primitive, Scalar as ScalarAbi, Size, TagEncoding, VariantIdx, Variants,
+};
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::LOCAL_CRATE;
@@ -17,7 +19,7 @@ use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
     self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder,
     ExistentialPredicate, FloatTy, GenericArg, GenericArgKind, GenericArgsRef, Instance,
-    InstanceKind, IntTy, Ty, TyCtxt, TypingEnv, UintTy,
+    InstanceKind, IntTy, Ty, TyCtxt, TypingEnv, UintTy, VariantDiscr,
 };
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
@@ -326,6 +328,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     .variants()
                     .iter_enumerated()
                     .map(|(variant_idx, variant_def)| {
+                        if !matches!(variant_def.discr, VariantDiscr::Relative(pos) if pos as usize == variant_idx.index()) {
+                            bug!("[assumption] non-relative variant discriminant for enum {def_desc}");
+                        }
                         let variant_index = SolVariantIndex(variant_idx.index());
                         let variant_name = SolVariantName(variant_def.name.to_ident_string());
                         let fields = variant_def
@@ -416,17 +421,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
             TyConstKind::Value(val) => {
                 let const_ty = self.mk_type(val.ty);
                 let const_val = if val.valtree.is_zst() {
-                    SolConst::ZeroSized
+                    self.mk_val_const_from_zst(val.ty)
                 } else {
                     match val.valtree.try_to_scalar() {
                         None => bug!("[unsupported] non-scalar type constant {ty_const:?}"),
-                        Some(Scalar::Int(scalar)) => SolConst::Scalar(SolScalar {
-                            bits: scalar.size().bits_usize(),
-                            value: scalar.to_bits_unchecked(),
-                        }),
-                        Some(Scalar::Ptr(..)) => {
-                            bug!("[invariant] unexpected pointer type constant {ty_const:?}");
-                        }
+                        Some(scalar) => self.mk_val_const_from_scalar(val.ty, scalar),
                     }
                 };
                 SolTyConst::Simple { ty: const_ty, val: const_val }
@@ -447,22 +446,425 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
     }
 
-    /// Create a constant known in the value system
-    fn mk_val_const(&mut self, val_const: ConstValue) -> SolConst {
-        match val_const {
-            ConstValue::Scalar(Scalar::Int(scalar)) => SolConst::Scalar(SolScalar {
+    /// Create a constant from a zero-sized type (ZST)
+    fn mk_val_const_from_zst(&mut self, ty: Ty<'tcx>) -> SolConst {
+        match ty.kind() {
+            ty::Tuple(elems) if elems.is_empty() => SolConst::Tuple(vec![]),
+            ty::Adt(def, _) => match def.adt_kind() {
+                AdtKind::Struct if def.all_fields().count() == 0 => SolConst::Struct(vec![]),
+                _ => bug!("[invariant] the ADT definition is not a ZST: {ty}"),
+            },
+            _ => bug!("[invariant] unexpected non-ZST type {ty}"),
+        }
+    }
+
+    /// Create a constant from a MIR scalar
+    fn mk_val_const_from_scalar(&mut self, ty: Ty<'tcx>, scalar: Scalar) -> SolConst {
+        match ty.kind() {
+            // value types
+            ty::Bool => match scalar {
+                Scalar::Int(int) => SolConst::Bool(!int.is_null()),
+                Scalar::Ptr(..) => {
+                    bug!("[invariant] unexpected pointer scalar for bool");
+                }
+            },
+            ty::Char => match scalar {
+                Scalar::Int(int) => SolConst::Char(int.to_u8() as char),
+                Scalar::Ptr(..) => {
+                    bug!("[invariant] unexpected pointer scalar for char");
+                }
+            },
+            ty::Int(int_ty) => match scalar {
+                Scalar::Int(int) => match int_ty {
+                    IntTy::I8 => SolConst::Int(SolConstInt::I8(int.to_i8())),
+                    IntTy::I16 => SolConst::Int(SolConstInt::I16(int.to_i16())),
+                    IntTy::I32 => SolConst::Int(SolConstInt::I32(int.to_i32())),
+                    IntTy::I64 => SolConst::Int(SolConstInt::I64(int.to_i64())),
+                    IntTy::I128 => SolConst::Int(SolConstInt::I128(int.to_i128())),
+                    IntTy::Isize => {
+                        SolConst::Int(SolConstInt::Isize(int.to_target_isize(self.tcx) as isize))
+                    }
+                },
+                Scalar::Ptr(..) => {
+                    bug!("[invariant] unexpected pointer scalar for signed int");
+                }
+            },
+            ty::Uint(uint_ty) => match scalar {
+                Scalar::Int(int) => match uint_ty {
+                    UintTy::U8 => SolConst::Int(SolConstInt::U8(int.to_u8())),
+                    UintTy::U16 => SolConst::Int(SolConstInt::U16(int.to_u16())),
+                    UintTy::U32 => SolConst::Int(SolConstInt::U32(int.to_u32())),
+                    UintTy::U64 => SolConst::Int(SolConstInt::U64(int.to_u64())),
+                    UintTy::U128 => SolConst::Int(SolConstInt::U128(int.to_u128())),
+                    UintTy::Usize => {
+                        SolConst::Int(SolConstInt::Usize(int.to_target_usize(self.tcx) as usize))
+                    }
+                },
+                Scalar::Ptr(..) => {
+                    bug!("[invariant] unexpected pointer scalar for unsigned int");
+                }
+            },
+            ty::Float(float_ty) => match scalar {
+                Scalar::Int(int) => match float_ty {
+                    FloatTy::F16 => SolConst::Float(SolConstFloat::F16(int.to_f16().to_string())),
+                    FloatTy::F32 => SolConst::Float(SolConstFloat::F32(int.to_f32().to_string())),
+                    FloatTy::F64 => SolConst::Float(SolConstFloat::F64(int.to_f64().to_string())),
+                    FloatTy::F128 => {
+                        SolConst::Float(SolConstFloat::F128(int.to_f128().to_string()))
+                    }
+                },
+                Scalar::Ptr(..) => {
+                    bug!("[invariant] unexpected pointer scalar for float");
+                }
+            },
+
+            // pointer or reference types (fixme)
+            ty::Ref(_, _, _) => {
+                bug!("[unsupported] ref for scalar constant");
+            }
+            ty::RawPtr(_, _) => {
+                bug!("[unsupported] raw-ptr for scalar constant");
+            }
+            ty::FnPtr(_, _) => {
+                bug!("[unsupported] fn-ptr for scalar constant");
+            }
+
+            // all others
+            _ => {
+                bug!("[assumption] unexpected type {ty} for scalar constant");
+            }
+        }
+    }
+
+    /* TODO: to be removed
+    /// Create a constant from a MIR scalar
+    fn mk_val_const_from_scalar2(&mut self, scalar: Scalar) -> SolConstBase {
+        match scalar {
+            Scalar::Int(scalar) => SolConstBase::Scalar(SolScalar {
                 bits: scalar.size().bits_usize(),
                 value: scalar.to_bits_unchecked(),
             }),
-            ConstValue::Scalar(Scalar::Ptr(ptr, _ /* pointer size */)) => {
+            Scalar::Ptr(ptr, _ /* pointer size */) => {
                 let (prov, offset) = ptr.prov_and_relative_offset();
-                SolConst::Pointer {
+                SolConstBase::Pointer(SolPointer {
                     origin: self.make_global(prov.alloc_id()),
                     offset: SolOffset(offset.bytes_usize()),
+                })
+            }
+        }
+    }
+    */
+
+    fn read_const_from_memory_and_layout(
+        &mut self,
+        memory: &Allocation,
+        offset: Size,
+        ty: Ty<'tcx>,
+    ) -> SolConst {
+        // utility
+        let read_primitive = |tcx: TyCtxt<'tcx>, start, size: Size, is_provenane: bool| {
+            memory.read_scalar(&tcx, AllocRange { start, size }, is_provenane).unwrap_or_else(|e| {
+                bug!("[invariant] failed to read a primitive in memory allocation: {e:?}")
+            })
+        };
+
+        // get the layout of the type
+        let layout = self
+            .tcx
+            .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+            .unwrap_or_else(|e| bug!("[invariant] unable to get layout of type {ty}: {e}"))
+            .layout;
+
+        // case by type
+        match ty.kind() {
+            // primitives
+            ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) => {
+                match layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect single 0-variant for primitive type {ty}"),
+                }
+                if !matches!(layout.fields, FieldsShape::Primitive) {
+                    bug!("[invariant] expect a primitive field for primitive type {ty}");
+                }
+
+                let v = read_primitive(self.tcx, offset, layout.size, false);
+                self.mk_val_const_from_scalar(ty, v)
+            }
+
+            // pointers
+            ty::RawPtr(..) | ty::Ref(..) | ty::FnPtr(..) => {
+                match &layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect single 0-variant for pointer type {ty}"),
+                }
+                if !matches!(layout.fields, FieldsShape::Primitive) {
+                    bug!("[invariant] expect a primitive field for pointer type {ty}");
+                }
+
+                let v = read_primitive(self.tcx, offset, layout.size, true);
+                self.mk_val_const_from_scalar(ty, v)
+            }
+
+            // slices (should not be here)
+            ty::Str => {
+                bug!("[assumption] unexpected string constant in memory");
+            }
+            ty::Slice(_) => {
+                bug!("[assumption] unexpected slice constant in memory");
+            }
+
+            // packed
+            ty::Array(elem_ty, _) => {
+                match &layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect single 0-variant for array type {ty}"),
+                }
+                match &layout.fields {
+                    FieldsShape::Array { stride, count } => {
+                        let mut elements = vec![];
+                        for i in 0..*count {
+                            let elem_offset = offset + *stride * i;
+                            let elem = self.read_const_from_memory_and_layout(
+                                memory,
+                                elem_offset,
+                                *elem_ty,
+                            );
+                            elements.push(elem);
+                        }
+                        SolConst::Array(elements)
+                    }
+                    _ => bug!("[invariant] expect an array field for array type {ty}"),
                 }
             }
-            ConstValue::ZeroSized => SolConst::ZeroSized,
+
+            ty::Tuple(elem_tys) => {
+                match &layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect a single 0-variant for tuple type {ty}"),
+                }
+                match &layout.fields {
+                    FieldsShape::Arbitrary { offsets, memory_index: _ } => {
+                        if offsets.len() != elem_tys.len() {
+                            bug!("[invariant] field count mismatch for tuple type {ty}");
+                        }
+
+                        let mut elements = vec![];
+                        for (i, elem_ty) in elem_tys.iter().enumerate() {
+                            let field_idx = FieldIdx::from_usize(i);
+                            let field_offset = *offsets.get(field_idx).unwrap_or_else(|| {
+                                bug!("[invariant] no offset for field {i} in tuple type {ty}");
+                            });
+                            let elem = self.read_const_from_memory_and_layout(
+                                memory,
+                                offset + field_offset,
+                                elem_ty,
+                            );
+                            elements.push(elem);
+                        }
+                        SolConst::Tuple(elements)
+                    }
+                    _ => bug!("[invariant] expect an arbitrary field for tuple type {ty}"),
+                }
+            }
+
+            ty::Adt(def, ty_args) => match def.adt_kind() {
+                AdtKind::Struct => {
+                    let field_details = def
+                        .non_enum_variant()
+                        .fields
+                        .iter_enumerated()
+                        .map(|(field_idx, field_def)| {
+                            (field_idx, field_def.name, field_def.ty(self.tcx, ty_args))
+                        })
+                        .collect::<Vec<_>>();
+
+                    match &layout.variants {
+                        Variants::Single { index } if index.index() == 0 => {}
+                        _ => bug!("[invariant] expect a single 0-variant for array type {ty}"),
+                    }
+                    match &layout.fields {
+                        FieldsShape::Arbitrary { offsets, memory_index: _ } => {
+                            if offsets.len() != field_details.len() {
+                                bug!("[invariant] field count mismatch for struct type {ty}");
+                            }
+
+                            let mut elements = vec![];
+                            for (field_idx, field_name, field_ty) in field_details {
+                                let field_offset = *offsets.get(field_idx).unwrap_or_else(|| {
+                                    bug!(
+                                        "[invariant] no offset for field {field_name} in struct type {ty}",
+                                    );
+                                });
+                                let elem = self.read_const_from_memory_and_layout(
+                                    memory,
+                                    offset + field_offset,
+                                    field_ty,
+                                );
+                                elements.push((SolFieldIndex(field_idx.index()), elem));
+                            }
+                            SolConst::Struct(elements)
+                        }
+                        _ => bug!("[invariant] expect an arbitrary field for struct type {ty}"),
+                    }
+                }
+                AdtKind::Union => {
+                    match &layout.variants {
+                        Variants::Single { index } if index.index() == 0 => {}
+                        _ => bug!("[invariant] expect a single 0-variant for union type {ty}"),
+                    }
+                    match &layout.fields {
+                        FieldsShape::Union(..) => todo!("union constant is not supported yet"),
+                        _ => bug!("[invariant] expect a union field for union type {ty}"),
+                    }
+                }
+                AdtKind::Enum => {
+                    let (variant_idx, variant_layout) = match &layout.variants {
+                        Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
+                            // sanity checks
+                            if !matches!(
+                                tag,
+                                ScalarAbi::Initialized {
+                                    value: Primitive::Int(..),
+                                    valid_range: _
+                                },
+                            ) {
+                                bug!("[invariant] unexpected variant specification for direct tag");
+                            }
+
+                            // get the offset for the tag field
+                            let tag_offset =  match &layout.fields {
+                                FieldsShape::Arbitrary { offsets, memory_index: _ } => {
+                                    *offsets.get(*tag_field).unwrap_or_else(|| {
+                                        bug!("[invariant] no offset for tag field in constant for type {ty}");
+                                    })
+                                }
+                                _ => bug!("[invariant] tagged variants does not have field specification"),
+                            };
+
+                            // parse the tag as variant index
+                            //
+                            // NOTE: technically, the tag represents the "discriminant" of the variant, no its index,
+                            // However, we asserted in the type serialization logic that all enum variants are using
+                            // relative discriminants, and the discriminants are the same as the variant indices.
+                            let tag_value = match read_primitive(
+                                self.tcx,
+                                offset + tag_offset,
+                                tag.size(&self.tcx),
+                                false,
+                            ) {
+                                Scalar::Int(val) => val.to_target_usize(self.tcx) as u128,
+                                Scalar::Ptr(..) => bug!("[invariant] unexpected pointer tag"),
+                            };
+
+                            // derive variant index
+                            let variant_idx = match tag_encoding {
+                                TagEncoding::Direct => bug!("[unsupported] direct tag encoding"),
+                                TagEncoding::Niche {
+                                    untagged_variant: _,
+                                    niche_variants,
+                                    niche_start,
+                                } => {
+                                    let tag_index = tag_value
+                                        .checked_sub(*niche_start)
+                                        .unwrap()
+                                        .checked_add(niche_variants.start().index() as u128)
+                                        .unwrap();
+                                    VariantIdx::from_usize(tag_index as usize)
+                                }
+                            };
+
+                            // get variant layout
+                            let variant_layout = variants.get(variant_idx).unwrap_or_else(|| {
+                                bug!(
+                                    "[invariant] invalid variant index {} for type {ty}",
+                                    variant_idx.index()
+                                )
+                            });
+
+                            // return both the index and the layout
+                            (variant_idx, variant_layout)
+                        }
+                        _ => bug!("[invariant] expect multiple variants for enum type {ty}"),
+                    };
+
+                    // get the variant definition from typing
+                    let variant_def = def.variant(variant_idx);
+
+                    // sanity check on the variant layout
+                    if !matches!(variant_layout.variants, Variants::Single { index } if index == variant_idx)
+                    {
+                        bug!(
+                            "[invariant] expect single indexed({})-variant for enum variant of type {ty}",
+                            variant_idx.index()
+                        );
+                    }
+
+                    // get variant fields from layout
+                    let field_offsets = match &variant_layout.fields {
+                        FieldsShape::Arbitrary { offsets, memory_index: _ } => {
+                            if offsets.len() != variant_def.fields.len() {
+                                bug!(
+                                    "[invariant] field count mismatch for variant {} in type {ty}",
+                                    variant_def.name
+                                );
+                            }
+                            offsets
+                        }
+                        _ => bug!(
+                            "[invariant] expect an arbitrary field for enum variant of type {ty}"
+                        ),
+                    };
+
+                    // construct values for the variant fields
+                    let mut elements = vec![];
+                    for (field_idx, field_def) in variant_def.fields.iter_enumerated() {
+                        let field_offset = *field_offsets.get(field_idx).unwrap_or_else(|| {
+                            bug!(
+                                "[invariant] no offset for field {} in enum type {ty} variant {}",
+                                field_def.name,
+                                variant_def.name
+                            );
+                        });
+                        let elem = self.read_const_from_memory_and_layout(
+                            memory,
+                            offset + field_offset,
+                            field_def.ty(self.tcx, ty_args),
+                        );
+                        elements.push((SolFieldIndex(field_idx.index()), elem));
+                    }
+                    SolConst::Enum(SolVariantIndex(variant_idx.index()), elements)
+                }
+            },
+
+            // unexpected
+            ty::Never
+            | ty::Pat(..)
+            | ty::FnDef(..)
+            | ty::Closure(..)
+            | ty::Dynamic(..)
+            | ty::Coroutine(..)
+            | ty::CoroutineClosure(..)
+            | ty::CoroutineWitness(..)
+            | ty::Foreign(..)
+            | ty::Alias(..)
+            | ty::Param(..)
+            | ty::Bound(..)
+            | ty::UnsafeBinder(..)
+            | ty::Infer(..)
+            | ty::Placeholder(..)
+            | ty::Error(..) => {
+                bug!("[invariant] unexpected type in memory allocation: {ty}");
+            }
+        }
+    }
+
+    /// Create a constant known in the value system together with its type
+    fn mk_val_const_with_ty(&mut self, val_const: ConstValue, ty: Ty<'tcx>) -> SolConst {
+        match val_const {
+            ConstValue::Scalar(s) => self.mk_val_const_from_scalar(ty, s),
+            ConstValue::ZeroSized => self.mk_val_const_from_zst(ty),
             ConstValue::Slice { alloc_id, meta } => {
+                // TODO: handle slice
                 let origin = self.make_global(alloc_id);
                 let length = meta as usize;
                 SolConst::Slice { origin, length }
@@ -472,50 +874,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     GlobalAlloc::Memory(a) => a.inner(),
                     _ => bug!("[invariant] indirect const should be of the memory allocation type"),
                 };
-
-                let ptr_size = self.tcx.data_layout.pointer_size();
-                if memory.size() < offset + 2 * ptr_size {
-                    bug!("[invariant] dangling reference in indirect const");
+                if !matches!(memory.mutability, Mutability::Not) {
+                    bug!("[invariant] indirect const refers to a mutable memory allocation");
                 }
-
-                // read the pointer component
-                let ptr = memory
-                    .read_scalar(&self.tcx, AllocRange { start: offset, size: ptr_size }, true)
-                    .unwrap_or_else(|e| {
-                        bug!("[invariant] failed to read pointer in indirect const: {e:?}")
-                    })
-                    .to_pointer(&self.tcx)
-                    .unwrap_or_else(|e| {
-                        bug!("[invariant] failed to convert pointer in direct const: {e:?}")
-                    })
-                    .into_pointer_or_addr()
-                    .unwrap_or_else(|e| {
-                        bug!(
-                            "[invariant] expect a pointer got an address 0x{:x} in indirect const",
-                            e.bytes_usize()
-                        )
-                    });
-
-                // read the length component
-                let len = memory
-                    .read_scalar(
-                        &self.tcx,
-                        AllocRange { start: offset + ptr_size, size: ptr_size },
-                        false,
-                    )
-                    .unwrap_or_else(|e| {
-                        bug!("[invariant] failed to read length in indirect const: {e:?}")
-                    })
-                    .to_target_usize(&self.tcx)
-                    .unwrap_or_else(|e| {
-                        bug!("[invariant] expect a target usize of length in indirect const: {e:?}")
-                    });
-
-                // resolve the targetted object
-                let (prov, offset) = ptr.prov_and_relative_offset();
-                let origin = self.make_global(prov.alloc_id());
-                let offset = SolOffset(offset.bytes_usize());
-                SolConst::Indirect { origin, offset, length: len as usize }
+                self.read_const_from_memory_and_layout(memory, offset, ty)
             }
         }
     }
@@ -539,7 +901,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 SolOpConst::Type(const_ty, const_val)
             }
             OpConst::Val(val_const, ty) => {
-                let const_val = self.mk_val_const(val_const);
+                let const_val = self.mk_val_const_with_ty(val_const, ty);
                 let const_ty = self.mk_type(ty);
                 SolOpConst::Value(const_ty, const_val)
             }
@@ -550,7 +912,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     .unwrap_or_else(|e| {
                         bug!("[invariant] unable to resolve unevaluated constant {op_const}: {e:?}")
                     });
-                let const_val = self.mk_val_const(val_const);
+                let const_val = self.mk_val_const_with_ty(val_const, ty);
                 let const_ty = self.mk_type(ty);
                 SolOpConst::Value(const_ty, const_val)
             }
@@ -1659,6 +2021,12 @@ pub(crate) struct SolFnDef {
  */
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolOffset(pub(crate) usize);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolAlign(pub(crate) usize);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolGlobalMemory {
     pub(crate) bytes: Vec<u8>,
     pub(crate) prov: BTreeMap<SolOffset, SolGlobalObject>,
@@ -1674,30 +2042,58 @@ pub(crate) enum SolGlobalObject {
 }
 
 /*
- * Shared
+ * Constant
  */
 
+/// An integer constant
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolOffset(pub(crate) usize);
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolAlign(pub(crate) usize);
-
-/// A scalar value
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolScalar {
-    pub(crate) bits: usize,
-    pub(crate) value: u128,
+pub(crate) enum SolConstInt {
+    I8(i8),
+    U8(u8),
+    I16(i16),
+    U16(u16),
+    I32(i32),
+    U32(u32),
+    I64(i64),
+    U64(u64),
+    I128(i128),
+    U128(u128),
+    Isize(isize),
+    Usize(usize),
 }
 
-/// A constant, used by both the type system and the value system
+/// A floating-point constant
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolConstFloat {
+    F16(String),
+    F32(String),
+    F64(String),
+    F128(String),
+}
+
+/* TODO: to be removed
+/// A constant pointer
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolConstPointer {
+    pub(crate) origin: SolGlobalObject,
+    pub(crate) offset: SolOffset,
+}
+*/
+
+/// A constant
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolConst {
-    ZeroSized,
-    Scalar(SolScalar),
+    Bool(bool),
+    Char(char),
+    Int(SolConstInt),
+    Float(SolConstFloat),
+    Array(Vec<SolConst>),
+    Tuple(Vec<SolConst>),
+    Struct(Vec<(SolFieldIndex, SolConst)>),
+    Union(SolFieldIndex, Box<SolConst>),
+    Enum(SolVariantIndex, Vec<(SolFieldIndex, SolConst)>),
+    // TODO: handle slice
     Slice { origin: SolGlobalObject, length: usize },
-    Indirect { origin: SolGlobalObject, offset: SolOffset, length: usize },
-    Pointer { origin: SolGlobalObject, offset: SolOffset },
 }
 
 /*
