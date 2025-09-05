@@ -9,7 +9,7 @@ use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::bug;
-use rustc_middle::mir::interpret::{AllocId, AllocRange, Allocation, GlobalAlloc, Scalar};
+use rustc_middle::mir::interpret::{AllocRange, Allocation, GlobalAlloc, Scalar};
 use rustc_middle::mir::{
     AggregateKind, BinOp, BorrowKind, CastKind, Const as OpConst, ConstValue, MirPhase,
     NonDivergingIntrinsic, NullOp, Operand, Place, PlaceElem, RawPtrKind, RuntimePhase, Rvalue,
@@ -420,12 +420,15 @@ impl<'tcx> SolContextBuilder<'tcx> {
         match ty_const.kind() {
             TyConstKind::Value(val) => {
                 let const_ty = self.mk_type(val.ty);
+
+                let normalized_ty =
+                    self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), val.ty);
                 let const_val = if val.valtree.is_zst() {
-                    self.mk_val_const_from_zst(val.ty)
+                    self.mk_val_const_from_zst(normalized_ty)
                 } else {
                     match val.valtree.try_to_scalar() {
                         None => bug!("[unsupported] non-scalar type constant {ty_const:?}"),
-                        Some(scalar) => self.mk_val_const_from_scalar(val.ty, scalar),
+                        Some(scalar) => self.mk_val_const_from_scalar(normalized_ty, scalar),
                     }
                 };
                 SolTyConst::Simple { ty: const_ty, val: const_val }
@@ -864,10 +867,24 @@ impl<'tcx> SolContextBuilder<'tcx> {
             ConstValue::Scalar(s) => self.mk_val_const_from_scalar(ty, s),
             ConstValue::ZeroSized => self.mk_val_const_from_zst(ty),
             ConstValue::Slice { alloc_id, meta } => {
-                // TODO: handle slice
-                let origin = self.make_global(alloc_id);
-                let length = meta as usize;
-                SolConst::Slice { origin, length }
+                let memory = match self.tcx.global_alloc(alloc_id) {
+                    GlobalAlloc::Memory(a) => a.inner(),
+                    _ => bug!("[invariant] slice const should be of the memory allocation type"),
+                };
+                if !matches!(memory.mutability, Mutability::Not) {
+                    bug!("[invariant] slice const refers to a mutable memory allocation");
+                }
+                match ty.kind() {
+                    ty::Slice(elem_ty) => {
+                        let elements = (0..meta)
+                            .map(|_| {
+                                self.read_const_from_memory_and_layout(memory, Size::ZERO, *elem_ty)
+                            })
+                            .collect();
+                        SolConst::Slice(elements)
+                    }
+                    _ => bug!("[invariant] unexpected type for slice const: {ty}"),
+                }
             }
             ConstValue::Indirect { alloc_id, offset } => {
                 let memory = match self.tcx.global_alloc(alloc_id) {
@@ -901,8 +918,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 SolOpConst::Type(const_ty, const_val)
             }
             OpConst::Val(val_const, ty) => {
-                let const_val = self.mk_val_const_with_ty(val_const, ty);
                 let const_ty = self.mk_type(ty);
+
+                let normalized_ty =
+                    self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
+                let const_val = self.mk_val_const_with_ty(val_const, normalized_ty);
+
                 SolOpConst::Value(const_ty, const_val)
             }
             OpConst::Unevaluated(unevaluated, ty) => {
@@ -912,8 +933,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     .unwrap_or_else(|e| {
                         bug!("[invariant] unable to resolve unevaluated constant {op_const}: {e:?}")
                     });
-                let const_val = self.mk_val_const_with_ty(val_const, ty);
+
                 let const_ty = self.mk_type(ty);
+
+                let normalized_ty =
+                    self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
+                let const_val = self.mk_val_const_with_ty(val_const, normalized_ty);
+
                 SolOpConst::Value(const_ty, const_val)
             }
         }
@@ -1540,6 +1566,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         (kind, ident, ty_args)
     }
 
+    /* TODO: maybe we should remove both
     /// Create a global variable definition
     fn make_global(&mut self, alloc_id: AllocId) -> SolGlobalObject {
         match self.tcx.global_alloc(alloc_id) {
@@ -1592,6 +1619,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         };
         SolGlobalMemory { bytes, prov, align, mutable }
     }
+     */
 
     /// Build the context
     pub(crate) fn build(self) -> (SolEnv, SolContext) {
@@ -2092,8 +2120,7 @@ pub(crate) enum SolConst {
     Struct(Vec<(SolFieldIndex, SolConst)>),
     Union(SolFieldIndex, Box<SolConst>),
     Enum(SolVariantIndex, Vec<(SolFieldIndex, SolConst)>),
-    // TODO: handle slice
-    Slice { origin: SolGlobalObject, length: usize },
+    Slice(Vec<SolConst>),
 }
 
 /*
