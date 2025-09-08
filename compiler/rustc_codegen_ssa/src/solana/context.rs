@@ -9,7 +9,7 @@ use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::bug;
-use rustc_middle::mir::interpret::{AllocRange, Allocation, GlobalAlloc, Scalar};
+use rustc_middle::mir::interpret::{AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Scalar};
 use rustc_middle::mir::{
     AggregateKind, BinOp, BorrowKind, CastKind, Const as OpConst, ConstValue, MirPhase,
     NonDivergingIntrinsic, NullOp, Operand, Place, PlaceElem, RawPtrKind, RuntimePhase, Rvalue,
@@ -55,7 +55,7 @@ pub(crate) struct SolContextBuilder<'tcx> {
     >,
 
     /// collected definitions of global variables
-    globals: BTreeMap<SolIdent, SolGlobalMemory>,
+    globals: BTreeMap<SolIdent, (SolType, SolConst)>,
 
     /// functions without MIRs available
     dep_fns: BTreeMap<
@@ -457,6 +457,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 AdtKind::Struct if def.all_fields().count() == 0 => SolConst::Struct(vec![]),
                 _ => bug!("[invariant] the ADT definition is not a ZST: {ty}"),
             },
+            ty::FnDef(def_id, generics) => {
+                let (kind, ident, ty_args) = self.make_type_function(*def_id, generics);
+                SolConst::FuncDef(kind, ident, ty_args)
+            }
             _ => bug!("[invariant] unexpected non-ZST type {ty}"),
         }
     }
@@ -521,15 +525,46 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
             },
 
-            // pointer or reference types (fixme)
-            ty::Ref(_, _, _) => {
-                bug!("[unsupported] ref for scalar constant");
-            }
-            ty::RawPtr(_, _) => {
-                bug!("[unsupported] raw-ptr for scalar constant");
-            }
+            // pointer or reference to values
+            ty::Ref(_, sub_ty, mutability) => match scalar {
+                Scalar::Ptr(pointer, _) => {
+                    let (prov, offset) = pointer.into_raw_parts();
+                    let offset = SolOffset(offset.bytes_usize());
+                    match self.make_provenance(prov, *sub_ty, *mutability) {
+                        SolProvenance::Const(val) => SolConst::GlobalRefConst(val.into(), offset),
+                        SolProvenance::Variable(ident) => match mutability {
+                            Mutability::Not => SolConst::GlobalRefImm(ident, offset),
+                            Mutability::Mut => SolConst::GlobalRefMut(ident, offset),
+                        },
+                    }
+                }
+                Scalar::Int(..) => {
+                    bug!("[invariant] unexpected integer scalar for references");
+                }
+            },
+            ty::RawPtr(sub_ty, mutability) => match scalar {
+                Scalar::Ptr(pointer, _) => {
+                    let (prov, offset) = pointer.into_raw_parts();
+                    let offset = SolOffset(offset.bytes_usize());
+                    match self.make_provenance(prov, *sub_ty, *mutability) {
+                        SolProvenance::Const(val) => SolConst::GlobalPtrConst(val.into(), offset),
+                        SolProvenance::Variable(ident) => match mutability {
+                            Mutability::Not => SolConst::GlobalPtrImm(ident, offset),
+                            Mutability::Mut => SolConst::GlobalPtrMut(ident, offset),
+                        },
+                    }
+                }
+                Scalar::Int(scalar_int) => {
+                    if !scalar_int.is_null() {
+                        bug!("[invariant] unexpected non-null integer scalar for raw pointers");
+                    }
+                    SolConst::GlobalPtrNull
+                }
+            },
+
+            // function pointers
             ty::FnPtr(_, _) => {
-                bug!("[unsupported] fn-ptr for scalar constant");
+                bug!("[unsupported] function pointer for scalar constant");
             }
 
             // all others
@@ -539,31 +574,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
     }
 
-    /* TODO: to be removed
-    /// Create a constant from a MIR scalar
-    fn mk_val_const_from_scalar2(&mut self, scalar: Scalar) -> SolConstBase {
-        match scalar {
-            Scalar::Int(scalar) => SolConstBase::Scalar(SolScalar {
-                bits: scalar.size().bits_usize(),
-                value: scalar.to_bits_unchecked(),
-            }),
-            Scalar::Ptr(ptr, _ /* pointer size */) => {
-                let (prov, offset) = ptr.prov_and_relative_offset();
-                SolConstBase::Pointer(SolPointer {
-                    origin: self.make_global(prov.alloc_id()),
-                    offset: SolOffset(offset.bytes_usize()),
-                })
-            }
-        }
-    }
-    */
-
     fn read_const_from_memory_and_layout(
         &mut self,
         memory: &Allocation,
         offset: Size,
         ty: Ty<'tcx>,
-    ) -> SolConst {
+    ) -> (Size, SolConst) {
         // utility
         let read_primitive = |tcx: TyCtxt<'tcx>, start, size: Size, is_provenane: bool| {
             memory.read_scalar(&tcx, AllocRange { start, size }, is_provenane).unwrap_or_else(|e| {
@@ -579,7 +595,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             .layout;
 
         // case by type
-        match ty.kind() {
+        let parsed = match ty.kind() {
             // primitives
             ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) => {
                 match layout.variants {
@@ -627,7 +643,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         let mut elements = vec![];
                         for i in 0..*count {
                             let elem_offset = offset + *stride * i;
-                            let elem = self.read_const_from_memory_and_layout(
+                            let (_, elem) = self.read_const_from_memory_and_layout(
                                 memory,
                                 elem_offset,
                                 *elem_ty,
@@ -657,7 +673,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             let field_offset = *offsets.get(field_idx).unwrap_or_else(|| {
                                 bug!("[invariant] no offset for field {i} in tuple type {ty}");
                             });
-                            let elem = self.read_const_from_memory_and_layout(
+                            let (_, elem) = self.read_const_from_memory_and_layout(
                                 memory,
                                 offset + field_offset,
                                 elem_ty,
@@ -698,7 +714,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                         "[invariant] no offset for field {field_name} in struct type {ty}",
                                     );
                                 });
-                                let elem = self.read_const_from_memory_and_layout(
+                                let (_, elem) = self.read_const_from_memory_and_layout(
                                     memory,
                                     offset + field_offset,
                                     field_ty,
@@ -716,7 +732,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         _ => bug!("[invariant] expect a single 0-variant for union type {ty}"),
                     }
                     match &layout.fields {
-                        FieldsShape::Union(..) => todo!("union constant is not supported yet"),
+                        FieldsShape::Union(..) => bug!("[unsupported] union constant in memory"),
                         _ => bug!("[invariant] expect a union field for union type {ty}"),
                     }
                 }
@@ -828,7 +844,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 variant_def.name
                             );
                         });
-                        let elem = self.read_const_from_memory_and_layout(
+                        let (_, elem) = self.read_const_from_memory_and_layout(
                             memory,
                             offset + field_offset,
                             field_def.ty(self.tcx, ty_args),
@@ -858,7 +874,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
             | ty::Error(..) => {
                 bug!("[invariant] unexpected type in memory allocation: {ty}");
             }
-        }
+        };
+
+        // return both the size and the parsed constant
+        (layout.size, parsed)
     }
 
     /// Create a constant known in the value system together with its type
@@ -874,14 +893,38 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 if !matches!(memory.mutability, Mutability::Not) {
                     bug!("[invariant] slice const refers to a mutable memory allocation");
                 }
-                match ty.kind() {
+
+                let slice_ty = match ty.kind() {
+                    ty::Ref(_, sub_ty, Mutability::Not) => sub_ty,
+                    _ => bug!("[invariant] unexpected type for slice const: {ty}"),
+                };
+                match slice_ty.kind() {
                     ty::Slice(elem_ty) => {
-                        let elements = (0..meta)
-                            .map(|_| {
-                                self.read_const_from_memory_and_layout(memory, Size::ZERO, *elem_ty)
-                            })
-                            .collect();
+                        let mut elements = vec![];
+                        let mut offset = Size::ZERO;
+                        for _ in 0..meta {
+                            let (elem_size, elem) =
+                                self.read_const_from_memory_and_layout(memory, offset, *elem_ty);
+                            elements.push(elem);
+                            offset += elem_size;
+                        }
                         SolConst::Slice(elements)
+                    }
+                    ty::Str => {
+                        let range = AllocRange { start: Size::ZERO, size: Size::from_bytes(meta) };
+                        let num_prov = memory.provenance().get_range(&self.tcx, range).count();
+                        if num_prov != 0 {
+                            bug!("[invariant] string constant contains provenance");
+                        }
+
+                        let bytes = memory
+                            .get_bytes_strip_provenance(&self.tcx, range)
+                            .unwrap_or_else(|e| {
+                                bug!("[invariant] failed to read bytes for string constant: {e:?}");
+                            });
+                        SolConst::String(String::from_utf8(bytes.to_vec()).unwrap_or_else(|e| {
+                            bug!("[invariant] non utf-8 string constant: {e}");
+                        }))
                     }
                     _ => bug!("[invariant] unexpected type for slice const: {ty}"),
                 }
@@ -894,7 +937,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 if !matches!(memory.mutability, Mutability::Not) {
                     bug!("[invariant] indirect const refers to a mutable memory allocation");
                 }
-                self.read_const_from_memory_and_layout(memory, offset, ty)
+                let (_, parsed) = self.read_const_from_memory_and_layout(memory, offset, ty);
+                parsed
             }
         }
     }
@@ -1566,6 +1610,49 @@ impl<'tcx> SolContextBuilder<'tcx> {
         (kind, ident, ty_args)
     }
 
+    fn make_provenance(
+        &mut self,
+        prov: CtfeProvenance,
+        ty: Ty<'tcx>,
+        mutability: Mutability,
+    ) -> SolProvenance {
+        match self.tcx.global_alloc(prov.alloc_id()) {
+            GlobalAlloc::Memory(allocated) => {
+                if !matches!(mutability, Mutability::Not) {
+                    bug!("[invariant] mutable memory allocation in provenance");
+                }
+
+                let (_, const_val) =
+                    self.read_const_from_memory_and_layout(allocated.inner(), Size::ZERO, ty);
+                SolProvenance::Const(const_val)
+            }
+            GlobalAlloc::Static(def_id) => {
+                let ident = self.mk_ident(def_id);
+
+                // check if we have an initializer already
+                if !self.globals.contains_key(&ident) {
+                    let initializer =
+                        self.tcx.eval_static_initializer(def_id).unwrap_or_else(|_| {
+                            bug!(
+                                "[invariant] unable to evaluate static initializer for {}",
+                                self.tcx.def_path_str(def_id)
+                            )
+                        });
+
+                    let init_ty = self.mk_type(ty);
+                    let (_, init_val) =
+                        self.read_const_from_memory_and_layout(initializer.inner(), Size::ZERO, ty);
+                    self.globals.insert(ident.clone(), (init_ty, init_val));
+                }
+
+                SolProvenance::Variable(ident)
+            }
+            GlobalAlloc::Function { .. } => bug!("[invariant] unexpected function in provenance"),
+            GlobalAlloc::VTable(..) => bug!("[unsupported] vtable in provenance"),
+            GlobalAlloc::TypeId { .. } => bug!("[unsupported] type id in provenance"),
+        }
+    }
+
     /* TODO: maybe we should remove both
     /// Create a global variable definition
     fn make_global(&mut self, alloc_id: AllocId) -> SolGlobalObject {
@@ -1662,8 +1749,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
 
         let mut globals = vec![];
-        for (ident, memory) in self.globals.into_iter() {
-            globals.push((ident, memory));
+        for (ident, (ty, val)) in self.globals.into_iter() {
+            globals.push((ident, ty, val));
         }
 
         let mut dep_fns = vec![];
@@ -1692,7 +1779,7 @@ pub(crate) struct SolContext {
     pub(crate) id_desc: Vec<(SolIdent, SolPathDesc)>,
     pub(crate) ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTyDef)>,
     pub(crate) fn_defs: Vec<(SolInstanceKind, SolIdent, Vec<SolGenericArg>, SolFnDef)>,
-    pub(crate) globals: Vec<(SolIdent, SolGlobalMemory)>,
+    pub(crate) globals: Vec<(SolIdent, SolType, SolConst)>,
     pub(crate) dep_fns: Vec<(SolInstanceKind, SolIdent, Vec<SolGenericArg>, SolPathDescWithArgs)>,
 }
 
@@ -2051,6 +2138,14 @@ pub(crate) struct SolFnDef {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolOffset(pub(crate) usize);
 
+/// A provenance origin
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolProvenance {
+    Const(SolConst),
+    Variable(SolIdent),
+}
+
+/* TODO: REMOVE
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolAlign(pub(crate) usize);
 
@@ -2068,6 +2163,7 @@ pub(crate) enum SolGlobalObject {
     Static(SolIdent),
     Function(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
 }
+*/
 
 /*
  * Constant
@@ -2121,6 +2217,15 @@ pub(crate) enum SolConst {
     Union(SolFieldIndex, Box<SolConst>),
     Enum(SolVariantIndex, Vec<(SolFieldIndex, SolConst)>),
     Slice(Vec<SolConst>),
+    String(String),
+    GlobalRefConst(Box<SolConst>, SolOffset),
+    GlobalRefImm(SolIdent, SolOffset),
+    GlobalRefMut(SolIdent, SolOffset),
+    GlobalPtrConst(Box<SolConst>, SolOffset),
+    GlobalPtrImm(SolIdent, SolOffset),
+    GlobalPtrMut(SolIdent, SolOffset),
+    GlobalPtrNull,
+    FuncDef(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
 }
 
 /*
