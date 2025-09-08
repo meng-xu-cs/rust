@@ -739,16 +739,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 AdtKind::Enum => {
                     let (variant_idx, variant_layout) = match &layout.variants {
                         Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
-                            // sanity checks
-                            if !matches!(
-                                tag,
-                                ScalarAbi::Initialized {
-                                    value: Primitive::Int(..),
-                                    valid_range: _
-                                },
-                            ) {
-                                bug!("[invariant] unexpected variant specification for direct tag");
-                            }
+                            // get the tag type
+                            let tag_type = match tag {
+                                ScalarAbi::Initialized { value, valid_range: _ } => value,
+                                ScalarAbi::Union { .. } => {
+                                    bug!("[invariant] unexpected tag specification for type {ty}");
+                                }
+                            };
 
                             // get the offset for the tag field
                             let tag_offset =  match &layout.fields {
@@ -769,10 +766,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 self.tcx,
                                 offset + tag_offset,
                                 tag.size(&self.tcx),
-                                false,
+                                matches!(tag_type, Primitive::Pointer(_)),
                             ) {
                                 Scalar::Int(val) => val.to_target_usize(self.tcx) as u128,
-                                Scalar::Ptr(..) => bug!("[invariant] unexpected pointer tag"),
+                                Scalar::Ptr(..) => bug!("[unsupported] pointer as tag"),
                             };
 
                             // derive variant index
