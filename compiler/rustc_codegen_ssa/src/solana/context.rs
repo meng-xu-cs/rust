@@ -324,28 +324,40 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 SolTyDef::Union { fields }
             }
             AdtKind::Enum => {
-                let variants = adt_def
-                    .variants()
-                    .iter_enumerated()
-                    .map(|(variant_idx, variant_def)| {
-                        if !matches!(variant_def.discr, VariantDiscr::Relative(pos) if pos as usize == variant_idx.index()) {
-                            bug!("[assumption] non-relative variant discriminant for enum {def_desc}");
+                let mut variants = vec![];
+                let mut last_discr_value = 0;
+                for (variant_idx, variant_def) in adt_def.variants().iter_enumerated() {
+                    let variant_index = SolVariantIndex(variant_idx.index());
+                    let variant_name = SolVariantName(variant_def.name.to_ident_string());
+                    let variant_descr = match variant_def.discr {
+                        VariantDiscr::Relative(pos) => {
+                            SolVariantDiscr(last_discr_value + pos as u128)
                         }
-                        let variant_index = SolVariantIndex(variant_idx.index());
-                        let variant_name = SolVariantName(variant_def.name.to_ident_string());
-                        let fields = variant_def
-                            .fields
-                            .iter_enumerated()
-                            .map(|(field_idx, field_def)| {
-                                let field_index = SolFieldIndex(field_idx.index());
-                                let field_name = SolFieldName(field_def.name.to_ident_string());
-                                let field_ty = self.mk_type(field_def.ty(self.tcx, generics));
-                                SolField { index: field_index, name: field_name, ty: field_ty }
-                            })
-                            .collect();
-                        SolVariant { index: variant_index, name: variant_name, fields }
-                    })
-                    .collect();
+                        VariantDiscr::Explicit(did) => {
+                            let discr = adt_def.eval_explicit_discr(self.tcx, did).unwrap_or_else(|_| {
+                                    bug!("[invariant] failed to evaluate discriminant for enum {def_desc}")
+                                });
+                            last_discr_value = discr.val;
+                            SolVariantDiscr(discr.val)
+                        }
+                    };
+                    let fields = variant_def
+                        .fields
+                        .iter_enumerated()
+                        .map(|(field_idx, field_def)| {
+                            let field_index = SolFieldIndex(field_idx.index());
+                            let field_name = SolFieldName(field_def.name.to_ident_string());
+                            let field_ty = self.mk_type(field_def.ty(self.tcx, generics));
+                            SolField { index: field_index, name: field_name, ty: field_ty }
+                        })
+                        .collect();
+                    variants.push(SolVariant {
+                        index: variant_index,
+                        name: variant_name,
+                        discr: variant_descr,
+                        fields,
+                    });
+                }
                 SolTyDef::Enum { variants }
             }
         };
@@ -757,35 +769,61 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 _ => bug!("[invariant] tagged variants does not have field specification"),
                             };
 
-                            // parse the tag as variant index
-                            //
-                            // NOTE: technically, the tag represents the "discriminant" of the variant, no its index,
-                            // However, we asserted in the type serialization logic that all enum variants are using
-                            // relative discriminants, and the discriminants are the same as the variant indices.
+                            // parse the tag value
                             let tag_value = match read_primitive(
                                 self.tcx,
                                 offset + tag_offset,
                                 tag.size(&self.tcx),
                                 matches!(tag_type, Primitive::Pointer(_)),
                             ) {
-                                Scalar::Int(val) => val.to_target_usize(self.tcx) as u128,
-                                Scalar::Ptr(..) => bug!("[unsupported] pointer as tag"),
+                                Scalar::Int(val) => val.to_u128(),
+                                Scalar::Ptr(..) => bug!("[unsupported] non-null pointer as tag"),
                             };
 
                             // derive variant index
                             let variant_idx = match tag_encoding {
-                                TagEncoding::Direct => bug!("[unsupported] direct tag encoding"),
+                                TagEncoding::Direct => {
+                                    // look for a variant with the same discriminant value
+                                    let mut last_discr_value = 0;
+                                    let mut variant_idx_found = None;
+                                    for (variant_idx, variant) in def.variants().iter_enumerated() {
+                                        let discr_value = match variant.discr {
+                                            VariantDiscr::Relative(pos) => {
+                                                last_discr_value + pos as u128
+                                            }
+                                            VariantDiscr::Explicit(did) => {
+                                                let discr = def.eval_explicit_discr(self.tcx, did).unwrap_or_else(|_| {
+                                                    bug!("[invariant] failed to evaluate discriminant for enum {ty}");
+                                                });
+                                                last_discr_value = discr.val;
+                                                discr.val
+                                            }
+                                        };
+                                        if discr_value == tag_value {
+                                            variant_idx_found = Some(variant_idx);
+                                            break;
+                                        }
+                                    }
+                                    variant_idx_found.unwrap_or_else(|| {
+                                        bug!("[invariant] invalid discriminant {tag_value} for enum type {ty}");
+                                    })
+                                }
                                 TagEncoding::Niche {
-                                    untagged_variant: _,
+                                    untagged_variant,
                                     niche_variants,
                                     niche_start,
                                 } => {
+                                    // NOTE: the discriminant and variant index of each variant coincide
                                     let tag_index = tag_value
                                         .checked_sub(*niche_start)
                                         .unwrap()
                                         .checked_add(niche_variants.start().index() as u128)
                                         .unwrap();
-                                    VariantIdx::from_usize(tag_index as usize)
+                                    if tag_index >= def.variants().len() as u128 {
+                                        *untagged_variant
+                                    } else {
+                                        VariantIdx::from_usize(tag_index as usize)
+                                    }
                                 }
                             };
 
@@ -1829,6 +1867,10 @@ pub(crate) struct SolVariantName(pub(crate) String);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolVariantIndex(pub(crate) usize);
 
+/// A variant discrimanant
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolVariantDiscr(pub(crate) u128);
+
 /// A slot number for locals
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolLocalSlot(pub(crate) usize);
@@ -1911,6 +1953,7 @@ pub(crate) struct SolField {
 pub(crate) struct SolVariant {
     pub(crate) index: SolVariantIndex,
     pub(crate) name: SolVariantName,
+    pub(crate) discr: SolVariantDiscr,
     pub(crate) fields: Vec<SolField>,
 }
 
