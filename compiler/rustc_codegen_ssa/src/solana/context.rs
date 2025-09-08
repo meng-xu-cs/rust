@@ -579,6 +579,40 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 bug!("[unsupported] function pointer for scalar constant");
             }
 
+            // single-field datatype
+            ty::Adt(def, generics) => match def.adt_kind() {
+                AdtKind::Enum => {
+                    if def.all_fields().count() != 0 {
+                        bug!("[unsupported] {ty} is not discriminant-only for scalar constant");
+                    }
+
+                    // handle enum discriminant for scalar constant
+                    let target_value = match scalar {
+                        Scalar::Int(scalar_int) => scalar_int.to_bits_unchecked(),
+                        Scalar::Ptr(..) => {
+                            bug!("[invariant] non-null pointer as enum discriminant")
+                        }
+                    };
+                    for (variant_idx, discr) in def.discriminants(self.tcx) {
+                        if discr.val == target_value {
+                            return SolConst::Enum(SolVariantIndex(variant_idx.index()), vec![]);
+                        }
+                    }
+                    bug!("[invariant] no matching discriminant value {target_value} for enum {ty}");
+                }
+                AdtKind::Union => bug!("[unsupported] union type {ty} for scalar constant"),
+                AdtKind::Struct => {
+                    let fields = &def.variant(VariantIdx::ZERO).fields;
+                    if fields.len() != 1 {
+                        bug!("[unsupported] {ty} is not single-field struct for scalar constant");
+                    }
+                    let field = fields.iter().next().unwrap();
+                    let field_ty = field.ty(self.tcx, generics);
+                    let field_val = self.mk_val_const_from_scalar(field_ty, scalar);
+                    SolConst::Struct(vec![(SolFieldIndex(0), field_val)])
+                }
+            },
+
             // all others
             _ => {
                 bug!("[assumption] unexpected type {ty} for scalar constant");
@@ -770,13 +804,14 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             };
 
                             // parse the tag value
+                            let tag_size = tag_type.size(&self.tcx);
                             let tag_value = match read_primitive(
                                 self.tcx,
                                 offset + tag_offset,
-                                tag.size(&self.tcx),
+                                tag_size,
                                 matches!(tag_type, Primitive::Pointer(_)),
                             ) {
-                                Scalar::Int(val) => val.to_u128(),
+                                Scalar::Int(val) => val.to_uint(tag_size),
                                 Scalar::Ptr(..) => bug!("[unsupported] non-null pointer as tag"),
                             };
 
