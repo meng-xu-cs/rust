@@ -10,7 +10,9 @@ use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::bug;
-use rustc_middle::mir::interpret::{AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Scalar};
+use rustc_middle::mir::interpret::{
+    AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Pointer, Scalar,
+};
 use rustc_middle::mir::{
     AggregateKind, BinOp, BorrowKind, CastKind, Const as OpConst, ConstValue, MirPhase,
     NonDivergingIntrinsic, NullOp, Operand, Place, PlaceElem, RawPtrKind, RuntimePhase, Rvalue,
@@ -20,7 +22,7 @@ use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
     self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder,
     ExistentialPredicate, FloatTy, GenericArg, GenericArgKind, GenericArgsRef, Instance,
-    InstanceKind, IntTy, Ty, TyCtxt, TypingEnv, UintTy, VariantDiscr,
+    InstanceKind, IntTy, ScalarInt, Ty, TyCtxt, TypingEnv, UintTy, VariantDiscr,
 };
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
@@ -440,8 +442,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     self.mk_val_const_from_zst(normalized_ty)
                 } else {
                     match val.valtree.try_to_scalar() {
-                        None => bug!("[unsupported] non-scalar type constant {ty_const:?}"),
-                        Some(scalar) => self.mk_val_const_from_scalar(normalized_ty, scalar),
+                        None => bug!("[unsupported] non-scalar type constant {val}"),
+                        Some(Scalar::Int(scalar_int)) => {
+                            self.mk_val_const_from_scalar_val(normalized_ty, scalar_int)
+                        }
+                        Some(Scalar::Ptr(..)) => {
+                            bug!("[unsupported] pointer scalar as type constant {val}")
+                        }
                     }
                 };
                 SolTyConst::Simple { ty: const_ty, val: const_val }
@@ -479,63 +486,36 @@ impl<'tcx> SolContextBuilder<'tcx> {
     }
 
     /// Create a value constant from a MIR scalar
-    fn mk_val_const_from_scalar(&mut self, ty: Ty<'tcx>, scalar: Scalar) -> SolConst {
+    fn mk_val_const_from_scalar_val(&mut self, ty: Ty<'tcx>, val: ScalarInt) -> SolConst {
         match ty.kind() {
             // value types
-            ty::Bool => match scalar {
-                Scalar::Int(int) => SolConst::Bool(!int.is_null()),
-                Scalar::Ptr(..) => {
-                    bug!("[invariant] unexpected pointer scalar for bool");
+            ty::Bool => SolConst::Bool(!val.is_null()),
+            ty::Char => SolConst::Char(val.to_u8() as char),
+            ty::Int(int_ty) => match int_ty {
+                IntTy::I8 => SolConst::Int(SolConstInt::I8(val.to_i8())),
+                IntTy::I16 => SolConst::Int(SolConstInt::I16(val.to_i16())),
+                IntTy::I32 => SolConst::Int(SolConstInt::I32(val.to_i32())),
+                IntTy::I64 => SolConst::Int(SolConstInt::I64(val.to_i64())),
+                IntTy::I128 => SolConst::Int(SolConstInt::I128(val.to_i128())),
+                IntTy::Isize => {
+                    SolConst::Int(SolConstInt::Isize(val.to_target_isize(self.tcx) as isize))
                 }
             },
-            ty::Char => match scalar {
-                Scalar::Int(int) => SolConst::Char(int.to_u8() as char),
-                Scalar::Ptr(..) => {
-                    bug!("[invariant] unexpected pointer scalar for char");
+            ty::Uint(uint_ty) => match uint_ty {
+                UintTy::U8 => SolConst::Int(SolConstInt::U8(val.to_u8())),
+                UintTy::U16 => SolConst::Int(SolConstInt::U16(val.to_u16())),
+                UintTy::U32 => SolConst::Int(SolConstInt::U32(val.to_u32())),
+                UintTy::U64 => SolConst::Int(SolConstInt::U64(val.to_u64())),
+                UintTy::U128 => SolConst::Int(SolConstInt::U128(val.to_u128())),
+                UintTy::Usize => {
+                    SolConst::Int(SolConstInt::Usize(val.to_target_usize(self.tcx) as usize))
                 }
             },
-            ty::Int(int_ty) => match scalar {
-                Scalar::Int(int) => match int_ty {
-                    IntTy::I8 => SolConst::Int(SolConstInt::I8(int.to_i8())),
-                    IntTy::I16 => SolConst::Int(SolConstInt::I16(int.to_i16())),
-                    IntTy::I32 => SolConst::Int(SolConstInt::I32(int.to_i32())),
-                    IntTy::I64 => SolConst::Int(SolConstInt::I64(int.to_i64())),
-                    IntTy::I128 => SolConst::Int(SolConstInt::I128(int.to_i128())),
-                    IntTy::Isize => {
-                        SolConst::Int(SolConstInt::Isize(int.to_target_isize(self.tcx) as isize))
-                    }
-                },
-                Scalar::Ptr(..) => {
-                    bug!("[invariant] unexpected pointer scalar for signed int");
-                }
-            },
-            ty::Uint(uint_ty) => match scalar {
-                Scalar::Int(int) => match uint_ty {
-                    UintTy::U8 => SolConst::Int(SolConstInt::U8(int.to_u8())),
-                    UintTy::U16 => SolConst::Int(SolConstInt::U16(int.to_u16())),
-                    UintTy::U32 => SolConst::Int(SolConstInt::U32(int.to_u32())),
-                    UintTy::U64 => SolConst::Int(SolConstInt::U64(int.to_u64())),
-                    UintTy::U128 => SolConst::Int(SolConstInt::U128(int.to_u128())),
-                    UintTy::Usize => {
-                        SolConst::Int(SolConstInt::Usize(int.to_target_usize(self.tcx) as usize))
-                    }
-                },
-                Scalar::Ptr(..) => {
-                    bug!("[invariant] unexpected pointer scalar for unsigned int");
-                }
-            },
-            ty::Float(float_ty) => match scalar {
-                Scalar::Int(int) => match float_ty {
-                    FloatTy::F16 => SolConst::Float(SolConstFloat::F16(int.to_f16().to_string())),
-                    FloatTy::F32 => SolConst::Float(SolConstFloat::F32(int.to_f32().to_string())),
-                    FloatTy::F64 => SolConst::Float(SolConstFloat::F64(int.to_f64().to_string())),
-                    FloatTy::F128 => {
-                        SolConst::Float(SolConstFloat::F128(int.to_f128().to_string()))
-                    }
-                },
-                Scalar::Ptr(..) => {
-                    bug!("[invariant] unexpected pointer scalar for float");
-                }
+            ty::Float(float_ty) => match float_ty {
+                FloatTy::F16 => SolConst::Float(SolConstFloat::F16(val.to_f16().to_string())),
+                FloatTy::F32 => SolConst::Float(SolConstFloat::F32(val.to_f32().to_string())),
+                FloatTy::F64 => SolConst::Float(SolConstFloat::F64(val.to_f64().to_string())),
+                FloatTy::F128 => SolConst::Float(SolConstFloat::F128(val.to_f128().to_string())),
             },
 
             // single-field datatype
@@ -546,12 +526,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     }
 
                     // handle enum discriminant for scalar constant
-                    let target_value = match scalar {
-                        Scalar::Int(scalar_int) => scalar_int.to_bits_unchecked(),
-                        Scalar::Ptr(..) => {
-                            bug!("[invariant] non-null pointer as enum discriminant")
-                        }
-                    };
+                    let target_value = val.to_bits_unchecked();
                     for (variant_idx, discr) in def.discriminants(self.tcx) {
                         if discr.val == target_value {
                             return SolConst::Enum(SolVariantIndex(variant_idx.index()), vec![]);
@@ -567,29 +542,29 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     }
                     let field = fields.iter().next().unwrap();
                     let field_ty = field.ty(self.tcx, generics);
-                    let field_val = self.mk_val_const_from_scalar(field_ty, scalar);
+                    let field_val = self.mk_val_const_from_scalar_val(field_ty, val);
                     SolConst::Struct(vec![(SolFieldIndex(0), field_val)])
                 }
             },
 
             // all others
             _ => {
-                bug!("[assumption] unexpected type {ty} for scalar constant {scalar} for values");
+                bug!("[invariant] unexpected type {ty} for value scalar constant {val}");
             }
         }
     }
 
     /// Create a pointer constant from a MIR scalar
-    fn mk_ptr_const_from_scalar(
+    fn mk_ptr_const_from_scalar_ptr(
         &mut self,
         ty: Ty<'tcx>,
-        scalar: Scalar,
+        ptr: Option<Pointer<CtfeProvenance>>,
         metadata: SolPtrMetadata,
     ) -> SolConst {
         match ty.kind() {
             // pointer or reference to values
-            ty::Ref(_, sub_ty, mutability) => match scalar {
-                Scalar::Ptr(pointer, _) => {
+            ty::Ref(_, sub_ty, mutability) => match ptr {
+                Some(pointer) => {
                     let (prov, offset) = pointer.into_raw_parts();
                     let offset = SolOffset(offset.bytes_usize());
                     match self.make_provenance(prov, *sub_ty, *mutability) {
@@ -602,12 +577,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         },
                     }
                 }
-                Scalar::Int(..) => {
-                    bug!("[invariant] unexpected integer scalar for references");
-                }
+                None => bug!("[invariant] unexpected null pointer for references"),
             },
-            ty::RawPtr(sub_ty, mutability) => match scalar {
-                Scalar::Ptr(pointer, _) => {
+            ty::RawPtr(sub_ty, mutability) => match ptr {
+                Some(pointer) => {
                     let (prov, offset) = pointer.into_raw_parts();
                     let offset = SolOffset(offset.bytes_usize());
                     match self.make_provenance(prov, *sub_ty, *mutability) {
@@ -620,10 +593,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         },
                     }
                 }
-                Scalar::Int(scalar_int) => {
-                    if !scalar_int.is_null() {
-                        bug!("[invariant] unexpected non-null integer scalar for raw pointers");
-                    }
+                None => {
                     if metadata.0 != 0 {
                         bug!("[invariant] unexpected non-zero metadata for null raw pointers");
                     }
@@ -631,14 +601,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
             },
 
-            // function pointers
-            ty::FnPtr(_, _) => {
-                bug!("[unsupported] function pointer for scalar constant");
-            }
-
             // all others
             _ => {
-                bug!("[assumption] unexpected type {ty} for scalar constant {scalar} for pointers");
+                bug!(
+                    "[invariant] unexpected type {ty} for pointer scalar constant {}",
+                    ptr.map_or("null".to_string(), |p| format!("{p:?}"))
+                );
             }
         }
     }
@@ -669,14 +637,19 @@ impl<'tcx> SolContextBuilder<'tcx> {
             ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) => {
                 match layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
-                    _ => bug!("[invariant] expect single 0-variant for primitive type {ty}"),
+                    _ => bug!("[invariant] expect single 0-variant for value type {ty}"),
                 }
                 if !matches!(layout.fields, FieldsShape::Primitive) {
-                    bug!("[invariant] expect a primitive field for primitive type {ty}");
+                    bug!("[invariant] expect a primitive field for value type {ty}");
                 }
 
-                let v = read_primitive(self.tcx, offset, layout.size, false);
-                self.mk_val_const_from_scalar(ty, v)
+                let v = match read_primitive(self.tcx, offset, layout.size, false) {
+                    Scalar::Int(scalar_int) => scalar_int,
+                    Scalar::Ptr(..) => {
+                        bug!("[invariant] unexpected pointer scalar for value type {ty}")
+                    }
+                };
+                self.mk_val_const_from_scalar_val(ty, v)
             }
 
             // pointers
@@ -723,8 +696,16 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     };
 
                 // read and parse the pointer
-                let scalar_ptr = read_primitive(self.tcx, offset, pointer_size, true);
-                self.mk_ptr_const_from_scalar(ty, scalar_ptr, SolPtrMetadata(metadata))
+                let p = match read_primitive(self.tcx, offset, pointer_size, true) {
+                    Scalar::Ptr(ptr, _) => Some(ptr),
+                    Scalar::Int(int) => {
+                        if !int.is_null() {
+                            bug!("[invariant] unexpected non-null for pointer type {ty}");
+                        }
+                        None
+                    }
+                };
+                self.mk_ptr_const_from_scalar_ptr(ty, p, SolPtrMetadata(metadata))
             }
 
             // unsupported
@@ -1011,8 +992,63 @@ impl<'tcx> SolContextBuilder<'tcx> {
     /// Create a constant known in the value system together with its type
     fn mk_val_const_with_ty(&mut self, val_const: ConstValue, ty: Ty<'tcx>) -> SolConst {
         match val_const {
-            ConstValue::Scalar(s) => self.mk_val_const_from_scalar(ty, s),
             ConstValue::ZeroSized => self.mk_val_const_from_zst(ty),
+            ConstValue::Scalar(scalar) => match ty.kind() {
+                // value types
+                ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Adt(..) => {
+                    let val = match scalar {
+                        Scalar::Int(scalar_int) => scalar_int,
+                        Scalar::Ptr(..) => {
+                            bug!("[invariant] unexpected pointer scalar for value type {ty}");
+                        }
+                    };
+                    self.mk_val_const_from_scalar_val(ty, val)
+                }
+
+                // pointers or references
+                ty::Ref(_, sub_ty, _) | ty::RawPtr(sub_ty, _) => {
+                    let ptr = match scalar {
+                        Scalar::Ptr(ptr, _) => Some(ptr),
+                        Scalar::Int(scalar_int) => {
+                            if !scalar_int.is_null() {
+                                bug!("[invariant] unexpected non-null for pointer type {ty}");
+                            }
+                            None
+                        }
+                    };
+                    let metadata = match sub_ty.kind() {
+                        ty::Array(_, size_const) => {
+                            let array_len = match size_const.kind() {
+                                TyConstKind::Value(size_val) => match size_val
+                                    .valtree
+                                    .try_to_scalar_int()
+                                {
+                                    Some(size_int) => size_int.to_target_usize(self.tcx) as usize,
+                                    None => bug!(
+                                        "[assumption] unexpected non-int size for array type {sub_ty} as pointee"
+                                    ),
+                                },
+                                _ => bug!(
+                                    "[assumption] unexpected non-value size for array type {sub_ty} as pointee"
+                                ),
+                            };
+                            SolPtrMetadata(array_len)
+                        }
+                        _ => bug!("[invariant] cannot derive metadata from pointee type {sub_ty}"),
+                    };
+                    self.mk_ptr_const_from_scalar_ptr(ty, ptr, metadata)
+                }
+
+                // function pointers
+                ty::FnPtr(..) => {
+                    bug!("[unsupported] function pointer for scalar constant");
+                }
+
+                // all others
+                _ => {
+                    bug!("[assumption] unexpected type {ty} for scalar {scalar}");
+                }
+            },
             ConstValue::Slice { alloc_id, meta } => {
                 let memory = match self.tcx.global_alloc(alloc_id) {
                     GlobalAlloc::Memory(a) => a.inner(),
