@@ -3,7 +3,8 @@ use std::fmt::Display;
 
 use regex::Regex;
 use rustc_abi::{
-    FieldIdx, FieldsShape, Primitive, Scalar as ScalarAbi, Size, TagEncoding, VariantIdx, Variants,
+    FieldIdx, FieldsShape, HasDataLayout, Primitive, Scalar as ScalarAbi, Size, TagEncoding,
+    VariantIdx, Variants,
 };
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
@@ -477,7 +478,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
     }
 
-    /// Create a constant from a MIR scalar
+    /// Create a value constant from a MIR scalar
     fn mk_val_const_from_scalar(&mut self, ty: Ty<'tcx>, scalar: Scalar) -> SolConst {
         match ty.kind() {
             // value types
@@ -537,48 +538,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
             },
 
-            // pointer or reference to values
-            ty::Ref(_, sub_ty, mutability) => match scalar {
-                Scalar::Ptr(pointer, _) => {
-                    let (prov, offset) = pointer.into_raw_parts();
-                    let offset = SolOffset(offset.bytes_usize());
-                    match self.make_provenance(prov, *sub_ty, *mutability) {
-                        SolProvenance::Const(val) => SolConst::GlobalRefConst(val.into(), offset),
-                        SolProvenance::Variable(ident) => match mutability {
-                            Mutability::Not => SolConst::GlobalRefImm(ident, offset),
-                            Mutability::Mut => SolConst::GlobalRefMut(ident, offset),
-                        },
-                    }
-                }
-                Scalar::Int(..) => {
-                    bug!("[invariant] unexpected integer scalar for references");
-                }
-            },
-            ty::RawPtr(sub_ty, mutability) => match scalar {
-                Scalar::Ptr(pointer, _) => {
-                    let (prov, offset) = pointer.into_raw_parts();
-                    let offset = SolOffset(offset.bytes_usize());
-                    match self.make_provenance(prov, *sub_ty, *mutability) {
-                        SolProvenance::Const(val) => SolConst::GlobalPtrConst(val.into(), offset),
-                        SolProvenance::Variable(ident) => match mutability {
-                            Mutability::Not => SolConst::GlobalPtrImm(ident, offset),
-                            Mutability::Mut => SolConst::GlobalPtrMut(ident, offset),
-                        },
-                    }
-                }
-                Scalar::Int(scalar_int) => {
-                    if !scalar_int.is_null() {
-                        bug!("[invariant] unexpected non-null integer scalar for raw pointers");
-                    }
-                    SolConst::GlobalPtrNull
-                }
-            },
-
-            // function pointers
-            ty::FnPtr(_, _) => {
-                bug!("[unsupported] function pointer for scalar constant");
-            }
-
             // single-field datatype
             ty::Adt(def, generics) => match def.adt_kind() {
                 AdtKind::Enum => {
@@ -615,7 +574,71 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
             // all others
             _ => {
-                bug!("[assumption] unexpected type {ty} for scalar constant");
+                bug!("[assumption] unexpected type {ty} for scalar constant {scalar} for values");
+            }
+        }
+    }
+
+    /// Create a pointer constant from a MIR scalar
+    fn mk_ptr_const_from_scalar(
+        &mut self,
+        ty: Ty<'tcx>,
+        scalar: Scalar,
+        metadata: SolPtrMetadata,
+    ) -> SolConst {
+        match ty.kind() {
+            // pointer or reference to values
+            ty::Ref(_, sub_ty, mutability) => match scalar {
+                Scalar::Ptr(pointer, _) => {
+                    let (prov, offset) = pointer.into_raw_parts();
+                    let offset = SolOffset(offset.bytes_usize());
+                    match self.make_provenance(prov, *sub_ty, *mutability) {
+                        SolProvenance::Const(val) => {
+                            SolConst::GlobalRefConst(val.into(), offset, metadata)
+                        }
+                        SolProvenance::Variable(ident) => match mutability {
+                            Mutability::Not => SolConst::GlobalRefImm(ident, offset, metadata),
+                            Mutability::Mut => SolConst::GlobalRefMut(ident, offset, metadata),
+                        },
+                    }
+                }
+                Scalar::Int(..) => {
+                    bug!("[invariant] unexpected integer scalar for references");
+                }
+            },
+            ty::RawPtr(sub_ty, mutability) => match scalar {
+                Scalar::Ptr(pointer, _) => {
+                    let (prov, offset) = pointer.into_raw_parts();
+                    let offset = SolOffset(offset.bytes_usize());
+                    match self.make_provenance(prov, *sub_ty, *mutability) {
+                        SolProvenance::Const(val) => {
+                            SolConst::GlobalPtrConst(val.into(), offset, metadata)
+                        }
+                        SolProvenance::Variable(ident) => match mutability {
+                            Mutability::Not => SolConst::GlobalPtrImm(ident, offset, metadata),
+                            Mutability::Mut => SolConst::GlobalPtrMut(ident, offset, metadata),
+                        },
+                    }
+                }
+                Scalar::Int(scalar_int) => {
+                    if !scalar_int.is_null() {
+                        bug!("[invariant] unexpected non-null integer scalar for raw pointers");
+                    }
+                    if metadata.0 != 0 {
+                        bug!("[invariant] unexpected non-zero metadata for null raw pointers");
+                    }
+                    SolConst::GlobalPtrNull
+                }
+            },
+
+            // function pointers
+            ty::FnPtr(_, _) => {
+                bug!("[unsupported] function pointer for scalar constant");
+            }
+
+            // all others
+            _ => {
+                bug!("[assumption] unexpected type {ty} for scalar constant {scalar} for pointers");
             }
         }
     }
@@ -657,25 +680,56 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
 
             // pointers
-            ty::RawPtr(..) | ty::Ref(..) | ty::FnPtr(..) => {
+            ty::RawPtr(..) | ty::Ref(..) => {
                 match &layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
                     _ => bug!("[invariant] expect single 0-variant for pointer type {ty}"),
                 }
-                if !matches!(layout.fields, FieldsShape::Primitive) {
-                    bug!("[invariant] expect a primitive field for pointer type {ty}");
+                let metadata_offset = match &layout.fields {
+                    FieldsShape::Arbitrary { offsets, memory_index: _ } => {
+                        if offsets.len() != 2 {
+                            bug!("[invariant] expect a pair of fields for pointer type {ty}");
+                        }
+                        let mut offsets_iter = offsets.into_iter();
+                        let off1 = offsets_iter.next().unwrap();
+                        let off2 = offsets_iter.next().unwrap();
+                        if off1.bytes_usize() == 0 {
+                            *off2
+                        } else {
+                            if !off2.bytes_usize() == 0 {
+                                bug!(
+                                    "[invariant] expect one field to be at offset 0 for pointer type {ty}"
+                                );
+                            }
+                            *off1
+                        }
+                    }
+                    _ => bug!("[invariant] expect an arbitrary field for pointer type {ty}"),
+                };
+
+                // sanity check
+                let pointer_size = self.tcx.data_layout().pointer_size();
+                if pointer_size * 2 != layout.size {
+                    bug!("[invariant] invalid layout size of pointer type {ty}");
                 }
 
-                let v = read_primitive(self.tcx, offset, layout.size, true);
-                self.mk_val_const_from_scalar(ty, v)
+                // read and parse the metadata
+                let metadata =
+                    match read_primitive(self.tcx, offset + metadata_offset, pointer_size, false) {
+                        Scalar::Int(scalar_int) => scalar_int.to_target_usize(self.tcx) as usize,
+                        Scalar::Ptr(..) => {
+                            bug!("[invariant] unexpected pointer scalar for pointer metadata")
+                        }
+                    };
+
+                // read and parse the pointer
+                let scalar_ptr = read_primitive(self.tcx, offset, pointer_size, true);
+                self.mk_ptr_const_from_scalar(ty, scalar_ptr, SolPtrMetadata(metadata))
             }
 
-            // slices (should not be here)
-            ty::Str => {
-                bug!("[assumption] unexpected string constant in memory");
-            }
-            ty::Slice(_) => {
-                bug!("[assumption] unexpected slice constant in memory");
+            // unsupported
+            ty::FnPtr(..) => {
+                bug!("[unsupported] function pointer constant in memory");
             }
 
             // packed
@@ -924,6 +978,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     SolConst::Enum(SolVariantIndex(variant_idx.index()), elements)
                 }
             },
+
+            // slices (should not be here)
+            ty::Str => bug!("[assumption] unexpected string constant in memory"),
+            ty::Slice(_) => bug!("[assumption] unexpected slice constant in memory"),
 
             // unexpected
             ty::Never
@@ -2213,6 +2271,9 @@ pub(crate) struct SolFnDef {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolOffset(pub(crate) usize);
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolPtrMetadata(pub(crate) usize);
+
 /// A provenance origin
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolProvenance {
@@ -2293,12 +2354,12 @@ pub(crate) enum SolConst {
     Enum(SolVariantIndex, Vec<(SolFieldIndex, SolConst)>),
     Slice(Vec<SolConst>),
     String(String),
-    GlobalRefConst(Box<SolConst>, SolOffset),
-    GlobalRefImm(SolIdent, SolOffset),
-    GlobalRefMut(SolIdent, SolOffset),
-    GlobalPtrConst(Box<SolConst>, SolOffset),
-    GlobalPtrImm(SolIdent, SolOffset),
-    GlobalPtrMut(SolIdent, SolOffset),
+    GlobalRefConst(Box<SolConst>, SolOffset, SolPtrMetadata),
+    GlobalRefImm(SolIdent, SolOffset, SolPtrMetadata),
+    GlobalRefMut(SolIdent, SolOffset, SolPtrMetadata),
+    GlobalPtrConst(Box<SolConst>, SolOffset, SolPtrMetadata),
+    GlobalPtrImm(SolIdent, SolOffset, SolPtrMetadata),
+    GlobalPtrMut(SolIdent, SolOffset, SolPtrMetadata),
     GlobalPtrNull,
     FuncDef(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
 }
