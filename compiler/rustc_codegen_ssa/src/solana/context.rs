@@ -3,8 +3,8 @@ use std::fmt::Display;
 
 use regex::Regex;
 use rustc_abi::{
-    FieldIdx, FieldsShape, HasDataLayout, Primitive, Scalar as ScalarAbi, Size, TagEncoding,
-    VariantIdx, Variants,
+    BackendRepr, FieldIdx, FieldsShape, HasDataLayout, Primitive, Scalar as ScalarAbi, Size,
+    TagEncoding, VariantIdx, Variants,
 };
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
@@ -521,18 +521,78 @@ impl<'tcx> SolContextBuilder<'tcx> {
             // single-field datatype
             ty::Adt(def, generics) => match def.adt_kind() {
                 AdtKind::Enum => {
-                    if def.all_fields().count() != 0 {
-                        bug!("[unsupported] {ty} is not discriminant-only for scalar constant");
+                    let tag_value = val.to_bits_unchecked();
+
+                    // we need to drill down to the encoding
+                    let layout = self
+                        .tcx
+                        .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+                        .unwrap_or_else(|e| {
+                            bug!("[invariant] unable to get layout of type {ty}: {e}")
+                        })
+                        .layout;
+
+                    if !matches!(layout.backend_repr, BackendRepr::Scalar(_)) {
+                        bug!("[invariant] {ty} is not represented as a scalar");
                     }
 
-                    // handle enum discriminant for scalar constant
-                    let target_value = val.to_bits_unchecked();
-                    for (variant_idx, discr) in def.discriminants(self.tcx) {
-                        if discr.val == target_value {
-                            return SolConst::Enum(SolVariantIndex(variant_idx.index()), vec![]);
+                    match &layout.variants {
+                        Variants::Multiple { tag_encoding, .. } => match tag_encoding {
+                            TagEncoding::Direct => {
+                                // discriminant is stored directly as the scalar value
+                                if def.all_fields().count() != 0 {
+                                    bug!("[assumption] {ty} is not discriminant-only as scalar");
+                                }
+
+                                // handle enum discriminant for scalar constant
+                                for (variant_idx, discr) in def.discriminants(self.tcx) {
+                                    if discr.val == tag_value {
+                                        return SolConst::Enum(
+                                            SolVariantIndex(variant_idx.index()),
+                                            vec![],
+                                        );
+                                    }
+                                }
+                                bug!("[invariant] no discriminant matches {tag_value} for {ty}");
+                            }
+                            TagEncoding::Niche {
+                                untagged_variant,
+                                niche_variants,
+                                niche_start,
+                            } => {
+                                // NOTE: the discriminant and variant index of each variant coincide
+                                let tag_index = tag_value
+                                    .wrapping_sub(*niche_start)
+                                    .wrapping_add(niche_variants.start().index() as u128);
+
+                                let variant_idx = if tag_index >= def.variants().len() as u128 {
+                                    *untagged_variant
+                                } else {
+                                    VariantIdx::from_usize(tag_index as usize)
+                                };
+
+                                let variant = def.variant(variant_idx);
+                                if variant.fields.is_empty() {
+                                    SolConst::Enum(SolVariantIndex(variant_idx.index()), vec![])
+                                } else {
+                                    if variant.fields.len() != 1 {
+                                        bug!("[unsupported] {ty} packs fields in a single scalar");
+                                    }
+                                    let field = variant.fields.iter().next().unwrap();
+                                    let field_ty = field.ty(self.tcx, generics);
+                                    let field_val =
+                                        self.mk_val_const_from_scalar_val(field_ty, val);
+                                    SolConst::Enum(
+                                        SolVariantIndex(variant_idx.index()),
+                                        vec![(SolFieldIndex(0), field_val)],
+                                    )
+                                }
+                            }
+                        },
+                        Variants::Empty | Variants::Single { .. } => {
+                            bug!("[invariant] expect multiple variants for scalar enum type {ty}")
                         }
                     }
-                    bug!("[invariant] no matching discriminant value {target_value} for enum {ty}");
                 }
                 AdtKind::Union => bug!("[unsupported] union type {ty} for scalar constant"),
                 AdtKind::Struct => {
@@ -713,11 +773,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 bug!("[unsupported] function pointer constant in memory");
             }
 
-            // packed
-            ty::Array(elem_ty, _) => {
+            // vector-alike
+            ty::Slice(elem_ty) | ty::Array(elem_ty, _) => {
                 match &layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
-                    _ => bug!("[invariant] expect single 0-variant for array type {ty}"),
+                    _ => bug!("[invariant] expect single 0-variant for vector type {ty}"),
                 }
                 match &layout.fields {
                     FieldsShape::Array { stride, count } => {
@@ -733,10 +793,36 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         }
                         SolConst::Array(elements)
                     }
-                    _ => bug!("[invariant] expect an array field for array type {ty}"),
+                    _ => bug!("[invariant] expect an array field for vector type {ty}"),
+                }
+            }
+            ty::Str => {
+                match &layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect single 0-variant for str type"),
+                }
+                match &layout.fields {
+                    FieldsShape::Array { stride, count } => {
+                        let range = AllocRange { start: Size::ZERO, size: *stride * *count };
+                        let num_prov = memory.provenance().get_range(&self.tcx, range).count();
+                        if num_prov != 0 {
+                            bug!("[invariant] string memory contains provenance");
+                        }
+
+                        let bytes = memory
+                            .get_bytes_strip_provenance(&self.tcx, range)
+                            .unwrap_or_else(|e| {
+                                bug!("[invariant] failed to read bytes for string memory: {e:?}");
+                            });
+                        SolConst::String(String::from_utf8(bytes.to_vec()).unwrap_or_else(|e| {
+                            bug!("[invariant] non utf-8 string memory: {e}");
+                        }))
+                    }
+                    _ => bug!("[invariant] expect an array field for str type"),
                 }
             }
 
+            // packed
             ty::Tuple(elem_tys) => {
                 match &layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
@@ -885,10 +971,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 } => {
                                     // NOTE: the discriminant and variant index of each variant coincide
                                     let tag_index = tag_value
-                                        .checked_sub(*niche_start)
-                                        .unwrap()
-                                        .checked_add(niche_variants.start().index() as u128)
-                                        .unwrap();
+                                        .wrapping_sub(*niche_start)
+                                        .wrapping_add(niche_variants.start().index() as u128);
                                     if tag_index >= def.variants().len() as u128 {
                                         *untagged_variant
                                     } else {
@@ -908,7 +992,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             // return both the index and the layout
                             (variant_idx, variant_layout)
                         }
-                        _ => bug!("[invariant] expect multiple variants for enum type {ty}"),
+                        Variants::Empty | Variants::Single { .. } => {
+                            bug!("[invariant] expect multiple variants for enum type {ty}")
+                        }
                     };
 
                     // get the variant definition from typing
@@ -959,10 +1045,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     SolConst::Enum(SolVariantIndex(variant_idx.index()), elements)
                 }
             },
-
-            // slices (should not be here)
-            ty::Str => bug!("[assumption] unexpected string constant in memory"),
-            ty::Slice(_) => bug!("[assumption] unexpected slice constant in memory"),
 
             // unexpected
             ty::Never
