@@ -481,7 +481,22 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let (kind, ident, ty_args) = self.make_type_function(*def_id, generics);
                 SolConst::FuncDef(kind, ident, ty_args)
             }
+            ty::Closure(def_id, generics) => {
+                let (kind, ident, ty_args) = self.make_type_closure(*def_id, generics);
+                SolConst::Closure(kind, ident, ty_args)
+            }
             _ => bug!("[invariant] unexpected non-ZST type {ty}"),
+        }
+    }
+    /// Create a constant if the type is a ZST
+    fn mk_val_const_when_zst(&mut self, ty: Ty<'tcx>) -> Option<SolConst> {
+        match ty.kind() {
+            ty::Tuple(elems) if elems.is_empty() => Some(SolConst::Tuple(vec![])),
+            ty::Adt(def, _) => match def.adt_kind() {
+                AdtKind::Struct if def.all_fields().count() == 0 => Some(SolConst::Struct(vec![])),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -570,23 +585,62 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 } else {
                                     VariantIdx::from_usize(tag_index as usize)
                                 };
-
                                 let variant = def.variant(variant_idx);
-                                if variant.fields.is_empty() {
-                                    SolConst::Enum(SolVariantIndex(variant_idx.index()), vec![])
-                                } else {
-                                    if variant.fields.len() != 1 {
-                                        bug!("[unsupported] {ty} packs fields in a single scalar");
+
+                                // collect field values for the variant
+                                let mut field_values = vec![];
+                                if variant_idx == *untagged_variant {
+                                    // for untagged variant, the scalar value is not yet consumed
+                                    let mut consumed = false;
+                                    for (field_idx, field_def) in variant.fields.iter_enumerated() {
+                                        let field_ty = field_def.ty(self.tcx, generics);
+                                        match (consumed, self.mk_val_const_when_zst(field_ty)) {
+                                            (true, Some(zst_val)) => {
+                                                field_values.push((
+                                                    SolFieldIndex(field_idx.index()),
+                                                    zst_val,
+                                                ));
+                                            }
+                                            (true, None) => {
+                                                bug!(
+                                                    "[invariant] expect ZST field {} in {ty} after consuming the scalar",
+                                                    field_def.name
+                                                );
+                                            }
+                                            (false, None) => {
+                                                let field_val = self
+                                                    .mk_val_const_from_scalar_val(field_ty, val);
+                                                field_values.push((
+                                                    SolFieldIndex(field_idx.index()),
+                                                    field_val,
+                                                ));
+                                                consumed = true;
+                                            }
+                                            (false, Some(zst_val)) => {
+                                                field_values.push((
+                                                    SolFieldIndex(field_idx.index()),
+                                                    zst_val,
+                                                ));
+                                            }
+                                        }
                                     }
-                                    let field = variant.fields.iter().next().unwrap();
-                                    let field_ty = field.ty(self.tcx, generics);
-                                    let field_val =
-                                        self.mk_val_const_from_scalar_val(field_ty, val);
-                                    SolConst::Enum(
-                                        SolVariantIndex(variant_idx.index()),
-                                        vec![(SolFieldIndex(0), field_val)],
-                                    )
-                                }
+                                } else {
+                                    // for tagged variant, the scalar value is consumed as the tag
+                                    for (field_idx, field_def) in variant.fields.iter_enumerated() {
+                                        let field_ty = field_def.ty(self.tcx, generics);
+                                        match self.mk_val_const_when_zst(field_ty) {
+                                            None => bug!(
+                                                "[invariant] expect ZST field {} in {ty} for tagged variant",
+                                                field_def.name
+                                            ),
+                                            Some(zst_val) => field_values
+                                                .push((SolFieldIndex(field_idx.index()), zst_val)),
+                                        }
+                                    }
+                                };
+
+                                // done with the enum constant
+                                SolConst::Enum(SolVariantIndex(variant_idx.index()), field_values)
                             }
                         },
                         Variants::Empty | Variants::Single { .. } => {
@@ -2480,6 +2534,7 @@ pub(crate) enum SolConst {
     GlobalPtrMut(SolIdent, SolOffset, SolPtrMetadata),
     GlobalPtrNull,
     FuncDef(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
+    Closure(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
 }
 
 /*
