@@ -1953,61 +1953,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
     }
 
-    /* TODO: maybe we should remove both
-    /// Create a global variable definition
-    fn make_global(&mut self, alloc_id: AllocId) -> SolGlobalObject {
-        match self.tcx.global_alloc(alloc_id) {
-            GlobalAlloc::Function { instance } => {
-                let (kind, ident, ty_args) = self.make_instance(instance);
-                SolGlobalObject::Function(kind, ident, ty_args)
-            }
-            GlobalAlloc::Memory(allocated) => {
-                SolGlobalObject::Memory(self.mk_allocation(allocated.inner()))
-            }
-            GlobalAlloc::Static(def_id) => {
-                let ident = self.mk_ident(def_id);
-
-                // check if we have a static memory allocation
-                if !self.globals.contains_key(&ident) {
-                    let initializer =
-                        self.tcx.eval_static_initializer(def_id).unwrap_or_else(|_| {
-                            bug!(
-                                "[invariant] unable to evaluate static initializer for {}",
-                                self.tcx.def_path_str(def_id)
-                            )
-                        });
-
-                    let memory = self.mk_allocation(initializer.inner());
-                    self.globals.insert(ident.clone(), memory);
-                }
-
-                SolGlobalObject::Static(ident)
-            }
-            GlobalAlloc::VTable(..) => bug!("[unsupported] vtable in global variable"),
-            GlobalAlloc::TypeId { .. } => bug!("[unsupported] type id in global variable"),
-        }
-    }
-
-    /// Create a global memory allocation
-    fn mk_allocation(&mut self, memory: &Allocation) -> SolGlobalMemory {
-        let bytes = memory
-            .get_bytes_unchecked(AllocRange { start: Size::ZERO, size: memory.size() })
-            .to_vec();
-
-        let mut prov = BTreeMap::new();
-        for (offset, ptr) in memory.provenance().ptrs().iter() {
-            prov.insert(SolOffset(offset.bytes_usize()), self.make_global(ptr.alloc_id()));
-        }
-
-        let align = SolAlign(memory.align.bytes_usize());
-        let mutable = match memory.mutability {
-            Mutability::Not => false,
-            Mutability::Mut => true,
-        };
-        SolGlobalMemory { bytes, prov, align, mutable }
-    }
-     */
-
     /// Build the context
     pub(crate) fn build(self) -> (SolEnv, SolContext) {
         // check we are balanced on stack
@@ -2453,26 +2398,6 @@ pub(crate) enum SolProvenance {
     Variable(SolIdent),
 }
 
-/* TODO: REMOVE
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolAlign(pub(crate) usize);
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolGlobalMemory {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) prov: BTreeMap<SolOffset, SolGlobalObject>,
-    pub(crate) align: SolAlign,
-    pub(crate) mutable: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) enum SolGlobalObject {
-    Memory(SolGlobalMemory),
-    Static(SolIdent),
-    Function(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
-}
-*/
-
 /*
  * Constant
  */
@@ -2502,15 +2427,6 @@ pub(crate) enum SolConstFloat {
     F64(String),
     F128(String),
 }
-
-/* TODO: to be removed
-/// A constant pointer
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolConstPointer {
-    pub(crate) origin: SolGlobalObject,
-    pub(crate) offset: SolOffset,
-}
-*/
 
 /// A constant
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
