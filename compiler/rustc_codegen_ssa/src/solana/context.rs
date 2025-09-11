@@ -2578,12 +2578,14 @@ pub(crate) enum SolBuiltinFunc {
     AllocRustAllocZeroed,
     AllocRustRealloc,
     AllocRustDealloc,
+    AllocExchangeMalloc,
     AllocHandleAllocError,
     AllocRawVecHandleError,
     LayoutIsSizeAlignValid,
     /* formatter */
     StdFmtWrite,
     DebugFmt,
+    SpecToString,
     /* solana */
     SolInvokeSigned,
 }
@@ -2657,12 +2659,14 @@ impl SolBuiltinFunc {
             Self::AllocRustAllocZeroed => r"alloc::alloc::__rust_alloc_zeroed",
             Self::AllocRustRealloc => r"alloc::alloc::__rust_realloc",
             Self::AllocRustDealloc => r"alloc::alloc::__rust_dealloc",
+            Self::AllocExchangeMalloc => r"alloc::alloc::exchange_malloc",
             Self::AllocHandleAllocError => r"handle_alloc_error",
             Self::AllocRawVecHandleError => r"alloc::raw_vec::handle_error",
             Self::LayoutIsSizeAlignValid => r"Layout::is_size_align_valid",
             /* formatter */
             Self::StdFmtWrite => r"std::fmt::write",
             Self::DebugFmt => r"<.* as Debug>::fmt",
+            Self::SpecToString => r"<.* as string::SpecToString>::spec_to_string",
             /* solana */
             Self::SolInvokeSigned => r"sol_invoke_signed",
         };
@@ -2687,12 +2691,14 @@ impl SolBuiltinFunc {
             Self::AllocRustAllocZeroed,
             Self::AllocRustRealloc,
             Self::AllocRustDealloc,
+            Self::AllocExchangeMalloc,
             Self::AllocHandleAllocError,
             Self::AllocRawVecHandleError,
             Self::LayoutIsSizeAlignValid,
             /* formatter */
             Self::StdFmtWrite,
             Self::DebugFmt,
+            Self::SpecToString,
             /* solana */
             Self::SolInvokeSigned,
         ]
