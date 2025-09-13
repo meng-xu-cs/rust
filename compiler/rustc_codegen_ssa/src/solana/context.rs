@@ -10,9 +10,7 @@ use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::bug;
-use rustc_middle::mir::interpret::{
-    AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Pointer, Scalar,
-};
+use rustc_middle::mir::interpret::{AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Scalar};
 use rustc_middle::mir::{
     AggregateKind, BinOp, BorrowKind, CastKind, Const as OpConst, ConstValue, MirPhase,
     NonDivergingIntrinsic, NullOp, Operand, Place, PlaceElem, RawPtrKind, RuntimePhase, Rvalue,
@@ -485,7 +483,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let (kind, ident, ty_args) = self.make_type_closure(*def_id, generics);
                 SolConst::Closure(kind, ident, ty_args)
             }
-            _ => bug!("[invariant] unexpected non-ZST type {ty}"),
+            _ => bug!("[invariant] making ZST const out of a non-ZST type {ty}"),
         }
     }
     /// Create a constant if the type is a ZST
@@ -668,7 +666,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
     }
 
+    // TODO: should be removed
     /// Create a pointer constant from a MIR scalar
+    /*
     fn mk_ptr_const_from_scalar_ptr(
         &mut self,
         ty: Ty<'tcx>,
@@ -724,6 +724,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
         }
     }
+     */
 
     fn read_const_from_memory_and_layout(
         &mut self,
@@ -767,59 +768,150 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
 
             // pointers
-            ty::RawPtr(..) | ty::Ref(..) => {
+            ty::RawPtr(sub_ty, mutability) | ty::Ref(_, sub_ty, mutability) => {
+                // sanity check on the variants
                 match &layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
                     _ => bug!("[invariant] expect single 0-variant for pointer type {ty}"),
                 }
-                let metadata_offset = match &layout.fields {
-                    FieldsShape::Arbitrary { offsets, memory_index: _ } => {
-                        if offsets.len() != 2 {
-                            bug!("[invariant] expect a pair of fields for pointer type {ty}");
-                        }
-                        let mut offsets_iter = offsets.into_iter();
-                        let off1 = offsets_iter.next().unwrap();
-                        let off2 = offsets_iter.next().unwrap();
-                        if off1.bytes_usize() == 0 {
-                            *off2
-                        } else {
-                            if !off2.bytes_usize() == 0 {
-                                bug!(
-                                    "[invariant] expect one field to be at offset 0 for pointer type {ty}"
-                                );
-                            }
-                            *off1
-                        }
-                    }
-                    _ => bug!("[invariant] expect an arbitrary field for pointer type {ty}"),
-                };
-
-                // sanity check
-                let pointer_size = self.tcx.data_layout().pointer_size();
-                if pointer_size * 2 != layout.size {
-                    bug!("[invariant] invalid layout size of pointer type {ty}");
-                }
-
-                // read and parse the metadata
-                let metadata =
-                    match read_primitive(self.tcx, offset + metadata_offset, pointer_size, false) {
-                        Scalar::Int(scalar_int) => scalar_int.to_target_usize(self.tcx) as usize,
-                        Scalar::Ptr(..) => {
-                            bug!("[invariant] unexpected pointer scalar for pointer metadata")
-                        }
-                    };
 
                 // read and parse the pointer
-                let p = match read_primitive(self.tcx, offset, pointer_size, true) {
-                    Scalar::Ptr(ptr, _) => Some(ptr),
+                let pointer_size = self.tcx.data_layout().pointer_size();
+                let pointer_parsed = match read_primitive(self.tcx, offset, pointer_size, true) {
+                    Scalar::Ptr(ptr, _) => {
+                        let (prov, offset) = ptr.into_raw_parts();
+                        let offset = SolOffset(offset.bytes_usize());
+                        let parsed_prov = self.make_provenance(prov, *sub_ty, *mutability);
+                        Some((parsed_prov, offset))
+                    }
                     Scalar::Int(int) => {
+                        if !ty.is_raw_ptr() {
+                            bug!("[invariant] unexpected integer for non-ptr type {ty}");
+                        }
                         if !int.is_null() {
                             bug!("[invariant] unexpected non-null for pointer type {ty}");
                         }
                         None
                     }
                 };
-                self.mk_ptr_const_from_scalar_ptr(ty, p, SolPtrMetadata(metadata))
+
+                // check whether the metadata is a ZST
+                // NOTE: we only handle size-based metadata for now
+                let need_metadata = sub_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized());
+
+                // switch by whether we need metadata
+                if need_metadata {
+                    // sanity check on the shape of the fields
+                    if pointer_size * 2 != layout.size {
+                        bug!("[invariant] invalid layout size of ptr/ref type {ty}");
+                    }
+
+                    // derive the metadata offset
+                    let offset_metadata = match &layout.fields {
+                        FieldsShape::Arbitrary { offsets, memory_index: _ } => {
+                            if offsets.len() != 2 {
+                                bug!("[invariant] expect two fields for ptr/ref type {ty}");
+                            }
+                            let mut offsets_iter = offsets.into_iter();
+                            let off_pointer = *offsets_iter.next().unwrap();
+                            let off_metadata = *offsets_iter.next().unwrap();
+                            if off_pointer.bytes_usize() != 0 || off_metadata != pointer_size {
+                                bug!("[invariant] unexpected offsets for ptr/ref type {ty}");
+                            }
+                            off_metadata
+                        }
+                        _ => bug!("[invariant] expect arbitrary layout for ptr/ref type {ty}"),
+                    };
+
+                    // read the metadata
+                    let metadata = match read_primitive(
+                        self.tcx,
+                        offset + offset_metadata,
+                        pointer_size,
+                        false,
+                    ) {
+                        Scalar::Int(scalar_int) => scalar_int.to_target_usize(self.tcx) as usize,
+                        Scalar::Ptr(..) => {
+                            bug!("[invariant] unexpected pointer scalar for metadata for type {ty}")
+                        }
+                    };
+                    let ptr_metadata = SolPtrMetadata(metadata);
+
+                    // now create the pointer constant
+                    match pointer_parsed {
+                        None => {
+                            if metadata != 0 {
+                                bug!("[invariant] unexpected non-zero metadata for null pointers");
+                            }
+                            match mutability {
+                                Mutability::Not => SolConst::PtrMetaSizedNullImm,
+                                Mutability::Mut => SolConst::PtrMetaSizedNullMut,
+                            }
+                        }
+                        Some((parsed_prov, offset)) => {
+                            // construct the constant based on mutability and whether it is a raw pointer
+                            match (parsed_prov, ty.is_raw_ptr()) {
+                                (SolProvenance::Const(val), true) => {
+                                    SolConst::PtrMetaSizedConst(ptr_metadata, val.into(), offset)
+                                }
+                                (SolProvenance::Const(val), false) => {
+                                    SolConst::RefMetaSizedConst(ptr_metadata, val.into(), offset)
+                                }
+                                (SolProvenance::VarImm(ident), true) => {
+                                    SolConst::PtrMetaSizedVarImm(ptr_metadata, ident, offset)
+                                }
+                                (SolProvenance::VarImm(ident), false) => {
+                                    SolConst::RefMetaSizedVarImm(ptr_metadata, ident, offset)
+                                }
+                                (SolProvenance::VarMut(ident), true) => {
+                                    SolConst::PtrMetaSizedVarMut(ptr_metadata, ident, offset)
+                                }
+                                (SolProvenance::VarMut(ident), false) => {
+                                    SolConst::RefMetaSizedVarMut(ptr_metadata, ident, offset)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // sanity check on the shape of the fields
+                    if pointer_size == layout.size {
+                        bug!("[invariant] invalid layout size of ptr/ref type {ty}");
+                    }
+                    if !matches!(layout.fields, FieldsShape::Primitive) {
+                        bug!("[invariant] expect a primitive field for pointer type {ty}");
+                    }
+
+                    // now create the pointer constant
+                    match pointer_parsed {
+                        None => match mutability {
+                            Mutability::Not => SolConst::PtrSizedNullImm,
+                            Mutability::Mut => SolConst::PtrSizedNullMut,
+                        },
+                        Some((parsed_prov, offset)) => {
+                            // construct the constant based on mutability and whether it is a raw pointer
+                            match (parsed_prov, ty.is_raw_ptr()) {
+                                (SolProvenance::Const(val), true) => {
+                                    SolConst::PtrSizedConst(val.into(), offset)
+                                }
+                                (SolProvenance::Const(val), false) => {
+                                    SolConst::RefSizedConst(val.into(), offset)
+                                }
+                                (SolProvenance::VarImm(ident), true) => {
+                                    SolConst::PtrSizedVarImm(ident, offset)
+                                }
+                                (SolProvenance::VarImm(ident), false) => {
+                                    SolConst::RefSizedVarImm(ident, offset)
+                                }
+                                (SolProvenance::VarMut(ident), true) => {
+                                    SolConst::PtrSizedVarMut(ident, offset)
+                                }
+                                (SolProvenance::VarMut(ident), false) => {
+                                    SolConst::RefSizedVarMut(ident, offset)
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // unsupported
@@ -828,10 +920,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
 
             // vector-alike
-            ty::Slice(elem_ty) | ty::Array(elem_ty, _) => {
+            ty::Array(elem_ty, _) => {
                 match &layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
-                    _ => bug!("[invariant] expect single 0-variant for vector type {ty}"),
+                    _ => bug!("[invariant] expect single 0-variant for array type {ty}"),
                 }
                 match &layout.fields {
                     FieldsShape::Array { stride, count } => {
@@ -847,7 +939,29 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         }
                         SolConst::Array(elements)
                     }
-                    _ => bug!("[invariant] expect an array field for vector type {ty}"),
+                    _ => bug!("[invariant] expect array field layout for array type {ty}"),
+                }
+            }
+            ty::Slice(elem_ty) => {
+                match &layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect single 0-variant for slice type {ty}"),
+                }
+                match &layout.fields {
+                    FieldsShape::Array { stride, count } => {
+                        let mut elements = vec![];
+                        for i in 0..*count {
+                            let elem_offset = offset + *stride * i;
+                            let (_, elem) = self.read_const_from_memory_and_layout(
+                                memory,
+                                elem_offset,
+                                *elem_ty,
+                            );
+                            elements.push(elem);
+                        }
+                        SolConst::Slice(elements)
+                    }
+                    _ => bug!("[invariant] expect an array field layout for slice type {ty}"),
                 }
             }
             ty::Str => {
@@ -1142,17 +1256,18 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
 
                 // pointers or references
-                ty::Ref(_, sub_ty, _) | ty::RawPtr(sub_ty, _) => {
-                    let ptr = match scalar {
-                        Scalar::Ptr(ptr, _) => Some(ptr),
-                        Scalar::Int(scalar_int) => {
-                            if !scalar_int.is_null() {
-                                bug!("[invariant] unexpected non-null for pointer type {ty}");
-                            }
-                            None
-                        }
-                    };
-                    let metadata = match sub_ty.kind() {
+                ty::Ref(_, sub_ty, mutability) | ty::RawPtr(sub_ty, mutability) => {
+                    // we only know how to convert a scalar to a sized reference/pointer for now
+                    if !sub_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized()) {
+                        bug!("[unsupported] unsized pointee type {sub_ty} as const scalar");
+                    }
+
+                    // TODO: remove this assignment
+                    // let metadata = SolPtrMetadata::Sized;
+
+                    // grab the element count
+                    /* TODO: remove this code block
+                    let count = match sub_ty.kind() {
                         ty::Array(_, size_const) => {
                             let array_len = match size_const.kind() {
                                 TyConstKind::Value(size_val) => match size_val
@@ -1168,11 +1283,58 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                     "[assumption] unexpected non-value size for array type {sub_ty} as pointee"
                                 ),
                             };
-                            SolPtrMetadata(array_len)
+                            array_len
                         }
-                        _ => bug!("[invariant] cannot derive metadata from pointee type {sub_ty}"),
+                        _ => 1,
                     };
-                    self.mk_ptr_const_from_scalar_ptr(ty, ptr, metadata)
+                     */
+
+                    // get the pointer (or possibly null if RawPtr type)
+                    let ptr = match scalar {
+                        Scalar::Ptr(scalar_ptr, _) => scalar_ptr,
+                        Scalar::Int(scalar_int) => {
+                            if !ty.is_raw_ptr() {
+                                bug!("[invariant] unexpected integer for non-ptr type {ty}");
+                            }
+                            if !scalar_int.is_null() {
+                                bug!("[invariant] unexpected non-null for pointer type {ty}");
+                            }
+
+                            // shortcut and early return for null pointers
+                            return match mutability {
+                                Mutability::Not => SolConst::PtrSizedNullImm,
+                                Mutability::Mut => SolConst::PtrSizedNullMut,
+                            };
+                        }
+                    };
+
+                    let (prov, offset) = ptr.into_raw_parts();
+                    let offset = SolOffset(offset.bytes_usize());
+
+                    // try to probe the memory behind the pointer
+                    let parsed_prov = self.make_provenance(prov, *sub_ty, *mutability);
+
+                    // construct the constant based on mutability and whether it is a raw pointer
+                    match (parsed_prov, ty.is_raw_ptr()) {
+                        (SolProvenance::Const(val), true) => {
+                            SolConst::PtrSizedConst(val.into(), offset)
+                        }
+                        (SolProvenance::Const(val), false) => {
+                            SolConst::RefSizedConst(val.into(), offset)
+                        }
+                        (SolProvenance::VarImm(ident), true) => {
+                            SolConst::PtrSizedVarImm(ident, offset)
+                        }
+                        (SolProvenance::VarImm(ident), false) => {
+                            SolConst::RefSizedVarImm(ident, offset)
+                        }
+                        (SolProvenance::VarMut(ident), true) => {
+                            SolConst::PtrSizedVarMut(ident, offset)
+                        }
+                        (SolProvenance::VarMut(ident), false) => {
+                            SolConst::RefSizedVarMut(ident, offset)
+                        }
+                    }
                 }
 
                 // function pointers
@@ -1208,7 +1370,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             elements.push(elem);
                             offset += elem_size;
                         }
-                        SolConst::Slice(elements)
+                        SolConst::RefSlice(elements)
                     }
                     ty::Str => {
                         let range = AllocRange { start: Size::ZERO, size: Size::from_bytes(meta) };
@@ -1222,7 +1384,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             .unwrap_or_else(|e| {
                                 bug!("[invariant] failed to read bytes for string constant: {e:?}");
                             });
-                        SolConst::String(String::from_utf8(bytes.to_vec()).unwrap_or_else(|e| {
+                        SolConst::RefString(String::from_utf8(bytes.to_vec()).unwrap_or_else(|e| {
                             bug!("[invariant] non utf-8 string constant: {e}");
                         }))
                     }
@@ -1252,9 +1414,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let const_val = match ty_const_val {
                     SolTyConst::Simple { ty: const_ty_inner, val: const_val } => {
                         if const_ty != const_ty_inner {
-                            bug!(
-                                "[invariant] type constant does not match its value type: {op_const}"
-                            );
+                            bug!("[invariant] type constant mismatches its value type: {op_const}");
                         }
                         const_val
                     }
@@ -1919,7 +2079,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         match self.tcx.global_alloc(prov.alloc_id()) {
             GlobalAlloc::Memory(allocated) => {
                 if !matches!(mutability, Mutability::Not) {
-                    bug!("[invariant] mutable memory allocation in provenance");
+                    bug!("[assumption] mutable memory allocation in provenance");
                 }
 
                 let (_, const_val) =
@@ -1945,7 +2105,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     self.globals.insert(ident.clone(), (init_ty, init_val));
                 }
 
-                SolProvenance::Variable(ident)
+                // split by mutability
+                match mutability {
+                    Mutability::Not => SolProvenance::VarImm(ident),
+                    Mutability::Mut => SolProvenance::VarMut(ident),
+                }
             }
             GlobalAlloc::Function { .. } => bug!("[invariant] unexpected function in provenance"),
             GlobalAlloc::VTable(..) => bug!("[unsupported] vtable in provenance"),
@@ -2395,7 +2559,8 @@ pub(crate) struct SolPtrMetadata(pub(crate) usize);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolProvenance {
     Const(SolConst),
-    Variable(SolIdent),
+    VarImm(SolIdent),
+    VarMut(SolIdent),
 }
 
 /*
@@ -2431,6 +2596,7 @@ pub(crate) enum SolConstFloat {
 /// A constant
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolConst {
+    /* data types */
     Bool(bool),
     Char(char),
     Int(SolConstInt),
@@ -2440,17 +2606,38 @@ pub(crate) enum SolConst {
     Struct(Vec<(SolFieldIndex, SolConst)>),
     Union(SolFieldIndex, Box<SolConst>),
     Enum(SolVariantIndex, Vec<(SolFieldIndex, SolConst)>),
+
+    /* proxy data */
     Slice(Vec<SolConst>),
     String(String),
-    GlobalRefConst(Box<SolConst>, SolOffset, SolPtrMetadata),
-    GlobalRefImm(SolIdent, SolOffset, SolPtrMetadata),
-    GlobalRefMut(SolIdent, SolOffset, SolPtrMetadata),
-    GlobalPtrConst(Box<SolConst>, SolOffset, SolPtrMetadata),
-    GlobalPtrImm(SolIdent, SolOffset, SolPtrMetadata),
-    GlobalPtrMut(SolIdent, SolOffset, SolPtrMetadata),
-    GlobalPtrNull,
+
+    /* code types */
     FuncDef(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
     Closure(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
+
+    /* references and pointers */
+    RefSlice(Vec<SolConst>),
+    RefString(String),
+
+    RefSizedConst(Box<SolConst>, SolOffset),
+    RefSizedVarImm(SolIdent, SolOffset),
+    RefSizedVarMut(SolIdent, SolOffset),
+    RefMetaSizedConst(SolPtrMetadata, Box<SolConst>, SolOffset),
+    RefMetaSizedVarImm(SolPtrMetadata, SolIdent, SolOffset),
+    RefMetaSizedVarMut(SolPtrMetadata, SolIdent, SolOffset),
+
+    /* pointers */
+    PtrSizedConst(Box<SolConst>, SolOffset),
+    PtrSizedVarImm(SolIdent, SolOffset),
+    PtrSizedVarMut(SolIdent, SolOffset),
+    PtrMetaSizedConst(SolPtrMetadata, Box<SolConst>, SolOffset),
+    PtrMetaSizedVarImm(SolPtrMetadata, SolIdent, SolOffset),
+    PtrMetaSizedVarMut(SolPtrMetadata, SolIdent, SolOffset),
+
+    PtrSizedNullImm,
+    PtrSizedNullMut,
+    PtrMetaSizedNullImm,
+    PtrMetaSizedNullMut,
 }
 
 /*
