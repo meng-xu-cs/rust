@@ -728,10 +728,30 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         if !ty.is_raw_ptr() {
                             bug!("[invariant] unexpected integer for non-ptr type {ty} in memory");
                         }
-                        if !int.is_null() {
-                            bug!("[invariant] unexpected non-null for pointer type {ty} in memory");
+                        if int.is_null() {
+                            // the normal case when faced with a null pointer
+                            None
+                        } else {
+                            // a rare but possible case where the pointer is a constant integer
+                            if layout.size != pointer_size {
+                                bug!("[invariant] invalid layout size for addr-ptr in type {ty}");
+                            }
+                            match &layout.backend_repr {
+                                BackendRepr::Scalar(ScalarAbi::Initialized {
+                                    value: Primitive::Pointer(_),
+                                    valid_range: _,
+                                }) => (),
+                                _ => {
+                                    bug!("[invariant] invalid layout for addr-ptr in type {ty}");
+                                }
+                            }
+
+                            // sanity check passed, short-circuit parsing from here
+                            return (
+                                layout.size,
+                                SolConst::PtrAddress(int.to_target_usize(self.tcx) as usize),
+                            );
                         }
-                        None
                     }
                 };
 
@@ -2551,6 +2571,9 @@ pub(crate) enum SolConst {
     PtrSizedNullMut,
     PtrMetaSizedNullImm,
     PtrMetaSizedNullMut,
+
+    /* special */
+    PtrAddress(usize),
 }
 
 /*
