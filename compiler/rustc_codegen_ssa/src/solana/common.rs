@@ -6,7 +6,7 @@ use std::{env, fs};
 use rustc_middle::bug;
 use rustc_middle::mir::Body;
 use rustc_middle::mir::graphviz::write_mir_fn_graphviz;
-use rustc_middle::mir::pretty::{PrettyPrintMirOptions, write_mir_fn};
+use rustc_middle::mir::pretty::MirWriter;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::FileNameDisplayPreference;
 use serde::Serialize;
@@ -178,14 +178,10 @@ impl SolEnv {
         // dump the MIR to file
         let mut file_mir = File::create(instance_outdir.join("body.mir"))
             .unwrap_or_else(|e| bug!("[invariant] failed to create MIR file: {e}"));
-        write_mir_fn(
-            tcx,
-            body,
-            &mut |_, _| Ok(()),
-            &mut file_mir,
-            PrettyPrintMirOptions::from_cli(tcx),
-        )
-        .unwrap_or_else(|e| bug!("[invariant] failed to write MIR to file: {e}"));
+
+        MirWriter::new(tcx)
+            .write_mir_fn(body, &mut file_mir)
+            .unwrap_or_else(|e| bug!("[invariant] failed to write MIR to file: {e}"));
 
         // dump the CFG to file
         let mut file_dot = File::create(instance_outdir.join("body.dot"))
