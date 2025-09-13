@@ -666,66 +666,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
     }
 
-    // TODO: should be removed
-    /// Create a pointer constant from a MIR scalar
-    /*
-    fn mk_ptr_const_from_scalar_ptr(
-        &mut self,
-        ty: Ty<'tcx>,
-        ptr: Option<Pointer<CtfeProvenance>>,
-        metadata: SolPtrMetadata,
-    ) -> SolConst {
-        match ty.kind() {
-            // pointer or reference to values
-            ty::Ref(_, sub_ty, mutability) => match ptr {
-                Some(pointer) => {
-                    let (prov, offset) = pointer.into_raw_parts();
-                    let offset = SolOffset(offset.bytes_usize());
-                    match self.make_provenance(prov, *sub_ty, *mutability) {
-                        SolProvenance::Const(val) => {
-                            SolConst::GlobalRefConst(val.into(), offset, metadata)
-                        }
-                        SolProvenance::Variable(ident) => match mutability {
-                            Mutability::Not => SolConst::GlobalRefImm(ident, offset, metadata),
-                            Mutability::Mut => SolConst::GlobalRefMut(ident, offset, metadata),
-                        },
-                    }
-                }
-                None => bug!("[invariant] unexpected null pointer for references"),
-            },
-            ty::RawPtr(sub_ty, mutability) => match ptr {
-                Some(pointer) => {
-                    let (prov, offset) = pointer.into_raw_parts();
-                    let offset = SolOffset(offset.bytes_usize());
-                    match self.make_provenance(prov, *sub_ty, *mutability) {
-                        SolProvenance::Const(val) => {
-                            SolConst::GlobalPtrConst(val.into(), offset, metadata)
-                        }
-                        SolProvenance::Variable(ident) => match mutability {
-                            Mutability::Not => SolConst::GlobalPtrImm(ident, offset, metadata),
-                            Mutability::Mut => SolConst::GlobalPtrMut(ident, offset, metadata),
-                        },
-                    }
-                }
-                None => {
-                    if metadata.0 != 0 {
-                        bug!("[invariant] unexpected non-zero metadata for null raw pointers");
-                    }
-                    SolConst::GlobalPtrNull
-                }
-            },
-
-            // all others
-            _ => {
-                bug!(
-                    "[invariant] unexpected type {ty} for pointer scalar constant {}",
-                    ptr.map_or("null".to_string(), |p| format!("{p:?}"))
-                );
-            }
-        }
-    }
-     */
-
     fn read_const_from_memory_and_layout(
         &mut self,
         memory: &Allocation,
@@ -786,10 +726,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     }
                     Scalar::Int(int) => {
                         if !ty.is_raw_ptr() {
-                            bug!("[invariant] unexpected integer for non-ptr type {ty}");
+                            bug!("[invariant] unexpected integer for non-ptr type {ty} in memory");
                         }
                         if !int.is_null() {
-                            bug!("[invariant] unexpected non-null for pointer type {ty}");
+                            bug!("[invariant] unexpected non-null for pointer type {ty} in memory");
                         }
                         None
                     }
@@ -797,7 +737,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
                 // check whether the metadata is a ZST
                 // NOTE: we only handle size-based metadata for now
-                let need_metadata = sub_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized());
+                let need_metadata = !sub_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized());
 
                 // switch by whether we need metadata
                 if need_metadata {
@@ -1262,39 +1202,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         bug!("[unsupported] unsized pointee type {sub_ty} as const scalar");
                     }
 
-                    // TODO: remove this assignment
-                    // let metadata = SolPtrMetadata::Sized;
-
-                    // grab the element count
-                    /* TODO: remove this code block
-                    let count = match sub_ty.kind() {
-                        ty::Array(_, size_const) => {
-                            let array_len = match size_const.kind() {
-                                TyConstKind::Value(size_val) => match size_val
-                                    .valtree
-                                    .try_to_scalar_int()
-                                {
-                                    Some(size_int) => size_int.to_target_usize(self.tcx) as usize,
-                                    None => bug!(
-                                        "[assumption] unexpected non-int size for array type {sub_ty} as pointee"
-                                    ),
-                                },
-                                _ => bug!(
-                                    "[assumption] unexpected non-value size for array type {sub_ty} as pointee"
-                                ),
-                            };
-                            array_len
-                        }
-                        _ => 1,
-                    };
-                     */
-
                     // get the pointer (or possibly null if RawPtr type)
                     let ptr = match scalar {
                         Scalar::Ptr(scalar_ptr, _) => scalar_ptr,
                         Scalar::Int(scalar_int) => {
                             if !ty.is_raw_ptr() {
-                                bug!("[invariant] unexpected integer for non-ptr type {ty}");
+                                bug!("[invariant] unexpected int scalar for non-ptr type {ty}");
                             }
                             if !scalar_int.is_null() {
                                 bug!("[invariant] unexpected non-null for pointer type {ty}");
