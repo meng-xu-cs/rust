@@ -5,6 +5,7 @@ pub(crate) mod common;
 pub(crate) mod context;
 pub(crate) mod pipeline_anchor;
 pub(crate) mod pipeline_shared;
+pub(crate) mod pipeline_spl;
 
 use common::{BuildSystem, Phase, retrieve_env};
 
@@ -17,19 +18,11 @@ pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
 
     // work on the monomorphised MIR
     match sol.phase {
-        Phase::Bootstrap => {
-            match sol.build_system {
-                BuildSystem::Spl => {
-                    // TODO: add SPL-specific processing here
-                }
-                BuildSystem::Anchor => {
-                    pipeline_anchor::phase_bootstrap(tcx, sol, instance);
-                }
-            }
-        }
-        Phase::Expansion(_) => {
-            pipeline_shared::phase_expansion(tcx, sol, instance);
-        }
+        Phase::Bootstrap => match sol.build_system {
+            BuildSystem::Spl => pipeline_spl::phase_bootstrap(tcx, sol, instance),
+            BuildSystem::Anchor => pipeline_anchor::phase_bootstrap(tcx, sol, instance),
+        },
+        Phase::Expansion(_) => pipeline_shared::phase_expansion(tcx, sol, instance),
         Phase::Temporary => bug!("[invariant] unexpected temporary phase"),
     }
 }
