@@ -1471,16 +1471,17 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     CastKind::FloatToFloat => SolOpcodeCast::FloatToFloat,
                     CastKind::IntToFloat => SolOpcodeCast::IntToFloat,
                     CastKind::FloatToInt => SolOpcodeCast::FloatToInt,
-                    CastKind::Transmute | CastKind::PtrToPtr | CastKind::FnPtrToPtr => {
-                        SolOpcodeCast::Reinterpret
-                    }
+                    CastKind::PtrToPtr => SolOpcodeCast::PtrToPtr,
+                    CastKind::FnPtrToPtr => SolOpcodeCast::FnPtrToPtr,
+                    CastKind::Transmute => SolOpcodeCast::Transmute,
                     CastKind::PointerCoercion(coercion_type, _) => match coercion_type {
-                        PointerCoercion::MutToConstPointer
-                        | PointerCoercion::ArrayToPointer
-                        | PointerCoercion::UnsafeFnPointer
-                        | PointerCoercion::Unsize => SolOpcodeCast::Reinterpret,
+                        PointerCoercion::UnsafeFnPointer => SolOpcodeCast::SafeToUnsafe,
+                        PointerCoercion::Unsize => SolOpcodeCast::Unsize,
                         PointerCoercion::ReifyFnPointer | PointerCoercion::ClosureFnPointer(_) => {
                             SolOpcodeCast::ReifyFnPtr
+                        }
+                        PointerCoercion::ArrayToPointer | PointerCoercion::MutToConstPointer => {
+                            bug!("[invariant] unexpected pointer coercion in cast: {cast_kind:?}");
                         }
                     },
                     CastKind::PointerExposeProvenance => SolOpcodeCast::PtrToAddr,
@@ -1489,7 +1490,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 SolExpr::Cast { opcode, place: self.mk_operand(operand), ty: self.mk_type(*ty) }
             }
             Rvalue::ShallowInitBox(operand, ty) => SolExpr::Cast {
-                opcode: SolOpcodeCast::Reinterpret,
+                opcode: SolOpcodeCast::Boxify,
                 place: self.mk_operand(operand),
                 ty: self.mk_type(*ty),
             },
@@ -2344,8 +2345,13 @@ pub(crate) enum SolOpcodeCast {
     FloatToFloat,
     IntToFloat,
     FloatToInt,
-    Reinterpret,
+    PtrToPtr,
+    FnPtrToPtr,
+    Transmute,
     ReifyFnPtr,
+    SafeToUnsafe,
+    Unsize,
+    Boxify,
     PtrToAddr,
     AddrToPtr,
 }
