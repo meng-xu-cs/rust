@@ -2645,6 +2645,12 @@ pub(crate) struct SolAnchorInstruction {
     pub(crate) ty_state: SolIdent,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolSplTestCase {
+    pub(crate) function: SolIdent,
+    pub(crate) expect_panic: bool,
+}
+
 /* --- END OF SYNC --- */
 
 /*
