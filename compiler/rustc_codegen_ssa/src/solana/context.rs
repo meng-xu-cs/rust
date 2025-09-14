@@ -20,7 +20,7 @@ use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
     self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder,
     ExistentialPredicate, FloatTy, GenericArg, GenericArgKind, GenericArgsRef, Instance,
-    InstanceKind, IntTy, ScalarInt, Ty, TyCtxt, TypingEnv, UintTy, VariantDiscr,
+    InstanceKind, IntTy, ScalarInt, TermKind, Ty, TyCtxt, TypingEnv, UintTy, VariantDiscr,
 };
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
@@ -218,14 +218,26 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 .iter()
                                 .map(|ty_arg| self.mk_ty_arg(ty_arg))
                                 .collect();
-                            trait_refs.push((trait_ident, trait_ty_args));
+                            trait_refs.push((trait_ident, trait_ty_args, None));
+                        }
+                        ExistentialPredicate::Projection(trait_proj) => {
+                            let trait_ident = self.mk_ident(trait_proj.def_id);
+                            let trait_ty_args = trait_proj
+                                .args
+                                .iter()
+                                .map(|ty_arg| self.mk_ty_arg(ty_arg))
+                                .collect();
+                            let trait_term = match trait_proj.term.kind() {
+                                TermKind::Ty(term_ty) => SolTyTerm::Type(self.mk_type(term_ty)),
+                                TermKind::Const(term_const) => {
+                                    SolTyTerm::Const(self.mk_ty_const(term_const))
+                                }
+                            };
+                            trait_refs.push((trait_ident, trait_ty_args, Some(trait_term)));
                         }
                         ExistentialPredicate::AutoTrait(auto_trait_id) => {
                             let trait_ident = self.mk_ident(auto_trait_id);
-                            trait_refs.push((trait_ident, vec![]));
-                        }
-                        ExistentialPredicate::Projection(..) => {
-                            bug!("[unsupported] unsupported dynamic type: {ty}");
+                            trait_refs.push((trait_ident, vec![], None));
                         }
                     }
                 }
@@ -471,9 +483,18 @@ impl<'tcx> SolContextBuilder<'tcx> {
     fn mk_val_const_from_zst(&mut self, ty: Ty<'tcx>) -> SolConst {
         match ty.kind() {
             ty::Tuple(elems) if elems.is_empty() => SolConst::Tuple(vec![]),
-            ty::Adt(def, _) => match def.adt_kind() {
-                AdtKind::Struct if def.all_fields().count() == 0 => SolConst::Struct(vec![]),
-                _ => bug!("[invariant] the ADT definition is not a ZST: {ty}"),
+            ty::Adt(def, generics) => match def.adt_kind() {
+                AdtKind::Struct => {
+                    let variant = def.variant(VariantIdx::from_usize(0));
+                    let mut fields = vec![];
+                    for (field_idx, field_def) in variant.fields.iter_enumerated() {
+                        let field_val =
+                            self.mk_val_const_from_zst(field_def.ty(self.tcx, generics));
+                        fields.push((SolFieldIndex(field_idx.as_usize()), field_val));
+                    }
+                    SolConst::Struct(fields)
+                }
+                _ => bug!("[invariant] the ADT definition is not a ZST struct: {ty}"),
             },
             ty::FnDef(def_id, generics) => {
                 let (kind, ident, ty_args) = self.make_type_function(*def_id, generics);
@@ -763,7 +784,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 if need_metadata {
                     // sanity check on the shape of the fields
                     if pointer_size * 2 != layout.size {
-                        bug!("[invariant] invalid layout size of ptr/ref type {ty}");
+                        bug!(
+                            "[invariant] invalid layout size of ptr/ref type {ty}, expect metadata but got {}",
+                            layout.size.bytes_usize()
+                        );
                     }
 
                     // derive the metadata offset
@@ -834,8 +858,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     }
                 } else {
                     // sanity check on the shape of the fields
-                    if pointer_size == layout.size {
-                        bug!("[invariant] invalid layout size of ptr/ref type {ty}");
+                    if pointer_size != layout.size {
+                        bug!(
+                            "[invariant] invalid layout size of ptr/ref type {ty}, expect no metadata but got {}",
+                            layout.size.bytes_usize()
+                        );
                     }
                     if !matches!(layout.fields, FieldsShape::Primitive) {
                         bug!("[invariant] expect a primitive field for pointer type {ty}");
@@ -876,7 +903,41 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
             // unsupported
             ty::FnPtr(..) => {
-                bug!("[unsupported] function pointer constant in memory");
+                // sanity check on the variants
+                match &layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect single 0-variant for fn-ptr type {ty}"),
+                }
+
+                // read and parse the pointer
+                let pointer_size = self.tcx.data_layout().pointer_size();
+                if layout.size != pointer_size {
+                    bug!("[invariant] unexpected layout size for function pointer type {ty}");
+                }
+                match read_primitive(self.tcx, offset, pointer_size, true) {
+                    Scalar::Ptr(ptr, _) => {
+                        let (prov, offset) = ptr.into_raw_parts();
+                        if offset != Size::ZERO {
+                            bug!("[invariant] unexpected non-zero offset for function pointer");
+                        }
+
+                        match self.tcx.global_alloc(prov.alloc_id()) {
+                            GlobalAlloc::Function { instance } => {
+                                let (kind, ident, ty_args) = self.make_instance(instance);
+                                SolConst::FuncPtr(kind, ident, ty_args)
+                            }
+                            _ => {
+                                bug!("[invariant] unexpected allocation for function pointer");
+                            }
+                        }
+                    }
+                    Scalar::Int(int) => {
+                        if !int.is_null() {
+                            bug!("[invariant] unexpected non-null integer for function pointer");
+                        }
+                        SolConst::FuncPtrNull
+                    }
+                }
             }
 
             // vector-alike
@@ -2237,7 +2298,7 @@ pub(crate) enum SolType {
     Function(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
     Closure(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
     FnPtr(Vec<SolType>, Box<SolType>),
-    Dynamic(Vec<(SolIdent, Vec<SolGenericArg>)>),
+    Dynamic(Vec<(SolIdent, Vec<SolGenericArg>, Option<SolTyTerm>)>),
 }
 
 /// User-defined type, i.e., an algebraic data type (ADT)
@@ -2269,6 +2330,13 @@ pub(crate) struct SolVariant {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolTyConst {
     Simple { ty: SolType, val: SolConst },
+}
+
+/// A term known in the type system
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolTyTerm {
+    Type(SolType),
+    Const(SolTyConst),
 }
 
 /// A generic argument
@@ -2580,6 +2648,10 @@ pub(crate) enum SolConst {
 
     /* special */
     PtrAddress(usize),
+
+    /* function pointers */
+    FuncPtrNull,
+    FuncPtr(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
 }
 
 /*
@@ -2646,9 +2718,8 @@ pub(crate) struct SolAnchorInstruction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolSplTestCase {
+pub(crate) struct SolSplTestEntrypoint {
     pub(crate) function: SolIdent,
-    pub(crate) expect_panic: bool,
 }
 
 /* --- END OF SYNC --- */
