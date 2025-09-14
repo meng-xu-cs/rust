@@ -1,10 +1,11 @@
 use rustc_hir::def::DefKind;
 use rustc_middle::bug;
-use rustc_middle::ty::{Instance, InstanceKind, TyCtxt};
+use rustc_middle::mir::{Const, ConstValue, Operand, START_BLOCK, TerminatorKind};
+use rustc_middle::ty::{self, Instance, InstanceKind, TyCtxt};
 use tracing::{info, warn};
 
 use crate::solana::common::SolEnv;
-use crate::solana::context::{SolContextBuilder, SolSplTestCase};
+use crate::solana::context::{SolContextBuilder, SolSplTestEntrypoint};
 
 pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: Instance<'tcx>) {
     info!(
@@ -40,25 +41,9 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
         }
     };
 
-    // check attributes
-    let mut has_attr_test = false;
-    let mut has_attr_ignore = false;
-    let mut has_attr_should_panic = false;
-    for attr in tcx.get_all_attrs(def_id) {
-        let name = match attr.name() {
-            None => continue,
-            Some(n) => n,
-        };
-        match name.as_str() {
-            "test" => has_attr_test = true,
-            "ignore" => has_attr_ignore = true,
-            "should_panic" => has_attr_should_panic = true,
-            _ => continue,
-        }
-    }
-
-    if !has_attr_test {
-        info!("- skipped, missing `test` attribute");
+    // the entrypoint of a test must be a "main" function
+    if def_desc.as_str() != "main" {
+        info!("- skipped, not the main function for rust unit tests");
         return;
     }
 
@@ -70,15 +55,55 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
         bug!("[invariant] expect a test function to have zero parameters");
     }
 
-    // check whether the test case is ignored
-    if has_attr_ignore {
-        info!("- skipped, `ignore = ...` attribute present");
+    // check the terminator of the first basic block
+    let entry_block = body
+        .basic_blocks
+        .get(START_BLOCK)
+        .unwrap_or_else(|| bug!("[invariant] missing entry block for main function"));
+
+    let callee = match entry_block.terminator.as_ref().map(|t| &t.kind) {
+        Some(TerminatorKind::Call { func, .. }) => func,
+        _ => {
+            info!("- skipped, entry block does not end with a function call");
+            return;
+        }
+    };
+
+    // try to derive the callee name
+    let callee_ty = match callee {
+        Operand::Constant(c) => match c.const_ {
+            Const::Val(ConstValue::ZeroSized, const_ty) => const_ty,
+            _ => {
+                info!("- skipped, entry block calls a non-constant function");
+                return;
+            }
+        },
+        Operand::Copy(..) | Operand::Move(..) => {
+            info!("- skipped, entry block ends with an indirect call");
+            return;
+        }
+    };
+    let callee_def_id = match callee_ty.kind() {
+        ty::FnDef(callee_def_id, callee_ty_args) => {
+            if !callee_ty_args.is_empty() {
+                info!("- skipped, entry block calls a generic function");
+                return;
+            }
+            callee_def_id
+        }
+        _ => {
+            info!("- skipped, entry block calls a different function");
+            return;
+        }
+    };
+    let callee_desc = tcx.def_path_str_with_args(callee_def_id, &[]);
+    if callee_desc != "test_main_static" {
+        info!("- skipped, entry block not calling 'test_main_static'");
         return;
     }
 
     // collect information
-    warn!("- found test case {def_desc}");
-
+    warn!("- found a test driver");
     let mut builder = SolContextBuilder::new(tcx, sol);
     let (_, inst_ident, _) = builder.make_instance(instance);
     let (sol, context) = builder.build();
@@ -87,9 +112,9 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     let ctxt_file = sol.context_to_file(&context);
 
     // save the metadata to file
-    let test_case = SolSplTestCase { function: inst_ident, expect_panic: has_attr_should_panic };
-    sol.summary_to_file("test_case", &test_case);
+    let entrypoint = SolSplTestEntrypoint { function: inst_ident };
+    sol.summary_to_file("entrypoint", &entrypoint);
 
     // done
-    info!("- done with instruction {def_desc}, context saved at {}", ctxt_file.display());
+    info!("- done with unittest entrypoint, context saved at {}", ctxt_file.display());
 }
