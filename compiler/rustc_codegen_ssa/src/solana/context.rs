@@ -20,7 +20,7 @@ use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
     self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder,
     ExistentialPredicate, FloatTy, GenericArg, GenericArgKind, GenericArgsRef, Instance,
-    InstanceKind, IntTy, ScalarInt, TermKind, Ty, TyCtxt, TypingEnv, UintTy, VariantDiscr,
+    InstanceKind, IntTy, ScalarInt, TermKind, Ty, TyCtxt, TypingEnv, UintTy, ValTree, VariantDiscr,
 };
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
@@ -440,26 +440,38 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
     }
 
+    /// Create a constant by parsing the value tree
+    fn mk_typed_valtree(&mut self, ty: Ty<'tcx>, tree: ValTree<'tcx>) -> SolConst {
+        match tree.try_to_scalar() {
+            None => match tree.try_to_branch() {
+                None => {
+                    bug!("[invariant] non-scalar non-branch valtree {tree:?} with type {ty}");
+                }
+                Some(branches) => {
+                    if branches.len() != 1 {
+                        bug!("[unsupported] multi-branch valtree {branches:#?} with type {ty}");
+                    }
+                    self.mk_typed_valtree(ty, *branches.into_iter().next().unwrap())
+                }
+            },
+            Some(Scalar::Int(scalar_int)) => self.mk_val_const_from_scalar_val(ty, scalar_int),
+            Some(Scalar::Ptr(..)) => {
+                bug!("[unsupported] pointer as valtree constant {tree:?} in type {ty}")
+            }
+        }
+    }
+
     /// Create a constant known in the type system
     fn mk_ty_const(&mut self, ty_const: TyConst<'tcx>) -> SolTyConst {
         match ty_const.kind() {
             TyConstKind::Value(val) => {
                 let const_ty = self.mk_type(val.ty);
-
                 let normalized_ty =
                     self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), val.ty);
                 let const_val = if val.valtree.is_zst() {
                     self.mk_val_const_from_zst(normalized_ty)
                 } else {
-                    match val.valtree.try_to_scalar() {
-                        None => bug!("[unsupported] non-scalar type constant {val}"),
-                        Some(Scalar::Int(scalar_int)) => {
-                            self.mk_val_const_from_scalar_val(normalized_ty, scalar_int)
-                        }
-                        Some(Scalar::Ptr(..)) => {
-                            bug!("[unsupported] pointer scalar as type constant {val}")
-                        }
-                    }
+                    self.mk_typed_valtree(normalized_ty, val.valtree)
                 };
                 SolTyConst::Simple { ty: const_ty, val: const_val }
             }
