@@ -12,9 +12,9 @@ use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::bug;
 use rustc_middle::mir::interpret::{AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Scalar};
 use rustc_middle::mir::{
-    AggregateKind, BinOp, BorrowKind, CastKind, Const as OpConst, ConstValue, MirPhase,
-    NonDivergingIntrinsic, NullOp, Operand, Place, PlaceElem, RawPtrKind, RuntimePhase, Rvalue,
-    Statement, StatementKind, Terminator, TerminatorKind, UnOp, UnwindAction,
+    AggregateKind, BinOp, BorrowKind, CastKind, Const as OpConst, ConstValue,
+    NonDivergingIntrinsic, NullOp, Operand, Place, PlaceElem, RawPtrKind, Rvalue, Statement,
+    StatementKind, Terminator, TerminatorKind, UnOp, UnwindAction,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
@@ -2131,11 +2131,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
 
                 // this is a regular function definition
-                let body = self.tcx.instance_mir(instance.def).clone();
-                if body.phase != MirPhase::Runtime(RuntimePhase::Optimized) {
-                    bug!("converted instance is not runtime optimized: {def_desc}");
-                }
-                body
+                self.tcx.instance_mir(instance.def).clone()
             }
 
             SolInstanceKind::DropEmpty
@@ -2862,6 +2858,8 @@ pub(crate) enum SolBuiltinFunc {
     AllocHandleAllocError,
     AllocRawVecHandleError,
     LayoutIsSizeAlignValid,
+    /* casting */
+    DowncastRef,
     /* formatter */
     StdFmtWrite,
     DebugFmt,
@@ -2954,6 +2952,8 @@ impl SolBuiltinFunc {
             Self::AllocHandleAllocError => r"handle_alloc_error",
             Self::AllocRawVecHandleError => r"alloc::raw_vec::handle_error",
             Self::LayoutIsSizeAlignValid => r"Layout::is_size_align_valid",
+            /* casting */
+            Self::DowncastRef => r"<.*>::downcast_ref::<.*>",
             /* formatter */
             Self::StdFmtWrite => r"std::fmt::write",
             Self::DebugFmt => r"<.* as Debug>::fmt",
@@ -2992,6 +2992,8 @@ impl SolBuiltinFunc {
             Self::AllocHandleAllocError,
             Self::AllocRawVecHandleError,
             Self::LayoutIsSizeAlignValid,
+            /* casting */
+            Self::DowncastRef,
             /* formatter */
             Self::StdFmtWrite,
             Self::DebugFmt,
