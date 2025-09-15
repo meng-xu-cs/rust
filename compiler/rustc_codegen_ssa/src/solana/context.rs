@@ -92,6 +92,16 @@ impl<'tcx> SolContextBuilder<'tcx> {
         matches!(self.sol.phase, Phase::Temporary)
     }
 
+    /// Whether a type is a ZST
+    fn is_ty_zst(&self, ty: Ty<'tcx>) -> bool {
+        match self.tcx.layout_of(TypingEnv::fully_monomorphized().as_query_input(ty)) {
+            Ok(layout) => layout.layout.is_zst(),
+            Err(_) => {
+                bug!("[invariant] unable to get layout of type {ty}");
+            }
+        }
+    }
+
     /// Create an identifier without caching it
     pub(crate) fn mk_ident_no_cache(tcx: TyCtxt<'tcx>, def_id: DefId) -> SolIdent {
         // now construct the identifier
@@ -505,7 +515,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             ty::Adt(def, generics) => match def.adt_kind() {
                 AdtKind::Struct => {
                     // a struct is a ZST if all its fields are ZSTs
-                    let variant = def.variant(VariantIdx::from_usize(0));
+                    let variant = def.non_enum_variant();
                     let mut fields = vec![];
                     for (field_idx, field_def) in variant.fields.iter_enumerated() {
                         let field_val =
@@ -722,17 +732,15 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                                             AdtKind::Struct => {
                                                                 warn!(
                                                                     "field type {field_ty} is a struct type with fields: {:#?}",
-                                                                    field_adt_def.variant(
-                                                                        VariantIdx::from_usize(0)
-                                                                    )
+                                                                    field_adt_def
+                                                                        .non_enum_variant()
                                                                 );
                                                             }
                                                             AdtKind::Union => {
                                                                 warn!(
                                                                     "field type {field_ty} is a union type with fields: {:#?}",
-                                                                    field_adt_def.variant(
-                                                                        VariantIdx::from_usize(0)
-                                                                    )
+                                                                    field_adt_def
+                                                                        .non_enum_variant()
                                                                 );
                                                             }
                                                         }
@@ -767,7 +775,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
                 AdtKind::Union => bug!("[unsupported] union type {ty} for scalar constant"),
                 AdtKind::Struct => {
-                    let fields = &def.variant(VariantIdx::ZERO).fields;
+                    let fields = &def.non_enum_variant().fields;
                     if fields.len() != 1 {
                         bug!("[unsupported] {ty} is not single-field struct for scalar constant");
                     }
@@ -797,6 +805,17 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 bug!("[invariant] failed to read a primitive in memory allocation: {e:?}")
             })
         };
+        let read_primitive_if_initialized =
+            |tcx: TyCtxt<'tcx>, start, size: Size, is_provenane: bool| {
+                let range = AllocRange { start, size };
+                if memory.init_mask().is_range_initialized(range).is_err() {
+                    return None;
+                }
+                let value = memory.read_scalar(&tcx, range, is_provenane).unwrap_or_else(|e| {
+                    bug!("[invariant] failed to read a primitive in memory allocation after range check: {e:?}")
+                });
+                Some(value)
+            };
 
         // get the layout of the type
         let layout = self
@@ -1185,9 +1204,62 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         Variants::Single { index } if index.index() == 0 => {}
                         _ => bug!("[invariant] expect a single 0-variant for union type {ty}"),
                     }
-                    match &layout.fields {
-                        FieldsShape::Union(..) => bug!("[unsupported] union constant in memory"),
+                    let union_value = match &layout.fields {
+                        FieldsShape::Union(..) => match &layout.backend_repr {
+                            BackendRepr::Scalar(ScalarAbi::Union { value }) => {
+                                read_primitive_if_initialized(
+                                    self.tcx,
+                                    offset,
+                                    layout.size,
+                                    matches!(value, Primitive::Pointer(_)),
+                                )
+                            }
+                            _ => bug!("[invariant] expect scalar-union layout for type {ty}"),
+                        },
                         _ => bug!("[invariant] expect a union field for union type {ty}"),
+                    };
+
+                    // expect only two fields in the union: a ZST and a non-ZST
+                    let field_details = def
+                        .non_enum_variant()
+                        .fields
+                        .iter_enumerated()
+                        .map(|(field_idx, field_def)| (field_idx, field_def.ty(self.tcx, ty_args)))
+                        .collect::<Vec<_>>();
+
+                    if field_details.len() != 2 {
+                        bug!(
+                            "[invariant] expect only two variants in union type {ty}, found {}",
+                            field_details.len()
+                        );
+                    }
+                    let (f1_idx, f1_ty) = field_details[0];
+                    let (f2_idx, f2_ty) = field_details[1];
+
+                    let (field_zst_idx, field_zst_ty, field_val_idx, field_val_ty) =
+                        match (self.is_ty_zst(f1_ty), self.is_ty_zst(f2_ty)) {
+                            (true, true) => {
+                                bug!("[invariant] expect one ZST in union {ty}, got two")
+                            }
+                            (false, false) => {
+                                bug!("[invariant] expect one ZST in union {ty}, got none")
+                            }
+                            (true, false) => (f1_idx, f1_ty, f2_idx, f2_ty),
+                            (false, true) => (f2_idx, f2_ty, f1_idx, f1_ty),
+                        };
+
+                    // build the union based on the value
+                    match union_value {
+                        None => SolConst::Union(
+                            SolFieldIndex(field_zst_idx.as_usize()),
+                            Box::new(self.mk_val_const_from_zst(field_zst_ty)),
+                        ),
+                        Some(val) => SolConst::Union(
+                            SolFieldIndex(field_val_idx.as_usize()),
+                            Box::new(
+                                self.mk_val_const_with_ty(ConstValue::Scalar(val), field_val_ty),
+                            ),
+                        ),
                     }
                 }
                 AdtKind::Enum => {
@@ -2791,6 +2863,8 @@ pub(crate) enum SolBuiltinFunc {
     IntrinsicsPanicFmt,
     IntrinsicsPanicNounwindFmt,
     IntrinsicsResultUnwrapFailed,
+    IntrinsicsOptionUnwrapFailed,
+    IntrinsicsVecRemoveAssertFailed,
     /* alloc */
     AllocGlobalAllocImpl,
     AllocRustAlloc,
@@ -2804,7 +2878,11 @@ pub(crate) enum SolBuiltinFunc {
     /* formatter */
     StdFmtWrite,
     DebugFmt,
+    FormatInner,
+    CoreFmt,
     SpecToString,
+    /* rust unit test */
+    TestMainStatic,
     /* solana */
     SolInvokeSigned,
 }
@@ -2877,6 +2955,8 @@ impl SolBuiltinFunc {
             Self::IntrinsicsPanicFmt => r"panic_fmt",
             Self::IntrinsicsPanicNounwindFmt => r"panic_nounwind_fmt",
             Self::IntrinsicsResultUnwrapFailed => r"result::unwrap_failed",
+            Self::IntrinsicsOptionUnwrapFailed => r"option::unwrap_failed",
+            Self::IntrinsicsVecRemoveAssertFailed => r"Vec::<.*>::remove::assert_failed",
             /* alloc */
             Self::AllocGlobalAllocImpl => r"std::alloc::Global::alloc_impl",
             Self::AllocRustAlloc => r"alloc::alloc::__rust_alloc",
@@ -2890,7 +2970,11 @@ impl SolBuiltinFunc {
             /* formatter */
             Self::StdFmtWrite => r"std::fmt::write",
             Self::DebugFmt => r"<.* as Debug>::fmt",
+            Self::FormatInner => r"format::format_inner",
+            Self::CoreFmt => r"core::fmt::.*::fmt",
             Self::SpecToString => r"<.* as string::SpecToString>::spec_to_string",
+            /* rust unit test */
+            Self::TestMainStatic => r"test_main_static",
             /* solana */
             Self::SolInvokeSigned => r"sol_invoke_signed",
         };
@@ -2909,6 +2993,8 @@ impl SolBuiltinFunc {
             Self::IntrinsicsPanicFmt,
             Self::IntrinsicsPanicNounwindFmt,
             Self::IntrinsicsResultUnwrapFailed,
+            Self::IntrinsicsOptionUnwrapFailed,
+            Self::IntrinsicsVecRemoveAssertFailed,
             /* alloc */
             Self::AllocGlobalAllocImpl,
             Self::AllocRustAlloc,
@@ -2922,7 +3008,11 @@ impl SolBuiltinFunc {
             /* formatter */
             Self::StdFmtWrite,
             Self::DebugFmt,
+            Self::FormatInner,
+            Self::CoreFmt,
             Self::SpecToString,
+            /* rust unit test */
+            Self::TestMainStatic,
             /* solana */
             Self::SolInvokeSigned,
         ]
