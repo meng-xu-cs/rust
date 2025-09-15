@@ -650,19 +650,35 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     match &layout.variants {
                         Variants::Multiple { tag_encoding, .. } => match tag_encoding {
                             TagEncoding::Direct => {
-                                // discriminant is stored directly as the scalar value
-                                if def.all_fields().count() != 0 {
-                                    bug!("[assumption] {ty} is not discriminant-only as scalar");
-                                }
-
                                 // handle enum discriminant for scalar constant
                                 for (variant_idx, discr) in def.discriminants(self.tcx) {
-                                    if discr.val == tag_value {
-                                        return SolConst::Enum(
-                                            SolVariantIndex(variant_idx.index()),
-                                            vec![],
-                                        );
+                                    if discr.val != tag_value {
+                                        continue;
                                     }
+
+                                    let variant_def = def.variant(variant_idx);
+
+                                    // as discriminant is stored directly as the scalar value,
+                                    // the fields of this variant, if any, must be ZSTs
+                                    let mut field_values = vec![];
+                                    for (field_idx, field_def) in
+                                        variant_def.fields.iter_enumerated()
+                                    {
+                                        let field_ty = field_def.ty(self.tcx, generics);
+                                        match self.mk_val_const_when_zst(field_ty) {
+                                            None => bug!(
+                                                "[invariant] expect ZST field {} in {ty} for tagged variant, got {field_ty}",
+                                                field_def.name
+                                            ),
+                                            Some(zst_val) => field_values
+                                                .push((SolFieldIndex(field_idx.index()), zst_val)),
+                                        }
+                                    }
+
+                                    return SolConst::Enum(
+                                        SolVariantIndex(variant_idx.index()),
+                                        field_values,
+                                    );
                                 }
                                 bug!("[invariant] no discriminant matches {tag_value} for {ty}");
                             }
@@ -725,48 +741,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                     for (field_idx, field_def) in variant.fields.iter_enumerated() {
                                         let field_ty = field_def.ty(self.tcx, generics);
                                         match self.mk_val_const_when_zst(field_ty) {
-                                            None => {
-                                                warn!(
-                                                    "converting scalar int {val} to ZST type {ty} with layout {layout:#?}"
-                                                );
-                                                match field_ty.kind() {
-                                                    ty::Adt(field_adt_def, field_generics) => {
-                                                        match field_adt_def.adt_kind() {
-                                                            AdtKind::Enum => {
-                                                                warn!(
-                                                                    "field type {field_ty} is an enum type with variants: {:#?}",
-                                                                    field_adt_def.variants()
-                                                                );
-                                                            }
-                                                            AdtKind::Struct => {
-                                                                warn!(
-                                                                    "field type {field_ty} is a struct type with fields: {:#?}",
-                                                                    field_adt_def
-                                                                        .non_enum_variant()
-                                                                );
-                                                            }
-                                                            AdtKind::Union => {
-                                                                warn!(
-                                                                    "field type {field_ty} is a union type with fields: {:#?}",
-                                                                    field_adt_def
-                                                                        .non_enum_variant()
-                                                                );
-                                                            }
-                                                        }
-                                                        for field in field_adt_def.all_fields() {
-                                                            let fty =
-                                                                field.ty(self.tcx, field_generics);
-                                                            warn!("  field {}: {fty}", field.name);
-                                                        }
-                                                    }
-                                                    _ => {}
-                                                }
-                                                warn!("expecting field {field_ty} to be a ZST");
-                                                bug!(
-                                                    "[invariant] expect ZST field {} in {ty} for tagged variant",
-                                                    field_def.name
-                                                )
-                                            }
+                                            None => bug!(
+                                                "[invariant] expect ZST field {} in {ty} for tagged variant, got {field_ty}",
+                                                field_def.name
+                                            ),
                                             Some(zst_val) => field_values
                                                 .push((SolFieldIndex(field_idx.index()), zst_val)),
                                         }
