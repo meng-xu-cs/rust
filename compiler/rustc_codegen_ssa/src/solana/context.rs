@@ -506,6 +506,18 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     }
                     SolConst::Struct(fields)
                 }
+                AdtKind::Enum if def.variants().len() == 1 => {
+                    let (variant_idx, variant_def) =
+                        def.variants().iter_enumerated().next().unwrap();
+
+                    let mut fields = vec![];
+                    for (field_idx, field_def) in variant_def.fields.iter_enumerated() {
+                        let field_val =
+                            self.mk_val_const_from_zst(field_def.ty(self.tcx, generics));
+                        fields.push((SolFieldIndex(field_idx.as_usize()), field_val));
+                    }
+                    SolConst::Enum(SolVariantIndex(variant_idx.index()), fields)
+                }
                 _ => bug!("[invariant] the ADT definition is not a ZST struct: {ty}"),
             },
             ty::FnDef(def_id, generics) => {
@@ -1706,8 +1718,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 SolExpr::Aggregate { opcode, vals }
             }
             Rvalue::CopyForDeref(place) => SolExpr::Load(self.mk_place(*place)),
-            Rvalue::ThreadLocalRef(..) => {
-                bug!("[assumption] unexpected thread-local reference in rvalue conversion");
+            Rvalue::ThreadLocalRef(def_id) => {
+                let ident = self.mk_ident(*def_id);
+                // FIXME: the TLS support is currently incomplete
+                SolExpr::ThreadLocalRef(ident)
             }
             Rvalue::WrapUnsafeBinder(..) => {
                 bug!("[invariant] unexpected wrap unsafe binder in rvalue conversion");
@@ -2417,6 +2431,7 @@ pub(crate) enum SolExpr {
     Discriminant(SolPlace),
     Aggregate { opcode: SolOpcodeAggregate, vals: Vec<(SolFieldIndex, SolOperand)> },
     Load(SolPlace),
+    ThreadLocalRef(SolIdent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
