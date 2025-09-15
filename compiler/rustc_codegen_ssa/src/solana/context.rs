@@ -512,6 +512,15 @@ impl<'tcx> SolContextBuilder<'tcx> {
     fn mk_val_const_when_zst(&mut self, ty: Ty<'tcx>) -> Option<SolConst> {
         let zst_val = match ty.kind() {
             ty::Tuple(elems) if elems.is_empty() => SolConst::Tuple(vec![]),
+            ty::Array(elem_ty, length) => {
+                let count = length.try_to_target_usize(self.tcx)? as usize;
+                if count == 0 {
+                    SolConst::Array(vec![])
+                } else {
+                    let elem_val = self.mk_val_const_from_zst(*elem_ty);
+                    SolConst::Array(vec![elem_val; count])
+                }
+            }
             ty::Adt(def, generics) => match def.adt_kind() {
                 AdtKind::Struct => {
                     // a struct is a ZST if all its fields are ZSTs
