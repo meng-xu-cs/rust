@@ -506,10 +506,48 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     }
                     SolConst::Struct(fields)
                 }
-                AdtKind::Enum if def.variants().len() == 1 => {
-                    let (variant_idx, variant_def) =
-                        def.variants().iter_enumerated().next().unwrap();
+                AdtKind::Enum => {
+                    // look for a feasible variant
+                    let mut feasible_variant = None;
+                    for (variant_idx, variant_def) in def.variants().iter_enumerated() {
+                        let mut is_variant_feasible = true;
+                        for (_, field_def) in variant_def.fields.iter_enumerated() {
+                            let field_ty = field_def.ty(self.tcx, generics);
+                            let feasible = match field_ty.kind() {
+                                ty::Never => false,
+                                ty::Adt(adt_def, _)
+                                    if adt_def.adt_kind() == AdtKind::Enum
+                                        && adt_def.variants().is_empty() =>
+                                {
+                                    false
+                                }
+                                _ => true,
+                            };
 
+                            if !feasible {
+                                is_variant_feasible = false;
+                                break;
+                            }
+                        }
+                        if !is_variant_feasible {
+                            continue;
+                        }
+
+                        // found a feasible variant
+                        if feasible_variant.is_some() {
+                            bug!("[invariant] multiple feasible variants for ZST enum {ty}");
+                        }
+                        feasible_variant = Some(variant_idx);
+                    }
+                    let variant_idx = match feasible_variant {
+                        None => {
+                            bug!("[invariant] no feasible variant for ZST enum {ty}");
+                        }
+                        Some(idx) => idx,
+                    };
+
+                    // parse the fields in that feasible variant
+                    let variant_def = def.variant(variant_idx);
                     let mut fields = vec![];
                     for (field_idx, field_def) in variant_def.fields.iter_enumerated() {
                         let field_val =
@@ -518,7 +556,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     }
                     SolConst::Enum(SolVariantIndex(variant_idx.index()), fields)
                 }
-                _ => bug!("[invariant] the ADT definition is not a ZST struct: {ty}"),
+                _ => bug!("[invariant] the ADT definition is not a ZST: {ty}"),
             },
             ty::FnDef(def_id, generics) => {
                 let (kind, ident, ty_args) = self.make_type_function(*def_id, generics);
@@ -1546,7 +1584,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 match raw_ptr_kind {
                     RawPtrKind::Const => SolExpr::PointerImm(converted_place),
                     RawPtrKind::Mut => SolExpr::PointerMut(converted_place),
-                    RawPtrKind::FakeForPtrMetadata => bug!("[invariant] fake raw ptr not expected"),
+                    RawPtrKind::FakeForPtrMetadata => SolExpr::FakePointer(converted_place),
                 }
             }
             Rvalue::Len(place) => SolExpr::Length(self.mk_place(*place)),
@@ -2423,6 +2461,7 @@ pub(crate) enum SolExpr {
     BorrowMut(SolPlace),
     PointerImm(SolPlace),
     PointerMut(SolPlace),
+    FakePointer(SolPlace),
     Length(SolPlace),
     Cast { opcode: SolOpcodeCast, place: SolOperand, ty: SolType },
     OpNullary { opcode: SolOpcodeNullary, ty: SolType },
