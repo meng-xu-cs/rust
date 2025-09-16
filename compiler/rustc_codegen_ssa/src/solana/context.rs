@@ -476,11 +476,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
         match ty_const.kind() {
             TyConstKind::Value(val) => {
                 let const_ty = self.mk_type(val.ty);
-                let normalized_ty =
-                    self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), val.ty);
                 let const_val = if val.valtree.is_zst() {
-                    self.mk_val_const_from_zst(normalized_ty)
+                    self.mk_val_const_from_zst(val.ty)
                 } else {
+                    let normalized_ty = self
+                        .tcx
+                        .normalize_erasing_regions(TypingEnv::fully_monomorphized(), val.ty);
                     self.mk_typed_valtree(normalized_ty, val.valtree)
                 };
                 SolTyConst::Simple { ty: const_ty, val: const_val }
@@ -510,7 +511,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
     /// Create a constant if the type is a ZST
     fn mk_val_const_when_zst(&mut self, ty: Ty<'tcx>) -> Option<SolConst> {
-        let zst_val = match ty.kind() {
+        // normalize the type first
+        let normalized_ty =
+            self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
+
+        // check if it is a ZST based on the normalized type
+        let zst_val = match normalized_ty.kind() {
             ty::Tuple(elems) if elems.is_empty() => SolConst::Tuple(vec![]),
             ty::Array(elem_ty, length) => {
                 let count = length.try_to_target_usize(self.tcx)? as usize;
@@ -598,7 +604,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
     /// Create a value constant from a MIR scalar
     fn mk_val_const_from_scalar_val(&mut self, ty: Ty<'tcx>, val: ScalarInt) -> SolConst {
-        match ty.kind() {
+        // normalize the type first
+        let normalized_ty =
+            self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
+
+        // derive constant based on the normalized type
+        match normalized_ty.kind() {
             // value types
             ty::Bool => SolConst::Bool(!val.is_null()),
             ty::Char => SolConst::Char(val.to_u8() as char),
@@ -637,14 +648,14 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     // we need to drill down to the encoding
                     let layout = self
                         .tcx
-                        .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+                        .layout_of(TypingEnv::fully_monomorphized().as_query_input(normalized_ty))
                         .unwrap_or_else(|e| {
-                            bug!("[invariant] unable to get layout of type {ty}: {e}")
+                            bug!("[invariant] unable to get layout of type {normalized_ty}: {e}")
                         })
                         .layout;
 
                     if !matches!(layout.backend_repr, BackendRepr::Scalar(_)) {
-                        bug!("[invariant] {ty} is not represented as a scalar");
+                        bug!("[invariant] {normalized_ty} is not represented as a scalar");
                     }
 
                     match &layout.variants {
@@ -656,6 +667,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                         continue;
                                     }
 
+                                    // found the matching variant
                                     let variant_def = def.variant(variant_idx);
 
                                     // as discriminant is stored directly as the scalar value,
@@ -665,14 +677,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                         variant_def.fields.iter_enumerated()
                                     {
                                         let field_ty = field_def.ty(self.tcx, generics);
-                                        match self.mk_val_const_when_zst(field_ty) {
-                                            None => bug!(
-                                                "[invariant] expect ZST field {} in {ty} for tagged variant, got {field_ty}",
-                                                field_def.name
-                                            ),
-                                            Some(zst_val) => field_values
-                                                .push((SolFieldIndex(field_idx.index()), zst_val)),
-                                        }
+                                        let field_val = self.mk_val_const_from_zst(field_ty);
+                                        field_values
+                                            .push((SolFieldIndex(field_idx.index()), field_val));
                                     }
 
                                     return SolConst::Enum(
@@ -680,7 +687,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                         field_values,
                                     );
                                 }
-                                bug!("[invariant] no discriminant matches {tag_value} for {ty}");
+
+                                // no matching discriminant found
+                                bug!("[invariant] no discriminant {tag_value} in {normalized_ty}");
                             }
                             TagEncoding::Niche {
                                 untagged_variant,
@@ -707,15 +716,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                     for (field_idx, field_def) in variant.fields.iter_enumerated() {
                                         let field_ty = field_def.ty(self.tcx, generics);
                                         match (consumed, self.mk_val_const_when_zst(field_ty)) {
-                                            (true, Some(zst_val)) => {
-                                                field_values.push((
-                                                    SolFieldIndex(field_idx.index()),
-                                                    zst_val,
-                                                ));
-                                            }
                                             (true, None) => {
                                                 bug!(
-                                                    "[invariant] expect ZST field {} in {ty} after consuming the scalar",
+                                                    "[invariant] expect ZST field {} in enum type {normalized_ty}
+                                                    after consuming the scalar, got {field_ty}",
                                                     field_def.name
                                                 );
                                             }
@@ -728,7 +732,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                                 ));
                                                 consumed = true;
                                             }
-                                            (false, Some(zst_val)) => {
+                                            (_, Some(zst_val)) => {
                                                 field_values.push((
                                                     SolFieldIndex(field_idx.index()),
                                                     zst_val,
@@ -740,42 +744,54 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                     // for tagged variant, the scalar value is consumed as the tag
                                     for (field_idx, field_def) in variant.fields.iter_enumerated() {
                                         let field_ty = field_def.ty(self.tcx, generics);
-                                        match self.mk_val_const_when_zst(field_ty) {
-                                            None => bug!(
-                                                "[invariant] expect ZST field {} in {ty} for tagged variant, got {field_ty}",
-                                                field_def.name
-                                            ),
-                                            Some(zst_val) => field_values
-                                                .push((SolFieldIndex(field_idx.index()), zst_val)),
-                                        }
+                                        let field_val = self.mk_val_const_from_zst(field_ty);
+                                        field_values
+                                            .push((SolFieldIndex(field_idx.index()), field_val));
                                     }
-                                };
+                                }
 
                                 // done with the enum constant
                                 SolConst::Enum(SolVariantIndex(variant_idx.index()), field_values)
                             }
                         },
                         Variants::Empty | Variants::Single { .. } => {
-                            bug!("[invariant] expect multiple variants for scalar enum type {ty}")
+                            bug!("[invariant] not multiple variants for int enum {normalized_ty}");
                         }
                     }
                 }
-                AdtKind::Union => bug!("[unsupported] union type {ty} for scalar constant"),
+                AdtKind::Union => bug!("[unsupported] scalar union constant in {normalized_ty}"),
                 AdtKind::Struct => {
                     let fields = &def.non_enum_variant().fields;
-                    if fields.len() != 1 {
-                        bug!("[unsupported] {ty} is not single-field struct for scalar constant");
+
+                    let mut field_values = vec![];
+                    let mut consumed = false;
+                    for (field_idx, field_def) in fields.iter_enumerated() {
+                        let field_ty = field_def.ty(self.tcx, generics);
+                        match (consumed, self.mk_val_const_when_zst(field_ty)) {
+                            (true, None) => {
+                                bug!(
+                                    "[invariant] expect ZST field {} in {normalized_ty}, got {field_ty}",
+                                    field_def.name
+                                );
+                            }
+                            (false, None) => {
+                                let field_val = self.mk_val_const_from_scalar_val(field_ty, val);
+                                field_values.push((SolFieldIndex(field_idx.index()), field_val));
+                                consumed = true;
+                            }
+                            (_, Some(zst_val)) => {
+                                field_values.push((SolFieldIndex(field_idx.index()), zst_val));
+                            }
+                        }
                     }
-                    let field = fields.iter().next().unwrap();
-                    let field_ty = field.ty(self.tcx, generics);
-                    let field_val = self.mk_val_const_from_scalar_val(field_ty, val);
-                    SolConst::Struct(vec![(SolFieldIndex(0), field_val)])
+
+                    SolConst::Struct(field_values)
                 }
             },
 
             // all others
             _ => {
-                bug!("[invariant] unexpected type {ty} for value scalar constant {val}");
+                bug!("[invariant] unexpected type {normalized_ty} for value scalar constant {val}");
             }
         }
     }
@@ -804,32 +820,38 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 Some(value)
             };
 
+        // normalize the type first
+        let normalized_ty =
+            self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
+
         // get the layout of the type
         let layout = self
             .tcx
-            .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
-            .unwrap_or_else(|e| bug!("[invariant] unable to get layout of type {ty}: {e}"))
+            .layout_of(TypingEnv::fully_monomorphized().as_query_input(normalized_ty))
+            .unwrap_or_else(|e| {
+                bug!("[invariant] unable to get layout of type {normalized_ty}: {e}")
+            })
             .layout;
 
         // case by type
-        let parsed = match ty.kind() {
+        let parsed = match normalized_ty.kind() {
             // primitives
             ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) => {
                 match layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
-                    _ => bug!("[invariant] expect single 0-variant for value type {ty}"),
+                    _ => bug!("[invariant] expect a 0-variant for value type {normalized_ty}"),
                 }
                 if !matches!(layout.fields, FieldsShape::Primitive) {
-                    bug!("[invariant] expect a primitive field for value type {ty}");
+                    bug!("[invariant] expect a primitive field for value type {normalized_ty}");
                 }
 
                 let v = match read_primitive(self.tcx, offset, layout.size, false) {
                     Scalar::Int(scalar_int) => scalar_int,
                     Scalar::Ptr(..) => {
-                        bug!("[invariant] unexpected pointer scalar for value type {ty}")
+                        bug!("[invariant] unexpected ptr scalar for value type {normalized_ty}")
                     }
                 };
-                self.mk_val_const_from_scalar_val(ty, v)
+                self.mk_val_const_from_scalar_val(normalized_ty, v)
             }
 
             // pointers
@@ -837,7 +859,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 // sanity check on the variants
                 match &layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
-                    _ => bug!("[invariant] expect single 0-variant for pointer type {ty}"),
+                    _ => bug!("[invariant] expect a 0-variant for ptr type {normalized_ty}"),
                 }
 
                 // read and parse the pointer
@@ -850,8 +872,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         Some((parsed_prov, offset))
                     }
                     Scalar::Int(int) => {
-                        if !ty.is_raw_ptr() {
-                            bug!("[invariant] unexpected integer for non-ptr type {ty} in memory");
+                        if !normalized_ty.is_raw_ptr() {
+                            bug!("[invariant] unexpected scalar int for {normalized_ty} in memory");
                         }
                         if int.is_null() {
                             // the normal case when faced with a null pointer
@@ -859,7 +881,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         } else {
                             // a rare but possible case where the pointer is a constant integer
                             if layout.size != pointer_size {
-                                bug!("[invariant] invalid layout size for addr-ptr in type {ty}");
+                                bug!(
+                                    "[invariant] layout size does not match with pointer size
+                                    for addr-ptr in type {normalized_ty}"
+                                );
                             }
                             match &layout.backend_repr {
                                 BackendRepr::Scalar(ScalarAbi::Initialized {
@@ -867,7 +892,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                     valid_range: _,
                                 }) => (),
                                 _ => {
-                                    bug!("[invariant] invalid layout for addr-ptr in type {ty}");
+                                    bug!(
+                                        "[invariant] backend repr for addr-ptr is not
+                                        an initialized pointer in type {normalized_ty}"
+                                    );
                                 }
                             }
 
@@ -889,7 +917,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     // sanity check on the shape of the fields
                     if pointer_size * 2 != layout.size {
                         bug!(
-                            "[invariant] invalid layout size of ptr/ref type {ty}, expect metadata but got {}",
+                            "[invariant] invalid layout size for {normalized_ty},
+                            expect metadata but got {}",
                             layout.size.bytes_usize()
                         );
                     }
@@ -898,17 +927,17 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     let offset_metadata = match &layout.fields {
                         FieldsShape::Arbitrary { offsets, memory_index: _ } => {
                             if offsets.len() != 2 {
-                                bug!("[invariant] expect two fields for ptr/ref type {ty}");
+                                bug!("[invariant] expect two fields for {normalized_ty}");
                             }
                             let mut offsets_iter = offsets.into_iter();
                             let off_pointer = *offsets_iter.next().unwrap();
                             let off_metadata = *offsets_iter.next().unwrap();
                             if off_pointer.bytes_usize() != 0 || off_metadata != pointer_size {
-                                bug!("[invariant] unexpected offsets for ptr/ref type {ty}");
+                                bug!("[invariant] unexpected offsets for {normalized_ty}");
                             }
                             off_metadata
                         }
-                        _ => bug!("[invariant] expect arbitrary layout for ptr/ref type {ty}"),
+                        _ => bug!("[invariant] expect arbitrary layout for {normalized_ty}"),
                     };
 
                     // read the metadata
@@ -920,7 +949,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     ) {
                         Scalar::Int(scalar_int) => scalar_int.to_target_usize(self.tcx) as usize,
                         Scalar::Ptr(..) => {
-                            bug!("[invariant] unexpected pointer scalar for metadata for type {ty}")
+                            bug!("[invariant] unexpected scalar ptr metadata for {normalized_ty}")
                         }
                     };
                     let ptr_metadata = SolPtrMetadata(metadata);
@@ -938,7 +967,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         }
                         Some((parsed_prov, offset)) => {
                             // construct the constant based on mutability and whether it is a raw pointer
-                            match (parsed_prov, ty.is_raw_ptr()) {
+                            match (parsed_prov, normalized_ty.is_raw_ptr()) {
                                 (SolProvenance::Const(val), true) => {
                                     SolConst::PtrMetaSizedConst(ptr_metadata, val.into(), offset)
                                 }
@@ -964,12 +993,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     // sanity check on the shape of the fields
                     if pointer_size != layout.size {
                         bug!(
-                            "[invariant] invalid layout size of ptr/ref type {ty}, expect no metadata but got {}",
+                            "[invariant] invalid layout size for {normalized_ty},
+                            expect no metadata but got {}",
                             layout.size.bytes_usize()
                         );
                     }
                     if !matches!(layout.fields, FieldsShape::Primitive) {
-                        bug!("[invariant] expect a primitive field for pointer type {ty}");
+                        bug!("[invariant] expect a primitive field for {normalized_ty}");
                     }
 
                     // now create the pointer constant
@@ -980,7 +1010,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         },
                         Some((parsed_prov, offset)) => {
                             // construct the constant based on mutability and whether it is a raw pointer
-                            match (parsed_prov, ty.is_raw_ptr()) {
+                            match (parsed_prov, normalized_ty.is_raw_ptr()) {
                                 (SolProvenance::Const(val), true) => {
                                     SolConst::PtrSizedConst(val.into(), offset)
                                 }
@@ -1005,18 +1035,18 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
             }
 
-            // unsupported
+            // function pointer
             ty::FnPtr(..) => {
                 // sanity check on the variants
                 match &layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
-                    _ => bug!("[invariant] expect single 0-variant for fn-ptr type {ty}"),
+                    _ => bug!("[invariant] expect a 0-variant for fn-ptr type {normalized_ty}"),
                 }
 
                 // read and parse the pointer
                 let pointer_size = self.tcx.data_layout().pointer_size();
                 if layout.size != pointer_size {
-                    bug!("[invariant] unexpected layout size for function pointer type {ty}");
+                    bug!("[invariant] unexpected layout size for fn-ptr {normalized_ty}");
                 }
                 match read_primitive(self.tcx, offset, pointer_size, true) {
                     Scalar::Ptr(ptr, _) => {
@@ -1030,9 +1060,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 let (kind, ident, ty_args) = self.make_instance(instance);
                                 SolConst::FuncPtr(kind, ident, ty_args)
                             }
-                            _ => {
-                                bug!("[invariant] unexpected allocation for function pointer");
-                            }
+                            _ => bug!("[invariant] unexpected allocation for function pointer"),
                         }
                     }
                     Scalar::Int(int) => {
@@ -1048,7 +1076,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             ty::Array(elem_ty, _) => {
                 match &layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
-                    _ => bug!("[invariant] expect single 0-variant for array type {ty}"),
+                    _ => bug!("[invariant] expect a 0-variant for array type {normalized_ty}"),
                 }
                 match &layout.fields {
                     FieldsShape::Array { stride, count } => {
@@ -1064,13 +1092,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         }
                         SolConst::Array(elements)
                     }
-                    _ => bug!("[invariant] expect array field layout for array type {ty}"),
+                    _ => bug!("[invariant] expect array field layout for array {normalized_ty}"),
                 }
             }
             ty::Slice(elem_ty) => {
                 match &layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
-                    _ => bug!("[invariant] expect single 0-variant for slice type {ty}"),
+                    _ => bug!("[invariant] expect a 0-variant for slice type {normalized_ty}"),
                 }
                 match &layout.fields {
                     FieldsShape::Array { stride, count } => {
@@ -1086,13 +1114,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         }
                         SolConst::Slice(elements)
                     }
-                    _ => bug!("[invariant] expect an array field layout for slice type {ty}"),
+                    _ => bug!("[invariant] expect an array field layout for slice {normalized_ty}"),
                 }
             }
             ty::Str => {
                 match &layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
-                    _ => bug!("[invariant] expect single 0-variant for str type"),
+                    _ => bug!("[invariant] expect a 0-variant for str type"),
                 }
                 match &layout.fields {
                     FieldsShape::Array { stride, count } => {
@@ -1119,19 +1147,19 @@ impl<'tcx> SolContextBuilder<'tcx> {
             ty::Tuple(elem_tys) => {
                 match &layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
-                    _ => bug!("[invariant] expect a single 0-variant for tuple type {ty}"),
+                    _ => bug!("[invariant] expect a 0-variant for tuple type {normalized_ty}"),
                 }
                 match &layout.fields {
                     FieldsShape::Arbitrary { offsets, memory_index: _ } => {
                         if offsets.len() != elem_tys.len() {
-                            bug!("[invariant] field count mismatch for tuple type {ty}");
+                            bug!("[invariant] field count mismatch for tuple type {normalized_ty}");
                         }
 
                         let mut elements = vec![];
                         for (i, elem_ty) in elem_tys.iter().enumerate() {
                             let field_idx = FieldIdx::from_usize(i);
                             let field_offset = *offsets.get(field_idx).unwrap_or_else(|| {
-                                bug!("[invariant] no offset for field {i} in tuple type {ty}");
+                                bug!("[invariant] no offset for field {i} in {normalized_ty}");
                             });
                             let (_, elem) = self.read_const_from_memory_and_layout(
                                 memory,
@@ -1142,7 +1170,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         }
                         SolConst::Tuple(elements)
                     }
-                    _ => bug!("[invariant] expect an arbitrary field for tuple type {ty}"),
+                    _ => bug!("[invariant] expect arbitrary fields for tuple {normalized_ty}"),
                 }
             }
 
@@ -1159,19 +1187,20 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
                     match &layout.variants {
                         Variants::Single { index } if index.index() == 0 => {}
-                        _ => bug!("[invariant] expect a single 0-variant for array type {ty}"),
+                        _ => bug!("[invariant] expect a 0-variant for array type {normalized_ty}"),
                     }
                     match &layout.fields {
                         FieldsShape::Arbitrary { offsets, memory_index: _ } => {
                             if offsets.len() != field_details.len() {
-                                bug!("[invariant] field count mismatch for struct type {ty}");
+                                bug!("[invariant] field count mismatch for struct {normalized_ty}");
                             }
 
                             let mut elements = vec![];
                             for (field_idx, field_name, field_ty) in field_details {
                                 let field_offset = *offsets.get(field_idx).unwrap_or_else(|| {
                                     bug!(
-                                        "[invariant] no offset for field {field_name} in struct type {ty}",
+                                        "[invariant] no offset for field {field_name}
+                                        in struct {normalized_ty}",
                                     );
                                 });
                                 let (_, elem) = self.read_const_from_memory_and_layout(
@@ -1183,13 +1212,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             }
                             SolConst::Struct(elements)
                         }
-                        _ => bug!("[invariant] expect an arbitrary field for struct type {ty}"),
+                        _ => bug!("[invariant] expect arbitrary fields for struct {normalized_ty}"),
                     }
                 }
                 AdtKind::Union => {
                     match &layout.variants {
                         Variants::Single { index } if index.index() == 0 => {}
-                        _ => bug!("[invariant] expect a single 0-variant for union type {ty}"),
+                        _ => bug!("[invariant] expect a 0-variant for union {normalized_ty}"),
                     }
                     let union_value = match &layout.fields {
                         FieldsShape::Union(..) => match &layout.backend_repr {
@@ -1201,9 +1230,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                     matches!(value, Primitive::Pointer(_)),
                                 )
                             }
-                            _ => bug!("[invariant] expect scalar-union layout for type {ty}"),
+                            _ => bug!("[invariant] expect scalar-union layout for {normalized_ty}"),
                         },
-                        _ => bug!("[invariant] expect a union field for union type {ty}"),
+                        _ => bug!("[invariant] expect a union field for {normalized_ty}"),
                     };
 
                     // expect only two fields in the union: a ZST and a non-ZST
@@ -1216,7 +1245,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
                     if field_details.len() != 2 {
                         bug!(
-                            "[invariant] expect only two variants in union type {ty}, found {}",
+                            "[invariant] expect two variants in union {normalized_ty}, found {}",
                             field_details.len()
                         );
                     }
@@ -1226,10 +1255,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     let (field_zst_idx, field_zst_ty, field_val_idx, field_val_ty) =
                         match (self.is_ty_zst(f1_ty), self.is_ty_zst(f2_ty)) {
                             (true, true) => {
-                                bug!("[invariant] expect one ZST in union {ty}, got two")
+                                bug!("[invariant] found two ZST in union {normalized_ty}")
                             }
                             (false, false) => {
-                                bug!("[invariant] expect one ZST in union {ty}, got none")
+                                bug!("[invariant] found no ZST in union {normalized_ty}")
                             }
                             (true, false) => (f1_idx, f1_ty, f2_idx, f2_ty),
                             (false, true) => (f2_idx, f2_ty, f1_idx, f1_ty),
@@ -1256,18 +1285,20 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             let tag_type = match tag {
                                 ScalarAbi::Initialized { value, valid_range: _ } => value,
                                 ScalarAbi::Union { .. } => {
-                                    bug!("[invariant] unexpected tag specification for type {ty}");
+                                    bug!("[invariant] unexpected tag spec for {normalized_ty}");
                                 }
                             };
 
                             // get the offset for the tag field
-                            let tag_offset =  match &layout.fields {
+                            let tag_offset = match &layout.fields {
                                 FieldsShape::Arbitrary { offsets, memory_index: _ } => {
                                     *offsets.get(*tag_field).unwrap_or_else(|| {
-                                        bug!("[invariant] no offset for tag field in constant for type {ty}");
+                                        bug!("[invariant] no offset for tag field for {normalized_ty}");
                                     })
                                 }
-                                _ => bug!("[invariant] tagged variants does not have field specification"),
+                                _ => bug!(
+                                    "[invariant] tagged variants does not have field spec in {normalized_ty}"
+                                ),
                             };
 
                             // parse the tag value
@@ -1295,7 +1326,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                             }
                                             VariantDiscr::Explicit(did) => {
                                                 let discr = def.eval_explicit_discr(self.tcx, did).unwrap_or_else(|_| {
-                                                    bug!("[invariant] failed to evaluate discriminant for enum {ty}");
+                                                    bug!("[invariant] failed to evaluate discriminant for {normalized_ty}");
                                                 });
                                                 last_discr_value = discr.val;
                                                 discr.val
@@ -1307,7 +1338,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                         }
                                     }
                                     variant_idx_found.unwrap_or_else(|| {
-                                        bug!("[invariant] invalid discriminant {tag_value} for enum type {ty}");
+                                        bug!("[invariant] invalid discriminant {tag_value} for {normalized_ty}");
                                     })
                                 }
                                 TagEncoding::Niche {
@@ -1330,7 +1361,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             // get variant layout
                             let variant_layout = variants.get(variant_idx).unwrap_or_else(|| {
                                 bug!(
-                                    "[invariant] invalid variant index {} for type {ty}",
+                                    "[invariant] invalid variant index {} for {normalized_ty}",
                                     variant_idx.index()
                                 )
                             });
@@ -1339,7 +1370,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             (variant_idx, variant_layout)
                         }
                         Variants::Empty | Variants::Single { .. } => {
-                            bug!("[invariant] expect multiple variants for enum type {ty}")
+                            bug!("[invariant] expect multiple variants for {normalized_ty}")
                         }
                     };
 
@@ -1350,7 +1381,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     if !matches!(variant_layout.variants, Variants::Single { index } if index == variant_idx)
                     {
                         bug!(
-                            "[invariant] expect single indexed({})-variant for enum variant of type {ty}",
+                            "[invariant] expect an indexed({})-variant for enum variant in {normalized_ty}",
                             variant_idx.index()
                         );
                     }
@@ -1360,14 +1391,14 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         FieldsShape::Arbitrary { offsets, memory_index: _ } => {
                             if offsets.len() != variant_def.fields.len() {
                                 bug!(
-                                    "[invariant] field count mismatch for variant {} in type {ty}",
+                                    "[invariant] field count mismatch for variant {} in {normalized_ty}",
                                     variant_def.name
                                 );
                             }
                             offsets
                         }
                         _ => bug!(
-                            "[invariant] expect an arbitrary field for enum variant of type {ty}"
+                            "[invariant] expect an arbitrary field for enum variant in {normalized_ty}"
                         ),
                     };
 
@@ -1376,7 +1407,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     for (field_idx, field_def) in variant_def.fields.iter_enumerated() {
                         let field_offset = *field_offsets.get(field_idx).unwrap_or_else(|| {
                             bug!(
-                                "[invariant] no offset for field {} in enum type {ty} variant {}",
+                                "[invariant] no offset for field {} in {normalized_ty} variant {}",
                                 field_def.name,
                                 variant_def.name
                             );
@@ -1409,7 +1440,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             | ty::Infer(..)
             | ty::Placeholder(..)
             | ty::Error(..) => {
-                bug!("[invariant] unexpected type in memory allocation: {ty}");
+                bug!("[invariant] unexpected type in memory allocation: {normalized_ty}");
             }
         };
 
@@ -1419,18 +1450,23 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
     /// Create a constant known in the value system together with its type
     fn mk_val_const_with_ty(&mut self, val_const: ConstValue, ty: Ty<'tcx>) -> SolConst {
+        // normalize the type first
+        let normalized_ty =
+            self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
+
+        // switch by the kind of constant value
         match val_const {
-            ConstValue::ZeroSized => self.mk_val_const_from_zst(ty),
-            ConstValue::Scalar(scalar) => match ty.kind() {
+            ConstValue::ZeroSized => self.mk_val_const_from_zst(normalized_ty),
+            ConstValue::Scalar(scalar) => match normalized_ty.kind() {
                 // value types
                 ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Adt(..) => {
                     let val = match scalar {
                         Scalar::Int(scalar_int) => scalar_int,
                         Scalar::Ptr(..) => {
-                            bug!("[invariant] unexpected pointer scalar for value type {ty}");
+                            bug!("[invariant] unexpected ptr scalar for {normalized_ty}");
                         }
                     };
-                    self.mk_val_const_from_scalar_val(ty, val)
+                    self.mk_val_const_from_scalar_val(normalized_ty, val)
                 }
 
                 // pointers or references
@@ -1444,11 +1480,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     let ptr = match scalar {
                         Scalar::Ptr(scalar_ptr, _) => scalar_ptr,
                         Scalar::Int(scalar_int) => {
-                            if !ty.is_raw_ptr() {
-                                bug!("[invariant] unexpected int scalar for non-ptr type {ty}");
+                            if !normalized_ty.is_raw_ptr() {
+                                bug!("[invariant] got int scalar for non-ptr type {normalized_ty}");
                             }
                             if !scalar_int.is_null() {
-                                bug!("[invariant] unexpected non-null for pointer type {ty}");
+                                bug!("[invariant] got non-null for pointer type {normalized_ty}");
                             }
 
                             // shortcut and early return for null pointers
@@ -1466,7 +1502,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     let parsed_prov = self.make_provenance(prov, *sub_ty, *mutability);
 
                     // construct the constant based on mutability and whether it is a raw pointer
-                    match (parsed_prov, ty.is_raw_ptr()) {
+                    match (parsed_prov, normalized_ty.is_raw_ptr()) {
                         (SolProvenance::Const(val), true) => {
                             SolConst::PtrSizedConst(val.into(), offset)
                         }
@@ -1495,7 +1531,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
                 // all others
                 _ => {
-                    bug!("[assumption] unexpected type {ty} for scalar {scalar}");
+                    bug!("[assumption] unexpected type {normalized_ty} for scalar {scalar}");
                 }
             },
             ConstValue::Slice { alloc_id, meta } => {
@@ -1507,9 +1543,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     bug!("[invariant] slice const refers to a mutable memory allocation");
                 }
 
-                let slice_ty = match ty.kind() {
+                let slice_ty = match normalized_ty.kind() {
                     ty::Ref(_, sub_ty, Mutability::Not) => sub_ty,
-                    _ => bug!("[invariant] unexpected type for slice const: {ty}"),
+                    _ => bug!("[invariant] unexpected type for slice const: {normalized_ty}"),
                 };
                 match slice_ty.kind() {
                     ty::Slice(elem_ty) => {
@@ -1539,7 +1575,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             bug!("[invariant] non utf-8 string constant: {e}");
                         }))
                     }
-                    _ => bug!("[invariant] unexpected type for slice const: {ty}"),
+                    _ => bug!("[invariant] unexpected type for slice const: {normalized_ty}"),
                 }
             }
             ConstValue::Indirect { alloc_id, offset } => {
@@ -1550,7 +1586,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 if !matches!(memory.mutability, Mutability::Not) {
                     bug!("[invariant] indirect const refers to a mutable memory allocation");
                 }
-                let (_, parsed) = self.read_const_from_memory_and_layout(memory, offset, ty);
+                let (_, parsed) =
+                    self.read_const_from_memory_and_layout(memory, offset, normalized_ty);
                 parsed
             }
         }
@@ -1574,11 +1611,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
             OpConst::Val(val_const, ty) => {
                 let const_ty = self.mk_type(ty);
-
-                let normalized_ty =
-                    self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
-                let const_val = self.mk_val_const_with_ty(val_const, normalized_ty);
-
+                let const_val = self.mk_val_const_with_ty(val_const, ty);
                 SolOpConst::Value(const_ty, const_val)
             }
             OpConst::Unevaluated(unevaluated, ty) => {
@@ -1590,11 +1623,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     });
 
                 let const_ty = self.mk_type(ty);
-
-                let normalized_ty =
-                    self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
-                let const_val = self.mk_val_const_with_ty(val_const, normalized_ty);
-
+                let const_val = self.mk_val_const_with_ty(val_const, ty);
                 SolOpConst::Value(const_ty, const_val)
             }
         }
