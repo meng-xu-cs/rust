@@ -93,12 +93,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
     }
 
     /// Whether a type is a ZST
-    fn is_ty_zst(&self, ty: Ty<'tcx>) -> bool {
+    fn type_layout_size(&self, ty: Ty<'tcx>) -> Size {
         match self.tcx.layout_of(TypingEnv::fully_monomorphized().as_query_input(ty)) {
-            Ok(layout) => layout.layout.is_zst(),
-            Err(_) => {
-                bug!("[invariant] unable to get layout of type {ty}");
-            }
+            Ok(layout) => layout.layout.size,
+            Err(_) => bug!("[invariant] unable to get layout of type {ty}"),
         }
     }
 
@@ -839,6 +837,21 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
             },
 
+            // raw pointers which can be null
+            ty::RawPtr(sub_ty, mutability) => {
+                // we only know how to convert a scalar to a sized reference/pointer for now
+                if !sub_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized()) {
+                    bug!("[unsupported] unsized pointee type {sub_ty} as const value scalar");
+                }
+
+                // it is possible that the pointer value is not null (even for a null pointer)
+                let null_mark = val.to_target_usize(self.tcx) as usize;
+                match mutability {
+                    Mutability::Not => SolConst::PtrSizedNullImm(null_mark),
+                    Mutability::Mut => SolConst::PtrSizedNullMut(null_mark),
+                }
+            }
+
             // all others
             _ => {
                 bug!("[invariant] unexpected type {normalized_ty} for value scalar constant {val}");
@@ -970,17 +983,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 bug!("[invariant] failed to read a primitive in memory allocation: {e:?}")
             })
         };
-        let read_primitive_if_initialized =
-            |tcx: TyCtxt<'tcx>, start, size: Size, is_provenane: bool| {
-                let range = AllocRange { start, size };
-                if memory.init_mask().is_range_initialized(range).is_err() {
-                    return None;
-                }
-                let value = memory.read_scalar(&tcx, range, is_provenane).unwrap_or_else(|e| {
-                    bug!("[invariant] failed to read a primitive in memory allocation after range check: {e:?}")
-                });
-                Some(value)
-            };
 
         // normalize the type first
         let normalized_ty =
@@ -1031,42 +1033,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         let (prov, offset) = ptr.into_raw_parts();
                         let offset = SolOffset(offset.bytes_usize());
                         let parsed_prov = self.make_provenance(prov, *sub_ty, *mutability);
-                        Some((parsed_prov, offset))
+                        Ok((parsed_prov, offset))
                     }
                     Scalar::Int(int) => {
                         if !normalized_ty.is_raw_ptr() {
                             bug!("[invariant] unexpected scalar int for {normalized_ty} in memory");
                         }
-                        if int.is_null() {
-                            // the normal case when faced with a null pointer
-                            None
-                        } else {
-                            // a rare but possible case where the pointer is a constant integer
-                            if layout.size != pointer_size {
-                                bug!(
-                                    "[invariant] layout size does not match with pointer size
-                                    for addr-ptr in type {normalized_ty}"
-                                );
-                            }
-                            match &layout.backend_repr {
-                                BackendRepr::Scalar(ScalarAbi::Initialized {
-                                    value: Primitive::Pointer(_),
-                                    valid_range: _,
-                                }) => (),
-                                _ => {
-                                    bug!(
-                                        "[invariant] backend repr for addr-ptr is not
-                                        an initialized pointer in type {normalized_ty}"
-                                    );
-                                }
-                            }
-
-                            // sanity check passed, short-circuit parsing from here
-                            return (
-                                layout.size,
-                                SolConst::PtrAddress(int.to_target_usize(self.tcx) as usize),
-                            );
-                        }
+                        Err(int.to_target_usize(self.tcx) as usize)
                     }
                 };
 
@@ -1118,16 +1091,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
                     // now create the pointer constant
                     match pointer_parsed {
-                        None => {
-                            if metadata != 0 {
-                                bug!("[invariant] unexpected non-zero metadata for null pointers");
-                            }
-                            match mutability {
-                                Mutability::Not => SolConst::PtrMetaSizedNullImm,
-                                Mutability::Mut => SolConst::PtrMetaSizedNullMut,
-                            }
-                        }
-                        Some((parsed_prov, offset)) => {
+                        Ok((parsed_prov, offset)) => {
                             // construct the constant based on mutability and whether it is a raw pointer
                             match (parsed_prov, normalized_ty.is_raw_ptr()) {
                                 (SolProvenance::Const(val), true) => {
@@ -1150,6 +1114,15 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 }
                             }
                         }
+                        Err(null_mark) => {
+                            if metadata != 0 {
+                                bug!("[invariant] unexpected non-zero metadata for null pointers");
+                            }
+                            match mutability {
+                                Mutability::Not => SolConst::PtrMetaSizedNullImm(null_mark),
+                                Mutability::Mut => SolConst::PtrMetaSizedNullMut(null_mark),
+                            }
+                        }
                     }
                 } else {
                     // sanity check on the shape of the fields
@@ -1166,11 +1139,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
                     // now create the pointer constant
                     match pointer_parsed {
-                        None => match mutability {
-                            Mutability::Not => SolConst::PtrSizedNullImm,
-                            Mutability::Mut => SolConst::PtrSizedNullMut,
-                        },
-                        Some((parsed_prov, offset)) => {
+                        Ok((parsed_prov, offset)) => {
                             // construct the constant based on mutability and whether it is a raw pointer
                             match (parsed_prov, normalized_ty.is_raw_ptr()) {
                                 (SolProvenance::Const(val), true) => {
@@ -1193,6 +1162,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 }
                             }
                         }
+                        Err(null_mark) => match mutability {
+                            Mutability::Not => SolConst::PtrSizedNullImm(null_mark),
+                            Mutability::Mut => SolConst::PtrSizedNullMut(null_mark),
+                        },
                     }
                 }
             }
@@ -1382,22 +1355,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         Variants::Single { index } if index.index() == 0 => {}
                         _ => bug!("[invariant] expect a 0-variant for union {normalized_ty}"),
                     }
-                    let union_value = match &layout.fields {
-                        FieldsShape::Union(..) => match &layout.backend_repr {
-                            BackendRepr::Scalar(ScalarAbi::Union { value }) => {
-                                read_primitive_if_initialized(
-                                    self.tcx,
-                                    offset,
-                                    layout.size,
-                                    matches!(value, Primitive::Pointer(_)),
-                                )
-                            }
-                            _ => bug!("[invariant] expect scalar-union layout for {normalized_ty}"),
-                        },
-                        _ => bug!("[invariant] expect a union field for {normalized_ty}"),
-                    };
+                    if !matches!(layout.fields, FieldsShape::Union(..)) {
+                        bug!("[invariant] expect union fields for {normalized_ty}");
+                    }
 
-                    // expect only two fields in the union: a ZST and a non-ZST
+                    // expect only two fields in the union: one that matches the layout size and another that does not
                     let field_details = def
                         .non_enum_variant()
                         .fields
@@ -1407,37 +1369,41 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
                     if field_details.len() != 2 {
                         bug!(
-                            "[invariant] expect two variants in union {normalized_ty}, found {}",
+                            "[invariant] expect two variants in union {normalized_ty} only, found {}",
                             field_details.len()
                         );
                     }
                     let (f1_idx, f1_ty) = field_details[0];
                     let (f2_idx, f2_ty) = field_details[1];
 
-                    let (field_zst_idx, field_zst_ty, field_val_idx, field_val_ty) =
-                        match (self.is_ty_zst(f1_ty), self.is_ty_zst(f2_ty)) {
-                            (true, true) => {
-                                bug!("[invariant] found two ZST in union {normalized_ty}")
-                            }
-                            (false, false) => {
-                                bug!("[invariant] found no ZST in union {normalized_ty}")
-                            }
-                            (true, false) => (f1_idx, f1_ty, f2_idx, f2_ty),
-                            (false, true) => (f2_idx, f2_ty, f1_idx, f1_ty),
-                        };
+                    let (field_match_idx, field_match_ty, field_value_idx, field_value_ty) = match (
+                        self.type_layout_size(f1_ty) == layout.size,
+                        self.type_layout_size(f2_ty) == layout.size,
+                    ) {
+                        (true, true) => {
+                            bug!("[invariant] found two matches in union {normalized_ty}");
+                        }
+                        (false, false) => {
+                            bug!("[invariant] found no matches in union {normalized_ty}");
+                        }
+                        (true, false) => (f1_idx, f1_ty, f2_idx, f2_ty),
+                        (false, true) => (f2_idx, f2_ty, f1_idx, f1_ty),
+                    };
 
-                    // build the union based on the value
-                    match union_value {
-                        None => SolConst::Union(
-                            SolFieldIndex(field_zst_idx.as_usize()),
-                            Box::new(self.mk_val_const_from_zst(field_zst_ty)),
-                        ),
-                        Some(val) => SolConst::Union(
-                            SolFieldIndex(field_val_idx.as_usize()),
-                            Box::new(
-                                self.mk_val_const_with_ty(ConstValue::Scalar(val), field_val_ty),
-                            ),
-                        ),
+                    // check whether the entire range is initialized
+                    let range = AllocRange { start: offset, size: layout.size };
+                    let initialized = memory.init_mask().is_range_initialized(range).is_ok();
+
+                    if initialized {
+                        // parse as the matched variant
+                        let (_, val) =
+                            self.read_const_from_memory_and_layout(memory, offset, field_match_ty);
+                        SolConst::Union(SolFieldIndex(field_match_idx.as_usize()), Box::new(val))
+                    } else {
+                        // parse as the alternative variant
+                        let (_, val) =
+                            self.read_const_from_memory_and_layout(memory, offset, field_value_ty);
+                        SolConst::Union(SolFieldIndex(field_value_idx.as_usize()), Box::new(val))
                     }
                 }
                 AdtKind::Enum => {
@@ -1643,14 +1609,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             if !normalized_ty.is_raw_ptr() {
                                 bug!("[invariant] got int scalar for non-ptr type {normalized_ty}");
                             }
-                            if !scalar_int.is_null() {
-                                bug!("[invariant] got non-null for pointer type {normalized_ty}");
-                            }
 
                             // shortcut and early return for null pointers
+                            let null_mark = scalar_int.to_target_usize(self.tcx) as usize;
                             return match mutability {
-                                Mutability::Not => SolConst::PtrSizedNullImm,
-                                Mutability::Mut => SolConst::PtrSizedNullMut,
+                                Mutability::Not => SolConst::PtrSizedNullImm(null_mark),
+                                Mutability::Mut => SolConst::PtrSizedNullMut(null_mark),
                             };
                         }
                     };
@@ -1685,9 +1649,28 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
 
                 // function pointers
-                ty::FnPtr(..) => {
-                    bug!("[unsupported] function pointer for scalar integer constant");
-                }
+                ty::FnPtr(..) => match scalar {
+                    Scalar::Ptr(scalar_ptr, _) => {
+                        let (prov, offset) = scalar_ptr.into_raw_parts();
+                        if offset != Size::ZERO {
+                            bug!("[invariant] unexpected non-zero offset for function pointer");
+                        }
+
+                        match self.tcx.global_alloc(prov.alloc_id()) {
+                            GlobalAlloc::Function { instance } => {
+                                let (kind, ident, ty_args) = self.make_instance(instance);
+                                SolConst::FuncPtr(kind, ident, ty_args)
+                            }
+                            _ => bug!("[invariant] unexpected allocation for function pointer"),
+                        }
+                    }
+                    Scalar::Int(scalar_int) => {
+                        if !scalar_int.is_null() {
+                            bug!("[invariant] unexpected non-null integer for function pointer");
+                        }
+                        SolConst::FuncPtrNull
+                    }
+                },
 
                 // all others
                 _ => {
@@ -2987,13 +2970,10 @@ pub(crate) enum SolConst {
     PtrMetaSizedVarImm(SolPtrMetadata, SolIdent, SolOffset),
     PtrMetaSizedVarMut(SolPtrMetadata, SolIdent, SolOffset),
 
-    PtrSizedNullImm,
-    PtrSizedNullMut,
-    PtrMetaSizedNullImm,
-    PtrMetaSizedNullMut,
-
-    /* special */
-    PtrAddress(usize),
+    PtrSizedNullImm(usize),
+    PtrSizedNullMut(usize),
+    PtrMetaSizedNullImm(usize),
+    PtrMetaSizedNullMut(usize),
 
     /* function pointers */
     FuncPtrNull,
