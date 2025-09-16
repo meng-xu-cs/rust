@@ -2344,7 +2344,11 @@ impl<'tcx> SolContextBuilder<'tcx> {
         );
 
         // dump the instance info
-        self.sol.save_instance_info(self.tcx, &body);
+        self.sol.save_instance_info(
+            self.tcx,
+            &body,
+            format!("{}::{}::{}", ident.krate.0, ident.local.0, def_desc.0),
+        );
 
         // convert function signatures
         let mut args = vec![];
@@ -2400,10 +2404,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
     ) -> SolProvenance {
         match self.tcx.global_alloc(prov.alloc_id()) {
             GlobalAlloc::Memory(allocated) => {
-                if !matches!(mutability, Mutability::Not) {
-                    bug!("[assumption] mutable memory allocation in provenance");
-                }
-
                 let (_, const_val) =
                     self.read_const_from_memory_and_layout(allocated.inner(), Size::ZERO, ty);
                 SolProvenance::Const(const_val)
