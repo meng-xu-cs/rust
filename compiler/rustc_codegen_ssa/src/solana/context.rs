@@ -640,7 +640,30 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 FloatTy::F128 => SolConst::Float(SolConstFloat::F128(val.to_f128().to_string())),
             },
 
-            // single-field datatype
+            // valid-field datatype
+            ty::Tuple(elem_tys) => {
+                let mut elem_values = vec![];
+                let mut consumed = false;
+                for elem_ty in elem_tys.iter() {
+                    match (consumed, self.mk_val_const_when_zst(elem_ty)) {
+                        (true, None) => {
+                            bug!(
+                                "[invariant] expect ZST elem {} in {normalized_ty}, got {elem_ty}",
+                                elem_ty
+                            );
+                        }
+                        (false, None) => {
+                            let elem_val = self.mk_val_const_from_scalar_val(elem_ty, val);
+                            elem_values.push(elem_val);
+                            consumed = true;
+                        }
+                        (_, Some(zst_val)) => {
+                            elem_values.push(zst_val);
+                        }
+                    }
+                }
+                SolConst::Tuple(elem_values)
+            }
             ty::Adt(def, generics) => match def.adt_kind() {
                 AdtKind::Enum => {
                     let tag_value = val.to_bits_unchecked();
@@ -792,6 +815,118 @@ impl<'tcx> SolContextBuilder<'tcx> {
             // all others
             _ => {
                 bug!("[invariant] unexpected type {normalized_ty} for value scalar constant {val}");
+            }
+        }
+    }
+
+    /// Create a value constant from a MIR scalar pointer
+    fn mk_val_const_from_scalar_ptr(
+        &mut self,
+        ty: Ty<'tcx>,
+        prov: CtfeProvenance,
+        offset: Size,
+    ) -> SolConst {
+        // normalize the type first
+        let normalized_ty =
+            self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
+
+        // derive constant based on the normalized type
+        match normalized_ty.kind() {
+            // packed types
+            ty::Tuple(elem_tys) => {
+                let mut elem_values = vec![];
+                let mut consumed = false;
+                for elem_ty in elem_tys.iter() {
+                    match (consumed, self.mk_val_const_when_zst(elem_ty)) {
+                        (true, None) => {
+                            bug!(
+                                "[invariant] expect ZST elem {} in {normalized_ty}, got {elem_ty}",
+                                elem_ty
+                            );
+                        }
+                        (false, None) => {
+                            let elem_val = self.mk_val_const_from_scalar_ptr(elem_ty, prov, offset);
+                            elem_values.push(elem_val);
+                            consumed = true;
+                        }
+                        (_, Some(zst_val)) => {
+                            elem_values.push(zst_val);
+                        }
+                    }
+                }
+                SolConst::Tuple(elem_values)
+            }
+            ty::Adt(def, generics) => match def.adt_kind() {
+                AdtKind::Struct => {
+                    let fields = &def.non_enum_variant().fields;
+
+                    let mut field_values = vec![];
+                    let mut consumed = false;
+                    for (field_idx, field_def) in fields.iter_enumerated() {
+                        let field_ty = field_def.ty(self.tcx, generics);
+                        match (consumed, self.mk_val_const_when_zst(field_ty)) {
+                            (true, None) => {
+                                bug!(
+                                    "[invariant] expect ZST field {} in {normalized_ty}, got {field_ty}",
+                                    field_def.name
+                                );
+                            }
+                            (false, None) => {
+                                let field_val =
+                                    self.mk_val_const_from_scalar_ptr(field_ty, prov, offset);
+                                field_values.push((SolFieldIndex(field_idx.index()), field_val));
+                                consumed = true;
+                            }
+                            (_, Some(zst_val)) => {
+                                field_values.push((SolFieldIndex(field_idx.index()), zst_val));
+                            }
+                        }
+                    }
+
+                    SolConst::Struct(field_values)
+                }
+                AdtKind::Union => bug!("[unsupported] ptr scalar for union {normalized_ty}"),
+                AdtKind::Enum => bug!("[unsupported] ptr scalar for enum {normalized_ty}"),
+            },
+
+            // pointers or references
+            ty::Ref(_, sub_ty, mutability) | ty::RawPtr(sub_ty, mutability) => {
+                // we only know how to convert a scalar to a sized reference/pointer for now
+                if !sub_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized()) {
+                    bug!("[unsupported] unsized pointee type {sub_ty} as const scalar pointer");
+                }
+
+                // try to probe the memory behind the pointer
+                let parsed_prov = self.make_provenance(prov, *sub_ty, *mutability);
+
+                // construct the constant based on mutability and whether it is a raw pointer
+                let offset = SolOffset(offset.bytes_usize());
+                match (parsed_prov, normalized_ty.is_raw_ptr()) {
+                    (SolProvenance::Const(val), true) => {
+                        SolConst::PtrSizedConst(val.into(), offset)
+                    }
+                    (SolProvenance::Const(val), false) => {
+                        SolConst::RefSizedConst(val.into(), offset)
+                    }
+                    (SolProvenance::VarImm(ident), true) => SolConst::PtrSizedVarImm(ident, offset),
+                    (SolProvenance::VarImm(ident), false) => {
+                        SolConst::RefSizedVarImm(ident, offset)
+                    }
+                    (SolProvenance::VarMut(ident), true) => SolConst::PtrSizedVarMut(ident, offset),
+                    (SolProvenance::VarMut(ident), false) => {
+                        SolConst::RefSizedVarMut(ident, offset)
+                    }
+                }
+            }
+
+            // function pointers
+            ty::FnPtr(..) => {
+                bug!("[unsupported] function pointer for scalar pointer constant");
+            }
+
+            // all others
+            _ => {
+                bug!("[invariant] unexpected type {normalized_ty} for ptr scalar {prov:?}");
             }
         }
     }
@@ -1458,8 +1593,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
         match val_const {
             ConstValue::ZeroSized => self.mk_val_const_from_zst(normalized_ty),
             ConstValue::Scalar(scalar) => match normalized_ty.kind() {
-                // value types
-                ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Adt(..) => {
+                // basic types
+                ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) => {
                     let val = match scalar {
                         Scalar::Int(scalar_int) => scalar_int,
                         Scalar::Ptr(..) => {
@@ -1468,6 +1603,17 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     };
                     self.mk_val_const_from_scalar_val(normalized_ty, val)
                 }
+
+                // adt
+                ty::Adt(..) => match scalar {
+                    Scalar::Int(scalar_int) => {
+                        self.mk_val_const_from_scalar_val(normalized_ty, scalar_int)
+                    }
+                    Scalar::Ptr(scalar_ptr, _) => {
+                        let (prov, offset) = scalar_ptr.into_raw_parts();
+                        self.mk_val_const_from_scalar_ptr(normalized_ty, prov, offset)
+                    }
+                },
 
                 // pointers or references
                 ty::Ref(_, sub_ty, mutability) | ty::RawPtr(sub_ty, mutability) => {
@@ -1526,7 +1672,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
                 // function pointers
                 ty::FnPtr(..) => {
-                    bug!("[unsupported] function pointer for scalar constant");
+                    bug!("[unsupported] function pointer for scalar integer constant");
                 }
 
                 // all others
