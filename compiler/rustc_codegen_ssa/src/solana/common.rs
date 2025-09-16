@@ -174,9 +174,19 @@ impl SolEnv {
         self.output_dir.join(phase.to_string())
     }
 
-    pub(crate) fn save_instance_info<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
+    pub(crate) fn save_instance_info<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ident: String,
+    ) {
         // prepare for output directory
         let instance_outdir = self.fresh_output_dir("i");
+
+        // dump the identity to file
+        fs::write(instance_outdir.join("identity.txt"), ident).unwrap_or_else(|e| {
+            bug!("[invariant] failed to write identity to file: {e}");
+        });
 
         // dump the MIR to file
         let mut file_mir = File::create(instance_outdir.join("body.mir"))
