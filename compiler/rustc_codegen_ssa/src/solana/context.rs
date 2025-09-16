@@ -454,9 +454,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
     fn mk_typed_valtree(&mut self, ty: Ty<'tcx>, tree: ValTree<'tcx>) -> SolConst {
         match tree.try_to_scalar() {
             None => match tree.try_to_branch() {
-                None => {
-                    bug!("[invariant] non-scalar non-branch valtree {tree:?} with type {ty}");
-                }
+                None => bug!("[invariant] non-scalar non-branch valtree {tree:?}"),
                 Some(branches) => {
                     if branches.len() != 1 {
                         bug!("[unsupported] multi-branch valtree {branches:#?} with type {ty}");
@@ -465,8 +463,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
             },
             Some(Scalar::Int(scalar_int)) => self.mk_val_const_from_scalar_val(ty, scalar_int),
-            Some(Scalar::Ptr(..)) => {
-                bug!("[unsupported] pointer as valtree constant {tree:?} in type {ty}")
+            Some(Scalar::Ptr(scalar_ptr, _)) => {
+                bug!("[unsupported] pointer as valtree constant {scalar_ptr:?} in type {ty}")
             }
         }
     }
@@ -517,14 +515,35 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
         // check if it is a ZST based on the normalized type
         let zst_val = match normalized_ty.kind() {
-            ty::Tuple(elems) if elems.is_empty() => SolConst::Tuple(vec![]),
+            ty::Tuple(elems) => {
+                // a tuple is a ZST if all its elements are ZSTs (including the empty tuple)
+                let mut elem_vals = vec![];
+                for elem_ty in elems.iter() {
+                    let elem_val = self.mk_val_const_when_zst(elem_ty)?;
+                    elem_vals.push(elem_val);
+                }
+                SolConst::Tuple(elem_vals)
+            }
             ty::Array(elem_ty, length) => {
-                let count = length.try_to_target_usize(self.tcx)? as usize;
-                if count == 0 {
-                    SolConst::Array(vec![])
-                } else {
-                    let elem_val = self.mk_val_const_from_zst(*elem_ty);
-                    SolConst::Array(vec![elem_val; count])
+                // an array is a ZST if its element type is a ZST or its length is zero
+                let parsed_length = self.mk_ty_const(*length);
+                match self.mk_val_const_when_zst(*elem_ty) {
+                    None => {
+                        match parsed_length {
+                            SolTyConst::Simple { ty: _, val } => {
+                                if !val.is_usize_zero() {
+                                    return None;
+                                }
+                            }
+                        }
+                        SolConst::Array(vec![])
+                    }
+                    Some(zst_val) => {
+                        let len = match parsed_length {
+                            SolTyConst::Simple { ty: _, val } => val.as_usize()?,
+                        };
+                        SolConst::Array(vec![zst_val; len])
+                    }
                 }
             }
             ty::Adt(def, generics) => match def.adt_kind() {
@@ -539,6 +558,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     }
                     SolConst::Struct(fields)
                 }
+                AdtKind::Union => return None, // unions cannot be ZSTs
                 AdtKind::Enum => {
                     // an enum is a ZST if it has only one feasible variant and all fields in that variant are ZSTs
                     let mut feasible_variant = None;
@@ -587,7 +607,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     }
                     SolConst::Enum(SolVariantIndex(variant_idx.index()), fields)
                 }
-                _ => return None, // the ADT definition is not a ZST
             },
             ty::FnDef(def_id, generics) => {
                 let (kind, ident, ty_args) = self.make_type_function(*def_id, generics);
@@ -597,7 +616,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let (kind, ident, ty_args) = self.make_type_closure(*def_id, generics);
                 SolConst::Closure(kind, ident, ty_args)
             }
-            _ => return None, // the type cannot be a ZST
+            _ => return None, // other types cannot be a ZST
         };
         Some(zst_val)
     }
@@ -612,7 +631,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
         match normalized_ty.kind() {
             // value types
             ty::Bool => SolConst::Bool(!val.is_null()),
-            ty::Char => SolConst::Char(val.to_u8() as char),
+            ty::Char => SolConst::Char(val.try_into().unwrap_or_else(|_| {
+                bug!("[invariant] invalid char value {val}");
+            })),
             ty::Int(int_ty) => match int_ty {
                 IntTy::I8 => SolConst::Int(SolConstInt::I8(val.to_i8())),
                 IntTy::I16 => SolConst::Int(SolConstInt::I16(val.to_i16())),
@@ -647,10 +668,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 for elem_ty in elem_tys.iter() {
                     match (consumed, self.mk_val_const_when_zst(elem_ty)) {
                         (true, None) => {
-                            bug!(
-                                "[invariant] expect ZST elem {} in {normalized_ty}, got {elem_ty}",
-                                elem_ty
-                            );
+                            bug!("[invariant] more than one non-ZST elements in {normalized_ty}");
                         }
                         (false, None) => {
                             let elem_val = self.mk_val_const_from_scalar_val(elem_ty, val);
@@ -661,6 +679,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             elem_values.push(zst_val);
                         }
                     }
+                }
+                if !consumed {
+                    bug!("[invariant] no non-ZST elements in {normalized_ty}");
                 }
                 SolConst::Tuple(elem_values)
             }
@@ -763,6 +784,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                             }
                                         }
                                     }
+                                    if !consumed {
+                                        bug!(
+                                            "[invariant] no non-ZST field in variant {} in {normalized_ty}",
+                                            variant.name
+                                        );
+                                    }
                                 } else {
                                     // for tagged variant, the scalar value is consumed as the tag
                                     for (field_idx, field_def) in variant.fields.iter_enumerated() {
@@ -792,10 +819,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         let field_ty = field_def.ty(self.tcx, generics);
                         match (consumed, self.mk_val_const_when_zst(field_ty)) {
                             (true, None) => {
-                                bug!(
-                                    "[invariant] expect ZST field {} in {normalized_ty}, got {field_ty}",
-                                    field_def.name
-                                );
+                                bug!("[invariant] more than one non-ZST fields in {normalized_ty}");
                             }
                             (false, None) => {
                                 let field_val = self.mk_val_const_from_scalar_val(field_ty, val);
@@ -806,6 +830,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 field_values.push((SolFieldIndex(field_idx.index()), zst_val));
                             }
                         }
+                    }
+                    if !consumed {
+                        bug!("[invariant] no non-ZST fields in {normalized_ty}");
                     }
 
                     SolConst::Struct(field_values)
@@ -839,10 +866,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 for elem_ty in elem_tys.iter() {
                     match (consumed, self.mk_val_const_when_zst(elem_ty)) {
                         (true, None) => {
-                            bug!(
-                                "[invariant] expect ZST elem {} in {normalized_ty}, got {elem_ty}",
-                                elem_ty
-                            );
+                            bug!("[invariant] more than one non-ZST elements in {normalized_ty}");
                         }
                         (false, None) => {
                             let elem_val = self.mk_val_const_from_scalar_ptr(elem_ty, prov, offset);
@@ -853,6 +877,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             elem_values.push(zst_val);
                         }
                     }
+                }
+                if !consumed {
+                    bug!("[invariant] no non-ZST elements in {normalized_ty}");
                 }
                 SolConst::Tuple(elem_values)
             }
@@ -866,10 +893,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         let field_ty = field_def.ty(self.tcx, generics);
                         match (consumed, self.mk_val_const_when_zst(field_ty)) {
                             (true, None) => {
-                                bug!(
-                                    "[invariant] expect ZST field {} in {normalized_ty}, got {field_ty}",
-                                    field_def.name
-                                );
+                                bug!("[invariant] more than one non-ZST fields in {normalized_ty}");
                             }
                             (false, None) => {
                                 let field_val =
@@ -881,6 +905,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 field_values.push((SolFieldIndex(field_idx.index()), zst_val));
                             }
                         }
+                    }
+                    if !consumed {
+                        bug!("[invariant] no non-ZST fields in {normalized_ty}");
                     }
 
                     SolConst::Struct(field_values)
@@ -1452,22 +1479,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             let variant_idx = match tag_encoding {
                                 TagEncoding::Direct => {
                                     // look for a variant with the same discriminant value
-                                    let mut last_discr_value = 0;
                                     let mut variant_idx_found = None;
-                                    for (variant_idx, variant) in def.variants().iter_enumerated() {
-                                        let discr_value = match variant.discr {
-                                            VariantDiscr::Relative(pos) => {
-                                                last_discr_value + pos as u128
-                                            }
-                                            VariantDiscr::Explicit(did) => {
-                                                let discr = def.eval_explicit_discr(self.tcx, did).unwrap_or_else(|_| {
-                                                    bug!("[invariant] failed to evaluate discriminant for {normalized_ty}");
-                                                });
-                                                last_discr_value = discr.val;
-                                                discr.val
-                                            }
-                                        };
-                                        if discr_value == tag_value {
+                                    for (variant_idx, discr) in def.discriminants(self.tcx) {
+                                        if discr.val == tag_value {
                                             variant_idx_found = Some(variant_idx);
                                             break;
                                         }
@@ -3023,6 +3037,8 @@ pub(crate) enum SolBuiltinFunc {
     IntrinsicsResultUnwrapFailed,
     IntrinsicsOptionUnwrapFailed,
     IntrinsicsVecRemoveAssertFailed,
+    IntrinsicsSliceIndexFailed,
+    IntrinsicsSliceLenMismatchFailed,
     /* alloc */
     AllocGlobalAllocImpl,
     AllocRustAlloc,
@@ -3117,6 +3133,10 @@ impl SolBuiltinFunc {
             Self::IntrinsicsResultUnwrapFailed => r"result::unwrap_failed",
             Self::IntrinsicsOptionUnwrapFailed => r"option::unwrap_failed",
             Self::IntrinsicsVecRemoveAssertFailed => r"Vec::<.*>::remove::assert_failed",
+            Self::IntrinsicsSliceIndexFailed => "core::slice::index::slice_index_fail",
+            Self::IntrinsicsSliceLenMismatchFailed => {
+                "core::slice::<.*>::copy_from_slice::len_mismatch_fail"
+            }
             /* alloc */
             Self::AllocGlobalAllocImpl => r"std::alloc::Global::alloc_impl",
             Self::AllocRustAlloc => r"alloc::alloc::__rust_alloc",
@@ -3157,6 +3177,7 @@ impl SolBuiltinFunc {
             Self::IntrinsicsResultUnwrapFailed,
             Self::IntrinsicsOptionUnwrapFailed,
             Self::IntrinsicsVecRemoveAssertFailed,
+            Self::IntrinsicsSliceIndexFailed,
             /* alloc */
             Self::AllocGlobalAllocImpl,
             Self::AllocRustAlloc,
@@ -3180,6 +3201,31 @@ impl SolBuiltinFunc {
             /* solana */
             Self::SolInvokeSigned,
         ]
+    }
+}
+
+impl SolConst {
+    fn as_usize(&self) -> Option<usize> {
+        let val = match self {
+            Self::Int(SolConstInt::I8(v)) => *v as usize,
+            Self::Int(SolConstInt::U8(v)) => *v as usize,
+            Self::Int(SolConstInt::I16(v)) => *v as usize,
+            Self::Int(SolConstInt::U16(v)) => *v as usize,
+            Self::Int(SolConstInt::I32(v)) => *v as usize,
+            Self::Int(SolConstInt::U32(v)) => *v as usize,
+            Self::Int(SolConstInt::I64(v)) => *v as usize,
+            Self::Int(SolConstInt::U64(v)) => *v as usize,
+            Self::Int(SolConstInt::I128(v)) => *v as usize,
+            Self::Int(SolConstInt::U128(v)) => *v as usize,
+            Self::Int(SolConstInt::Isize(v)) => *v as usize,
+            Self::Int(SolConstInt::Usize(v)) => *v,
+            _ => return None,
+        };
+        Some(val)
+    }
+
+    fn is_usize_zero(&self) -> bool {
+        self.as_usize().map_or(false, |v| v == 0)
     }
 }
 
