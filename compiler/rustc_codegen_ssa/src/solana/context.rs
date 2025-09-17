@@ -1026,13 +1026,75 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     _ => bug!("[invariant] expect a 0-variant for ptr type {normalized_ty}"),
                 }
 
-                // read and parse the pointer
+                // need to resolve the dynamic type (if relevant)
                 let pointer_size = self.tcx.data_layout().pointer_size();
+                let is_dyn_ty = matches!(sub_ty.kind(), ty::Dynamic(..));
+
+                let actual_sub_ty = if is_dyn_ty {
+                    // the dynamic type must carries a metadata
+                    if layout.size != pointer_size * 2 {
+                        bug!("[invariant] expect metadata in the layout for {normalized_ty}");
+                    }
+
+                    // derive the metadata offset
+                    let offset_metadata = match &layout.fields {
+                        FieldsShape::Arbitrary { offsets, memory_index: _ } => {
+                            if offsets.len() != 2 {
+                                bug!("[invariant] expect two fields for {normalized_ty}");
+                            }
+                            let mut offsets_iter = offsets.into_iter();
+                            let off_pointer = *offsets_iter.next().unwrap();
+                            let off_metadata = *offsets_iter.next().unwrap();
+                            if off_pointer.bytes_usize() != 0 || off_metadata != pointer_size {
+                                bug!("[invariant] unexpected offsets for {normalized_ty}");
+                            }
+                            off_metadata
+                        }
+                        _ => bug!("[invariant] expect arbitrary layout for {normalized_ty}"),
+                    };
+
+                    // read the metadata
+                    let alloc_id = match read_primitive(
+                        self.tcx,
+                        offset + offset_metadata,
+                        pointer_size,
+                        true,
+                    ) {
+                        Scalar::Int(_) => {
+                            bug!("[invariant] expect vtable for {sub_ty} in {normalized_ty}");
+                        }
+                        Scalar::Ptr(scalar_ptr, _) => {
+                            let (prov, offset) = scalar_ptr.into_raw_parts();
+                            if offset != Size::ZERO {
+                                bug!("[invariant] expect zero offset for vtable pointer");
+                            }
+                            prov.alloc_id()
+                        }
+                    };
+
+                    // get the actual underlying type behind the vtable
+                    let actual_ty = match self.tcx.global_alloc(alloc_id) {
+                        GlobalAlloc::VTable(vty, _) => vty,
+                        _ => bug!("[invariant] {normalized_ty} has non-vtable metadata"),
+                    };
+
+                    // ensure that the actual type is sized
+                    if !actual_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized()) {
+                        bug!("[assumption] actual type {actual_ty} behind vtable should be sized");
+                    }
+
+                    // return the actual type
+                    actual_ty
+                } else {
+                    *sub_ty
+                };
+
+                // read and parse the pointer
                 let pointer_parsed = match read_primitive(self.tcx, offset, pointer_size, true) {
                     Scalar::Ptr(ptr, _) => {
                         let (prov, offset) = ptr.into_raw_parts();
                         let offset = SolOffset(offset.bytes_usize());
-                        let parsed_prov = self.make_provenance(prov, *sub_ty, *mutability);
+                        let parsed_prov = self.make_provenance(prov, actual_sub_ty, *mutability);
                         Ok((parsed_prov, offset))
                     }
                     Scalar::Int(int) => {
@@ -1045,7 +1107,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
                 // check whether the metadata is a ZST
                 // NOTE: we only handle size-based metadata for now
-                let need_metadata = !sub_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized());
+                let need_metadata =
+                    !actual_sub_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized());
 
                 // switch by whether we need metadata
                 if need_metadata {
@@ -1126,15 +1189,17 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     }
                 } else {
                     // sanity check on the shape of the fields
-                    if pointer_size != layout.size {
-                        bug!(
-                            "[invariant] invalid layout size for {normalized_ty},
+                    if !is_dyn_ty {
+                        if pointer_size != layout.size {
+                            bug!(
+                                "[invariant] invalid layout size for {normalized_ty},
                             expect no metadata but got {}",
-                            layout.size.bytes_usize()
-                        );
-                    }
-                    if !matches!(layout.fields, FieldsShape::Primitive) {
-                        bug!("[invariant] expect a primitive field for {normalized_ty}");
+                                layout.size.bytes_usize()
+                            );
+                        }
+                        if !matches!(layout.fields, FieldsShape::Primitive) {
+                            bug!("[invariant] expect a primitive field for {normalized_ty}");
+                        }
                     }
 
                     // now create the pointer constant
