@@ -472,6 +472,33 @@ impl<'tcx> SolContextBuilder<'tcx> {
         match ty_const.kind() {
             TyConstKind::Value(val) => {
                 let const_ty = self.mk_type(val.ty);
+
+                // special handling for &str faced with valtrees
+                if matches!(&const_ty, SolType::ImmRef(ref_ty) if matches!(ref_ty.as_ref(), SolType::Str))
+                {
+                    let string = match val.valtree.try_to_branch() {
+                        None => bug!("[invariant] expect branch valtree for &str constant"),
+                        Some(branches) => {
+                            let mut bytes = vec![];
+                            for item in branches {
+                                let byte = match item.try_to_scalar_int() {
+                                    None => bug!("[invariant] expect scalar int in &str valtree"),
+                                    Some(int) => int.to_u8(),
+                                };
+                                bytes.push(byte);
+                            }
+
+                            // assume they are utf-8 bytes
+                            String::from_utf8(bytes).unwrap_or_else(|_| {
+                                bug!("[invariant] invalid UTF-8 in &str constant");
+                            })
+                        }
+                    };
+                    let const_val = SolConst::RefString(string);
+                    return SolTyConst::Simple { ty: const_ty, val: const_val };
+                }
+
+                // normal handling for other types
                 let const_val = if val.valtree.is_zst() {
                     self.mk_val_const_from_zst(val.ty)
                 } else {
