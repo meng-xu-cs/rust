@@ -17,6 +17,7 @@ use rustc_middle::mir::{
     StatementKind, Terminator, TerminatorKind, UnOp, UnwindAction,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
+use rustc_middle::ty::util::Discr;
 use rustc_middle::ty::{
     self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder,
     ExistentialPredicate, FloatTy, GenericArg, GenericArgKind, GenericArgsRef, Instance,
@@ -712,8 +713,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
             ty::Adt(def, generics) => match def.adt_kind() {
                 AdtKind::Enum => {
-                    let tag_value = val.to_bits_unchecked();
-
                     // we need to drill down to the encoding
                     let layout = self
                         .tcx
@@ -730,35 +729,35 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     match &layout.variants {
                         Variants::Multiple { tag_encoding, .. } => match tag_encoding {
                             TagEncoding::Direct => {
-                                // handle enum discriminant for scalar constant
+                                // direct tag encoding, the scalar value is the discriminant
+                                let tag_value = val;
+
+                                // look for a variant with the same discriminant value
+                                let mut variant_idx_found = None;
                                 for (variant_idx, discr) in def.discriminants(self.tcx) {
-                                    if discr.val != tag_value {
-                                        continue;
+                                    if scalar_eq_discr(tag_value, discr) {
+                                        variant_idx_found = Some(variant_idx);
+                                        break;
                                     }
+                                }
+                                let variant_idx = variant_idx_found.unwrap_or_else(|| {
+                                        bug!("[invariant] invalid discriminant {tag_value} for {normalized_ty}");
+                                    });
 
-                                    // found the matching variant
-                                    let variant_def = def.variant(variant_idx);
+                                // found the matching variant
+                                let variant_def = def.variant(variant_idx);
 
-                                    // as discriminant is stored directly as the scalar value,
-                                    // the fields of this variant, if any, must be ZSTs
-                                    let mut field_values = vec![];
-                                    for (field_idx, field_def) in
-                                        variant_def.fields.iter_enumerated()
-                                    {
-                                        let field_ty = field_def.ty(self.tcx, generics);
-                                        let field_val = self.mk_val_const_from_zst(field_ty);
-                                        field_values
-                                            .push((SolFieldIndex(field_idx.index()), field_val));
-                                    }
-
-                                    return SolConst::Enum(
-                                        SolVariantIndex(variant_idx.index()),
-                                        field_values,
-                                    );
+                                // as discriminant is stored directly as the scalar value,
+                                // the fields of this variant, if any, must be ZSTs
+                                let mut field_values = vec![];
+                                for (field_idx, field_def) in variant_def.fields.iter_enumerated() {
+                                    let field_ty = field_def.ty(self.tcx, generics);
+                                    let field_val = self.mk_val_const_from_zst(field_ty);
+                                    field_values
+                                        .push((SolFieldIndex(field_idx.index()), field_val));
                                 }
 
-                                // no matching discriminant found
-                                bug!("[invariant] no discriminant {tag_value} in {normalized_ty}");
+                                SolConst::Enum(SolVariantIndex(variant_idx.index()), field_values)
                             }
                             TagEncoding::Niche {
                                 untagged_variant,
@@ -766,7 +765,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 niche_start,
                             } => {
                                 // NOTE: the discriminant and variant index of each variant coincide
-                                let tag_index = tag_value
+                                let tag_index = val
+                                    .to_bits_unchecked()
                                     .wrapping_sub(*niche_start)
                                     .wrapping_add(niche_variants.start().index() as u128);
 
@@ -829,6 +829,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 SolConst::Enum(SolVariantIndex(variant_idx.index()), field_values)
                             }
                         },
+
                         Variants::Empty | Variants::Single { .. } => {
                             bug!("[invariant] not multiple variants for int enum {normalized_ty}");
                         }
@@ -1529,7 +1530,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 tag_size,
                                 matches!(tag_type, Primitive::Pointer(_)),
                             ) {
-                                Scalar::Int(val) => val.to_uint(tag_size),
+                                Scalar::Int(val) => val,
                                 Scalar::Ptr(..) => bug!("[unsupported] non-null pointer as tag"),
                             };
 
@@ -1539,7 +1540,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                     // look for a variant with the same discriminant value
                                     let mut variant_idx_found = None;
                                     for (variant_idx, discr) in def.discriminants(self.tcx) {
-                                        if discr.val == tag_value {
+                                        if scalar_eq_discr(tag_value, discr) {
                                             variant_idx_found = Some(variant_idx);
                                             break;
                                         }
@@ -1555,6 +1556,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 } => {
                                     // NOTE: the discriminant and variant index of each variant coincide
                                     let tag_index = tag_value
+                                        .to_uint(tag_size)
                                         .wrapping_sub(*niche_start)
                                         .wrapping_add(niche_variants.start().index() as u128);
                                     if tag_index >= def.variants().len() as u128 {
@@ -3310,6 +3312,27 @@ impl Display for SolPathDescWithArgs {
 /*
  * Utilities
  */
+
+/// Compare a scalar int and a discriminant
+fn scalar_eq_discr(scalar: ScalarInt, discr: Discr<'_>) -> bool {
+    let tmp = discr.val;
+    match discr.ty.kind() {
+        ty::Int(sub_ty) => {
+            let lhs = scalar.to_int(scalar.size());
+            let rhs = match sub_ty {
+                IntTy::I8 => tmp as u8 as i8 as i128,
+                IntTy::I16 => tmp as u16 as i16 as i128,
+                IntTy::I32 => tmp as u32 as i32 as i128,
+                IntTy::I64 => tmp as u64 as i64 as i128,
+                IntTy::I128 => tmp as i128,
+                IntTy::Isize => tmp as isize as i128,
+            };
+            lhs == rhs
+        }
+        ty::Uint(_) => scalar.to_uint(scalar.size()) == tmp,
+        _ => scalar.to_bits_unchecked() == discr.val,
+    }
+}
 
 /// A depth counter for indentation in logging
 struct Depth {
