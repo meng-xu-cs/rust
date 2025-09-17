@@ -1636,11 +1636,16 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
             },
 
+            // closure
+            ty::Closure(def_id, generics) => {
+                let (kind, ident, ty_args) = self.make_type_closure(*def_id, generics);
+                SolConst::Closure(kind, ident, ty_args)
+            }
+
             // unexpected
             ty::Never
             | ty::Pat(..)
             | ty::FnDef(..)
-            | ty::Closure(..)
             | ty::Dynamic(..)
             | ty::Coroutine(..)
             | ty::CoroutineClosure(..)
