@@ -1501,6 +1501,10 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
                 AdtKind::Enum => {
                     let (variant_idx, variant_layout) = match &layout.variants {
+                        Variants::Single { index } => {
+                            // the enum is known to be this single variant, maybe the other variants are all infeasible
+                            (*index, *layout)
+                        }
                         Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
                             // get the tag type
                             let tag_type = match tag {
@@ -1575,25 +1579,25 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 )
                             });
 
+                            // sanity check on the variant layout
+                            if !matches!(variant_layout.variants, Variants::Single { index } if index == variant_idx)
+                            {
+                                bug!(
+                                    "[invariant] expect an indexed({})-variant for enum variant in {normalized_ty}",
+                                    variant_idx.index()
+                                );
+                            }
+
                             // return both the index and the layout
                             (variant_idx, variant_layout)
                         }
-                        Variants::Empty | Variants::Single { .. } => {
-                            bug!("[invariant] expect multiple variants for {normalized_ty}")
+                        Variants::Empty => {
+                            bug!("[invariant] unexpected empty variants for {normalized_ty}")
                         }
                     };
 
                     // get the variant definition from typing
                     let variant_def = def.variant(variant_idx);
-
-                    // sanity check on the variant layout
-                    if !matches!(variant_layout.variants, Variants::Single { index } if index == variant_idx)
-                    {
-                        bug!(
-                            "[invariant] expect an indexed({})-variant for enum variant in {normalized_ty}",
-                            variant_idx.index()
-                        );
-                    }
 
                     // get variant fields from layout
                     let field_offsets = match &variant_layout.fields {
