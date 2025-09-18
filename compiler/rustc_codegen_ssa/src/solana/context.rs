@@ -21,7 +21,8 @@ use rustc_middle::ty::util::Discr;
 use rustc_middle::ty::{
     self, AdtDef, AdtKind, Const as TyConst, ConstKind as TyConstKind, EarlyBinder,
     ExistentialPredicate, FloatTy, GenericArg, GenericArgKind, GenericArgsRef, Instance,
-    InstanceKind, IntTy, ScalarInt, TermKind, Ty, TyCtxt, TypingEnv, UintTy, ValTree, VariantDiscr,
+    InstanceKind, IntTy, ScalarInt, TermKind, Ty, TyCtxt, TypingEnv, UintTy, ValTree, VariantDef,
+    VariantDiscr,
 };
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
@@ -449,8 +450,39 @@ impl<'tcx> SolContextBuilder<'tcx> {
         }
     }
 
-    /// Create a constant by parsing the value tree
-    fn mk_typed_valtree(&mut self, ty: Ty<'tcx>, tree: ValTree<'tcx>) -> SolConst {
+    /// Create a constant from a valtree and a type
+    fn mk_const_from_valtree(&mut self, ty: Ty<'tcx>, tree: ValTree<'tcx>) -> SolConst {
+        let parse_ty = self.mk_type(ty);
+
+        // special handling for &str faced with valtrees
+        if matches!(&parse_ty, SolType::ImmRef(ref_ty) if matches!(ref_ty.as_ref(), SolType::Str)) {
+            let string = match tree.try_to_branch() {
+                None => bug!("[invariant] expect branch valtree for &str constant"),
+                Some(branches) => {
+                    let mut bytes = vec![];
+                    for item in branches {
+                        let byte = match item.try_to_scalar_int() {
+                            None => bug!("[invariant] expect scalar int in &str valtree"),
+                            Some(int) => int.to_u8(),
+                        };
+                        bytes.push(byte);
+                    }
+
+                    // assume they are utf-8 bytes
+                    String::from_utf8(bytes).unwrap_or_else(|_| {
+                        bug!("[invariant] invalid UTF-8 in &str constant");
+                    })
+                }
+            };
+            return SolConst::RefString(string);
+        }
+
+        // short-circuit for ZST
+        if tree.is_zst() {
+            return self.mk_const_from_zst(ty);
+        }
+
+        // now we need to parse the valtree
         match tree.try_to_scalar() {
             None => match tree.try_to_branch() {
                 None => bug!("[invariant] non-scalar non-branch valtree {tree:?}"),
@@ -458,83 +490,22 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     if branches.len() != 1 {
                         bug!("[unsupported] multi-branch valtree {branches:#?} with type {ty}");
                     }
-                    self.mk_typed_valtree(ty, *branches.into_iter().next().unwrap())
+                    self.mk_const_from_valtree(ty, *branches.into_iter().next().unwrap())
                 }
             },
-            Some(Scalar::Int(scalar_int)) => self.mk_val_const_from_scalar_val(ty, scalar_int),
-            Some(Scalar::Ptr(scalar_ptr, _)) => {
-                bug!("[unsupported] pointer as valtree constant {scalar_ptr:?} in type {ty}")
-            }
-        }
-    }
-
-    /// Create a constant known in the type system
-    fn mk_ty_const(&mut self, ty_const: TyConst<'tcx>) -> SolTyConst {
-        match ty_const.kind() {
-            TyConstKind::Value(val) => {
-                let const_ty = self.mk_type(val.ty);
-
-                // special handling for &str faced with valtrees
-                if matches!(&const_ty, SolType::ImmRef(ref_ty) if matches!(ref_ty.as_ref(), SolType::Str))
-                {
-                    let string = match val.valtree.try_to_branch() {
-                        None => bug!("[invariant] expect branch valtree for &str constant"),
-                        Some(branches) => {
-                            let mut bytes = vec![];
-                            for item in branches {
-                                let byte = match item.try_to_scalar_int() {
-                                    None => bug!("[invariant] expect scalar int in &str valtree"),
-                                    Some(int) => int.to_u8(),
-                                };
-                                bytes.push(byte);
-                            }
-
-                            // assume they are utf-8 bytes
-                            String::from_utf8(bytes).unwrap_or_else(|_| {
-                                bug!("[invariant] invalid UTF-8 in &str constant");
-                            })
-                        }
-                    };
-                    let const_val = SolConst::RefString(string);
-                    return SolTyConst::Simple { ty: const_ty, val: const_val };
-                }
-
-                // normal handling for other types
-                let const_val = if val.valtree.is_zst() {
-                    self.mk_val_const_from_zst(val.ty)
-                } else {
-                    let normalized_ty = self
-                        .tcx
-                        .normalize_erasing_regions(TypingEnv::fully_monomorphized(), val.ty);
-                    self.mk_typed_valtree(normalized_ty, val.valtree)
-                };
-                SolTyConst::Simple { ty: const_ty, val: const_val }
-            }
-            TyConstKind::Param(..)
-            | TyConstKind::Infer(..)
-            | TyConstKind::Bound(..)
-            | TyConstKind::Placeholder(..)
-            | TyConstKind::Unevaluated(..) => {
-                bug!("[assumption] uninstantiated type constant {ty_const:?}");
-            }
-            TyConstKind::Expr(expr) => {
-                bug!("[unsupported] expression type constant {expr:?}");
-            }
-            TyConstKind::Error(_) => {
-                bug!("[invariant] error type constant");
-            }
+            Some(scalar) => self.mk_const_from_scalar(ty, scalar),
         }
     }
 
     /// Create a constant from a zero-sized type (ZST)
-    fn mk_val_const_from_zst(&mut self, ty: Ty<'tcx>) -> SolConst {
-        self.mk_val_const_when_zst(ty).unwrap_or_else(|| {
+    fn mk_const_from_zst(&mut self, ty: Ty<'tcx>) -> SolConst {
+        self.mk_const_when_zst(ty).unwrap_or_else(|| {
             bug!("[invariant] failed to create constant for ZST type {ty}");
         })
     }
 
     /// Create a constant if the type is a ZST
-    fn mk_val_const_when_zst(&mut self, ty: Ty<'tcx>) -> Option<SolConst> {
+    fn mk_const_when_zst(&mut self, ty: Ty<'tcx>) -> Option<SolConst> {
         // normalize the type first
         let normalized_ty =
             self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
@@ -545,31 +516,23 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 // a tuple is a ZST if all its elements are ZSTs (including the empty tuple)
                 let mut elem_vals = vec![];
                 for elem_ty in elems.iter() {
-                    let elem_val = self.mk_val_const_when_zst(elem_ty)?;
+                    let elem_val = self.mk_const_when_zst(elem_ty)?;
                     elem_vals.push(elem_val);
                 }
                 SolConst::Tuple(elem_vals)
             }
             ty::Array(elem_ty, length) => {
                 // an array is a ZST if its element type is a ZST or its length is zero
-                let parsed_length = self.mk_ty_const(*length);
-                match self.mk_val_const_when_zst(*elem_ty) {
-                    None => {
-                        match parsed_length {
-                            SolTyConst::Simple { ty: _, val } => {
-                                if !val.is_usize_zero() {
-                                    return None;
-                                }
-                            }
-                        }
-                        SolConst::Array(vec![])
-                    }
-                    Some(zst_val) => {
-                        let len = match parsed_length {
-                            SolTyConst::Simple { ty: _, val } => val.as_usize()?,
-                        };
-                        SolConst::Array(vec![zst_val; len])
-                    }
+                let parsed_length = match self.mk_ty_const(*length) {
+                    SolTyConst::Simple { ty: _, val } => val.as_usize().unwrap_or_else(|| {
+                        bug!("[invariant] expect usize for constant array length");
+                    }),
+                };
+                if parsed_length == 0 {
+                    SolConst::Array(vec![])
+                } else {
+                    let elem_val = self.mk_const_when_zst(*elem_ty)?;
+                    SolConst::Array(vec![elem_val; parsed_length])
                 }
             }
             ty::Adt(def, generics) => match def.adt_kind() {
@@ -578,8 +541,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     let variant = def.non_enum_variant();
                     let mut fields = vec![];
                     for (field_idx, field_def) in variant.fields.iter_enumerated() {
-                        let field_val =
-                            self.mk_val_const_when_zst(field_def.ty(self.tcx, generics))?;
+                        let field_val = self.mk_const_when_zst(field_def.ty(self.tcx, generics))?;
                         fields.push((SolFieldIndex(field_idx.as_usize()), field_val));
                     }
                     SolConst::Struct(fields)
@@ -587,48 +549,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 AdtKind::Union => return None, // unions cannot be ZSTs
                 AdtKind::Enum => {
                     // an enum is a ZST if it has only one feasible variant and all fields in that variant are ZSTs
-                    let mut feasible_variant = None;
-                    for (variant_idx, variant_def) in def.variants().iter_enumerated() {
-                        let mut is_variant_feasible = true;
-                        for (_, field_def) in variant_def.fields.iter_enumerated() {
-                            let field_ty = field_def.ty(self.tcx, generics);
-                            let feasible = match field_ty.kind() {
-                                ty::Never => false,
-                                ty::Adt(adt_def, _)
-                                    if adt_def.adt_kind() == AdtKind::Enum
-                                        && adt_def.variants().is_empty() =>
-                                {
-                                    false
-                                }
-                                _ => true,
-                            };
-
-                            if !feasible {
-                                is_variant_feasible = false;
-                                break;
-                            }
-                        }
-                        if !is_variant_feasible {
-                            continue;
-                        }
-
-                        // found more than one feasible variants
-                        if feasible_variant.is_some() {
-                            return None;
-                        }
-                        feasible_variant = Some(variant_idx);
-                    }
-                    let variant_idx = match feasible_variant {
-                        None => return None, // no feasible variants
-                        Some(idx) => idx,
-                    };
+                    let variant_idx = get_uniquely_feasible_variant(self.tcx, *def, generics)?;
 
                     // parse the fields in that feasible variant
                     let variant_def = def.variant(variant_idx);
                     let mut fields = vec![];
                     for (field_idx, field_def) in variant_def.fields.iter_enumerated() {
-                        let field_val =
-                            self.mk_val_const_when_zst(field_def.ty(self.tcx, generics))?;
+                        let field_val = self.mk_const_when_zst(field_def.ty(self.tcx, generics))?;
                         fields.push((SolFieldIndex(field_idx.as_usize()), field_val));
                     }
                     SolConst::Enum(SolVariantIndex(variant_idx.index()), fields)
@@ -647,8 +574,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         Some(zst_val)
     }
 
-    /// Create a value constant from a MIR scalar
-    fn mk_val_const_from_scalar_val(&mut self, ty: Ty<'tcx>, val: ScalarInt) -> SolConst {
+    fn mk_const_from_scalar(&mut self, ty: Ty<'tcx>, scalar: Scalar) -> SolConst {
         // normalize the type first
         let normalized_ty =
             self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
@@ -656,62 +582,67 @@ impl<'tcx> SolContextBuilder<'tcx> {
         // derive constant based on the normalized type
         match normalized_ty.kind() {
             // value types
-            ty::Bool => SolConst::Bool(!val.is_null()),
-            ty::Char => SolConst::Char(val.try_into().unwrap_or_else(|_| {
-                bug!("[invariant] invalid char value {val}");
-            })),
+            ty::Bool => SolConst::Bool(expect_scalar_bool(scalar)),
+            ty::Char => SolConst::Char(expect_scalar_char(scalar)),
             ty::Int(int_ty) => match int_ty {
-                IntTy::I8 => SolConst::Int(SolConstInt::I8(val.to_i8())),
-                IntTy::I16 => SolConst::Int(SolConstInt::I16(val.to_i16())),
-                IntTy::I32 => SolConst::Int(SolConstInt::I32(val.to_i32())),
-                IntTy::I64 => SolConst::Int(SolConstInt::I64(val.to_i64())),
-                IntTy::I128 => SolConst::Int(SolConstInt::I128(val.to_i128())),
+                IntTy::I8 => SolConst::Int(SolConstInt::I8(expect_scalar_i8(scalar))),
+                IntTy::I16 => SolConst::Int(SolConstInt::I16(expect_scalar_i16(scalar))),
+                IntTy::I32 => SolConst::Int(SolConstInt::I32(expect_scalar_i32(scalar))),
+                IntTy::I64 => SolConst::Int(SolConstInt::I64(expect_scalar_i64(scalar))),
+                IntTy::I128 => SolConst::Int(SolConstInt::I128(expect_scalar_i128(scalar))),
                 IntTy::Isize => {
-                    SolConst::Int(SolConstInt::Isize(val.to_target_isize(self.tcx) as isize))
+                    SolConst::Int(SolConstInt::Isize(expect_scalar_isize(self.tcx, scalar)))
                 }
             },
             ty::Uint(uint_ty) => match uint_ty {
-                UintTy::U8 => SolConst::Int(SolConstInt::U8(val.to_u8())),
-                UintTy::U16 => SolConst::Int(SolConstInt::U16(val.to_u16())),
-                UintTy::U32 => SolConst::Int(SolConstInt::U32(val.to_u32())),
-                UintTy::U64 => SolConst::Int(SolConstInt::U64(val.to_u64())),
-                UintTy::U128 => SolConst::Int(SolConstInt::U128(val.to_u128())),
+                UintTy::U8 => SolConst::Int(SolConstInt::U8(expect_scalar_u8(scalar))),
+                UintTy::U16 => SolConst::Int(SolConstInt::U16(expect_scalar_u16(scalar))),
+                UintTy::U32 => SolConst::Int(SolConstInt::U32(expect_scalar_u32(scalar))),
+                UintTy::U64 => SolConst::Int(SolConstInt::U64(expect_scalar_u64(scalar))),
+                UintTy::U128 => SolConst::Int(SolConstInt::U128(expect_scalar_u128(scalar))),
                 UintTy::Usize => {
-                    SolConst::Int(SolConstInt::Usize(val.to_target_usize(self.tcx) as usize))
+                    SolConst::Int(SolConstInt::Usize(expect_scalar_usize(self.tcx, scalar)))
                 }
             },
             ty::Float(float_ty) => match float_ty {
-                FloatTy::F16 => SolConst::Float(SolConstFloat::F16(val.to_f16().to_string())),
-                FloatTy::F32 => SolConst::Float(SolConstFloat::F32(val.to_f32().to_string())),
-                FloatTy::F64 => SolConst::Float(SolConstFloat::F64(val.to_f64().to_string())),
-                FloatTy::F128 => SolConst::Float(SolConstFloat::F128(val.to_f128().to_string())),
+                FloatTy::F16 => SolConst::Float(SolConstFloat::F16(expect_scalar_f16(scalar))),
+                FloatTy::F32 => SolConst::Float(SolConstFloat::F32(expect_scalar_f32(scalar))),
+                FloatTy::F64 => SolConst::Float(SolConstFloat::F64(expect_scalar_f64(scalar))),
+                FloatTy::F128 => SolConst::Float(SolConstFloat::F128(expect_scalar_f128(scalar))),
             },
 
-            // valid-field datatype
+            // data types
             ty::Tuple(elem_tys) => {
-                let mut elem_values = vec![];
+                let mut elem_vals = vec![];
                 let mut consumed = false;
                 for elem_ty in elem_tys.iter() {
-                    match (consumed, self.mk_val_const_when_zst(elem_ty)) {
+                    match (consumed, self.mk_const_when_zst(elem_ty)) {
                         (true, None) => {
                             bug!("[invariant] more than one non-ZST elements in {normalized_ty}");
                         }
                         (false, None) => {
-                            let elem_val = self.mk_val_const_from_scalar_val(elem_ty, val);
-                            elem_values.push(elem_val);
+                            let elem_val = self.mk_const_from_scalar(elem_ty, scalar);
+                            elem_vals.push(elem_val);
                             consumed = true;
                         }
                         (_, Some(zst_val)) => {
-                            elem_values.push(zst_val);
+                            elem_vals.push(zst_val);
                         }
                     }
                 }
                 if !consumed {
                     bug!("[invariant] no non-ZST elements in {normalized_ty}");
                 }
-                SolConst::Tuple(elem_values)
+                SolConst::Tuple(elem_vals)
             }
             ty::Adt(def, generics) => match def.adt_kind() {
+                AdtKind::Struct => {
+                    let variant = def.non_enum_variant();
+                    let field_vals =
+                        self.populate_const_fields_with_scalar(variant, generics, scalar);
+                    SolConst::Struct(field_vals)
+                }
+                AdtKind::Union => bug!("[unsupported] scalar constant for union {normalized_ty}"),
                 AdtKind::Enum => {
                     // we need to drill down to the encoding
                     let layout = self
@@ -726,277 +657,214 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         bug!("[invariant] {normalized_ty} is not represented as a scalar");
                     }
 
+                    // switch based on how the variants are encoded
                     match &layout.variants {
+                        Variants::Single { index } => {
+                            // there is only one variant feasible
+                            let variant_idx = *index;
+                            let variant_def = def.variant(variant_idx);
+
+                            // the scalar is yet to be consumed
+                            let field_vals = self.populate_const_fields_with_scalar(
+                                variant_def,
+                                generics,
+                                scalar,
+                            );
+                            SolConst::Enum(SolVariantIndex(variant_idx.index()), field_vals)
+                        }
                         Variants::Multiple { tag_encoding, .. } => match tag_encoding {
                             TagEncoding::Direct => {
                                 // direct tag encoding, the scalar value is the discriminant
-                                let tag_value = val;
-
-                                // look for a variant with the same discriminant value
-                                let mut variant_idx_found = None;
-                                for (variant_idx, discr) in def.discriminants(self.tcx) {
-                                    if scalar_eq_discr(tag_value, discr) {
-                                        variant_idx_found = Some(variant_idx);
-                                        break;
-                                    }
-                                }
-                                let variant_idx = variant_idx_found.unwrap_or_else(|| {
-                                        bug!("[invariant] invalid discriminant {tag_value} for {normalized_ty}");
-                                    });
-
-                                // found the matching variant
+                                let tag_value = expect_scalar_val(scalar);
+                                let variant_idx =
+                                    get_variant_by_discriminant(self.tcx, *def, tag_value);
                                 let variant_def = def.variant(variant_idx);
 
                                 // as discriminant is stored directly as the scalar value,
                                 // the fields of this variant, if any, must be ZSTs
-                                let mut field_values = vec![];
-                                for (field_idx, field_def) in variant_def.fields.iter_enumerated() {
-                                    let field_ty = field_def.ty(self.tcx, generics);
-                                    let field_val = self.mk_val_const_from_zst(field_ty);
-                                    field_values
-                                        .push((SolFieldIndex(field_idx.index()), field_val));
-                                }
-
-                                SolConst::Enum(SolVariantIndex(variant_idx.index()), field_values)
+                                let field_vals =
+                                    self.populate_const_fields_with_zst(variant_def, generics);
+                                SolConst::Enum(SolVariantIndex(variant_idx.index()), field_vals)
                             }
                             TagEncoding::Niche {
                                 untagged_variant,
                                 niche_variants,
                                 niche_start,
                             } => {
-                                // NOTE: the discriminant and variant index of each variant coincide
-                                let tag_index = val
-                                    .to_bits_unchecked()
-                                    .wrapping_sub(*niche_start)
-                                    .wrapping_add(niche_variants.start().index() as u128);
+                                // recover the variant index from the niche tag
+                                let variant_idx = match scalar {
+                                    Scalar::Int(int) => {
+                                        // NOTE: the discriminant and variant index of each variant coincide
+                                        let tag_index = int
+                                            .to_bits_unchecked()
+                                            .wrapping_sub(*niche_start)
+                                            .wrapping_add(niche_variants.start().index() as u128);
 
-                                let variant_idx = if tag_index >= def.variants().len() as u128 {
-                                    *untagged_variant
-                                } else {
-                                    VariantIdx::from_usize(tag_index as usize)
-                                };
-                                let variant = def.variant(variant_idx);
-
-                                // collect field values for the variant
-                                let mut field_values = vec![];
-                                if variant_idx == *untagged_variant {
-                                    // for untagged variant, the scalar value is not yet consumed
-                                    let mut consumed = false;
-                                    for (field_idx, field_def) in variant.fields.iter_enumerated() {
-                                        let field_ty = field_def.ty(self.tcx, generics);
-                                        match (consumed, self.mk_val_const_when_zst(field_ty)) {
-                                            (true, None) => {
-                                                bug!(
-                                                    "[invariant] expect ZST field {} in enum type {normalized_ty}
-                                                    after consuming the scalar, got {field_ty}",
-                                                    field_def.name
-                                                );
-                                            }
-                                            (false, None) => {
-                                                let field_val = self
-                                                    .mk_val_const_from_scalar_val(field_ty, val);
-                                                field_values.push((
-                                                    SolFieldIndex(field_idx.index()),
-                                                    field_val,
-                                                ));
-                                                consumed = true;
-                                            }
-                                            (_, Some(zst_val)) => {
-                                                field_values.push((
-                                                    SolFieldIndex(field_idx.index()),
-                                                    zst_val,
-                                                ));
-                                            }
+                                        if tag_index >= def.variants().len() as u128 {
+                                            *untagged_variant
+                                        } else {
+                                            VariantIdx::from_usize(tag_index as usize)
                                         }
                                     }
-                                    if !consumed {
-                                        bug!(
-                                            "[invariant] no non-ZST field in variant {} in {normalized_ty}",
-                                            variant.name
-                                        );
+                                    Scalar::Ptr(..) => {
+                                        // if we get a pointer as a tag, it must be on the untagged variant
+                                        *untagged_variant
                                     }
+                                };
+                                let variant_def = def.variant(variant_idx);
+
+                                // collect field values for the variant
+                                let field_vals = if variant_idx == *untagged_variant {
+                                    // for untagged variant, the scalar is not yet consumed
+                                    self.populate_const_fields_with_scalar(
+                                        variant_def,
+                                        generics,
+                                        scalar,
+                                    )
                                 } else {
-                                    // for tagged variant, the scalar value is consumed as the tag
-                                    for (field_idx, field_def) in variant.fields.iter_enumerated() {
-                                        let field_ty = field_def.ty(self.tcx, generics);
-                                        let field_val = self.mk_val_const_from_zst(field_ty);
-                                        field_values
-                                            .push((SolFieldIndex(field_idx.index()), field_val));
-                                    }
-                                }
+                                    // for tagged variants, the scalar is consumed as the tag
+                                    self.populate_const_fields_with_zst(variant_def, generics)
+                                };
 
                                 // done with the enum constant
-                                SolConst::Enum(SolVariantIndex(variant_idx.index()), field_values)
+                                SolConst::Enum(SolVariantIndex(variant_idx.index()), field_vals)
                             }
                         },
-
-                        Variants::Empty | Variants::Single { .. } => {
-                            bug!("[invariant] not multiple variants for int enum {normalized_ty}");
+                        Variants::Empty => {
+                            bug!("[invariant] unexpected empty variants for {normalized_ty}");
                         }
                     }
-                }
-                AdtKind::Union => bug!("[unsupported] scalar union constant in {normalized_ty}"),
-                AdtKind::Struct => {
-                    let fields = &def.non_enum_variant().fields;
-
-                    let mut field_values = vec![];
-                    let mut consumed = false;
-                    for (field_idx, field_def) in fields.iter_enumerated() {
-                        let field_ty = field_def.ty(self.tcx, generics);
-                        match (consumed, self.mk_val_const_when_zst(field_ty)) {
-                            (true, None) => {
-                                bug!("[invariant] more than one non-ZST fields in {normalized_ty}");
-                            }
-                            (false, None) => {
-                                let field_val = self.mk_val_const_from_scalar_val(field_ty, val);
-                                field_values.push((SolFieldIndex(field_idx.index()), field_val));
-                                consumed = true;
-                            }
-                            (_, Some(zst_val)) => {
-                                field_values.push((SolFieldIndex(field_idx.index()), zst_val));
-                            }
-                        }
-                    }
-                    if !consumed {
-                        bug!("[invariant] no non-ZST fields in {normalized_ty}");
-                    }
-
-                    SolConst::Struct(field_values)
                 }
             },
 
-            // raw pointers which can be null
-            ty::RawPtr(sub_ty, mutability) => {
-                // we only know how to convert a scalar to a sized reference/pointer for now
-                if !sub_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized()) {
-                    bug!("[unsupported] unsized pointee type {sub_ty} as const value scalar");
-                }
-
-                // it is possible that the pointer value is not null (even for a null pointer)
-                let null_mark = val.to_target_usize(self.tcx) as usize;
-                match mutability {
-                    Mutability::Not => SolConst::PtrSizedNullImm(null_mark),
-                    Mutability::Mut => SolConst::PtrSizedNullMut(null_mark),
-                }
-            }
-
-            // all others
-            _ => {
-                bug!("[invariant] unexpected type {normalized_ty} for value scalar constant {val}");
-            }
-        }
-    }
-
-    /// Create a value constant from a MIR scalar pointer
-    fn mk_val_const_from_scalar_ptr(
-        &mut self,
-        ty: Ty<'tcx>,
-        prov: CtfeProvenance,
-        offset: Size,
-    ) -> SolConst {
-        // normalize the type first
-        let normalized_ty =
-            self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
-
-        // derive constant based on the normalized type
-        match normalized_ty.kind() {
-            // packed types
-            ty::Tuple(elem_tys) => {
-                let mut elem_values = vec![];
-                let mut consumed = false;
-                for elem_ty in elem_tys.iter() {
-                    match (consumed, self.mk_val_const_when_zst(elem_ty)) {
-                        (true, None) => {
-                            bug!("[invariant] more than one non-ZST elements in {normalized_ty}");
-                        }
-                        (false, None) => {
-                            let elem_val = self.mk_val_const_from_scalar_ptr(elem_ty, prov, offset);
-                            elem_values.push(elem_val);
-                            consumed = true;
-                        }
-                        (_, Some(zst_val)) => {
-                            elem_values.push(zst_val);
-                        }
-                    }
-                }
-                if !consumed {
-                    bug!("[invariant] no non-ZST elements in {normalized_ty}");
-                }
-                SolConst::Tuple(elem_values)
-            }
-            ty::Adt(def, generics) => match def.adt_kind() {
-                AdtKind::Struct => {
-                    let fields = &def.non_enum_variant().fields;
-
-                    let mut field_values = vec![];
-                    let mut consumed = false;
-                    for (field_idx, field_def) in fields.iter_enumerated() {
-                        let field_ty = field_def.ty(self.tcx, generics);
-                        match (consumed, self.mk_val_const_when_zst(field_ty)) {
-                            (true, None) => {
-                                bug!("[invariant] more than one non-ZST fields in {normalized_ty}");
-                            }
-                            (false, None) => {
-                                let field_val =
-                                    self.mk_val_const_from_scalar_ptr(field_ty, prov, offset);
-                                field_values.push((SolFieldIndex(field_idx.index()), field_val));
-                                consumed = true;
-                            }
-                            (_, Some(zst_val)) => {
-                                field_values.push((SolFieldIndex(field_idx.index()), zst_val));
-                            }
-                        }
-                    }
-                    if !consumed {
-                        bug!("[invariant] no non-ZST fields in {normalized_ty}");
-                    }
-
-                    SolConst::Struct(field_values)
-                }
-                AdtKind::Union => bug!("[unsupported] ptr scalar for union {normalized_ty}"),
-                AdtKind::Enum => bug!("[unsupported] ptr scalar for enum {normalized_ty}"),
-            },
-
-            // pointers or references
+            // reference and pointer types
             ty::Ref(_, sub_ty, mutability) | ty::RawPtr(sub_ty, mutability) => {
-                // we only know how to convert a scalar to a sized reference/pointer for now
+                // we only know how to convert a scalar to a sized reference or pointer for now (i.e., ZST as metadata)
                 if !sub_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized()) {
-                    bug!("[unsupported] unsized pointee type {sub_ty} as const scalar pointer");
+                    bug!("[unsupported] unsized pointee type {sub_ty} as scalar");
                 }
 
-                // try to probe the memory behind the pointer
-                let parsed_prov = self.make_provenance(prov, *sub_ty, *mutability);
+                // switch based on whether the scalar is a pointer or an integer
+                match scalar {
+                    Scalar::Int(int) => {
+                        // a reference type cannot be null
+                        if !normalized_ty.is_raw_ptr() {
+                            bug!("[invariant] unexpected scalar {int} for ref {normalized_ty}");
+                        }
 
-                // construct the constant based on mutability and whether it is a raw pointer
-                let offset = SolOffset(offset.bytes_usize());
-                match (parsed_prov, normalized_ty.is_raw_ptr()) {
-                    (SolProvenance::Const(val), true) => {
-                        SolConst::PtrSizedConst(val.into(), offset)
+                        // null pointer with an absolute value (which might be non-zero) as a mark
+                        let mark = int.to_target_usize(self.tcx) as usize;
+                        match mutability {
+                            Mutability::Not => SolConst::PtrSizedNullImm(mark),
+                            Mutability::Mut => SolConst::PtrSizedNullMut(mark),
+                        }
                     }
-                    (SolProvenance::Const(val), false) => {
-                        SolConst::RefSizedConst(val.into(), offset)
-                    }
-                    (SolProvenance::VarImm(ident), true) => SolConst::PtrSizedVarImm(ident, offset),
-                    (SolProvenance::VarImm(ident), false) => {
-                        SolConst::RefSizedVarImm(ident, offset)
-                    }
-                    (SolProvenance::VarMut(ident), true) => SolConst::PtrSizedVarMut(ident, offset),
-                    (SolProvenance::VarMut(ident), false) => {
-                        SolConst::RefSizedVarMut(ident, offset)
+                    Scalar::Ptr(ptr, _) => {
+                        // try to probe the memory behind the pointer
+                        let (prov, offset) = ptr.prov_and_relative_offset();
+                        let parsed_prov = self.make_provenance(prov, *sub_ty, *mutability);
+
+                        // construct the constant based on mutability and whether it is a raw pointer
+                        let offset = SolOffset(offset.bytes_usize());
+                        match (parsed_prov, normalized_ty.is_raw_ptr()) {
+                            (SolProvenance::Const(val), true) => {
+                                SolConst::PtrSizedConst(val.into(), offset)
+                            }
+                            (SolProvenance::Const(val), false) => {
+                                SolConst::RefSizedConst(val.into(), offset)
+                            }
+                            (SolProvenance::VarImm(ident), true) => {
+                                SolConst::PtrSizedVarImm(ident, offset)
+                            }
+                            (SolProvenance::VarImm(ident), false) => {
+                                SolConst::RefSizedVarImm(ident, offset)
+                            }
+                            (SolProvenance::VarMut(ident), true) => {
+                                SolConst::PtrSizedVarMut(ident, offset)
+                            }
+                            (SolProvenance::VarMut(ident), false) => {
+                                SolConst::RefSizedVarMut(ident, offset)
+                            }
+                        }
                     }
                 }
             }
 
             // function pointers
-            ty::FnPtr(..) => {
-                bug!("[unsupported] function pointer for scalar pointer constant");
-            }
+            ty::FnPtr(..) => match scalar {
+                Scalar::Ptr(scalar_ptr, _) => {
+                    let (prov, offset) = scalar_ptr.into_raw_parts();
+                    if offset != Size::ZERO {
+                        bug!("[invariant] unexpected non-zero offset for function pointer");
+                    }
+
+                    match self.tcx.global_alloc(prov.alloc_id()) {
+                        GlobalAlloc::Function { instance } => {
+                            let (kind, ident, ty_args) = self.make_instance(instance);
+                            SolConst::FuncPtr(kind, ident, ty_args)
+                        }
+                        _ => bug!("[invariant] unexpected allocation for function pointer"),
+                    }
+                }
+                Scalar::Int(scalar_int) => {
+                    if !scalar_int.is_null() {
+                        bug!("[invariant] unexpected non-null integer for function pointer");
+                    }
+                    SolConst::FuncPtrNull
+                }
+            },
 
             // all others
             _ => {
-                bug!("[invariant] unexpected type {normalized_ty} for ptr scalar {prov:?}");
+                bug!("[unsupported] type {normalized_ty} as scalar constant {scalar}");
             }
         }
+    }
+
+    /// Utility: populate all fields of a variant with ZST constants
+    fn populate_const_fields_with_zst(
+        &mut self,
+        variant: &VariantDef,
+        generics: GenericArgsRef<'tcx>,
+    ) -> Vec<(SolFieldIndex, SolConst)> {
+        let mut field_vals = vec![];
+        for (field_idx, field_def) in variant.fields.iter_enumerated() {
+            let field_ty = field_def.ty(self.tcx, generics);
+            let field_val = self.mk_const_from_zst(field_ty);
+            field_vals.push((SolFieldIndex(field_idx.index()), field_val));
+        }
+        field_vals
+    }
+
+    /// Utility: populate all fields of a variant with ZST constants except one field with the scalar
+    fn populate_const_fields_with_scalar(
+        &mut self,
+        variant: &VariantDef,
+        generics: GenericArgsRef<'tcx>,
+        scalar: Scalar,
+    ) -> Vec<(SolFieldIndex, SolConst)> {
+        let mut field_vals = vec![];
+        let mut consumed = false;
+        for (field_idx, field_def) in variant.fields.iter_enumerated() {
+            let field_ty = field_def.ty(self.tcx, generics);
+            match (consumed, self.mk_const_when_zst(field_ty)) {
+                (true, None) => {
+                    bug!("[invariant] field {}: {field_ty} in is not ZST", field_def.name);
+                }
+                (false, None) => {
+                    let field_val = self.mk_const_from_scalar(field_ty, scalar);
+                    field_vals.push((SolFieldIndex(field_idx.index()), field_val));
+                    consumed = true;
+                }
+                (_, Some(zst_val)) => {
+                    field_vals.push((SolFieldIndex(field_idx.index()), zst_val));
+                }
+            }
+        }
+        if !consumed {
+            bug!("[invariant] scalar not consumed in variant {}", variant.name);
+        }
+        field_vals
     }
 
     fn read_const_from_memory_and_layout(
@@ -1011,6 +879,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 bug!("[invariant] failed to read a primitive in memory allocation: {e:?}")
             })
         };
+
+        // record the type
+        self.mk_type(ty);
 
         // normalize the type first
         let normalized_ty =
@@ -1037,13 +908,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     bug!("[invariant] expect a primitive field for value type {normalized_ty}");
                 }
 
-                let v = match read_primitive(self.tcx, offset, layout.size, false) {
-                    Scalar::Int(scalar_int) => scalar_int,
-                    Scalar::Ptr(..) => {
-                        bug!("[invariant] unexpected ptr scalar for value type {normalized_ty}")
-                    }
-                };
-                self.mk_val_const_from_scalar_val(normalized_ty, v)
+                let scalar = read_primitive(self.tcx, offset, layout.size, false);
+                self.mk_const_from_scalar(normalized_ty, scalar)
             }
 
             // pointers
@@ -1106,7 +972,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         _ => bug!("[invariant] {normalized_ty} has non-vtable metadata"),
                     };
 
-                    // ensure that the actual type is sized
+                    // ensure that the actual type is sized (so later we don't parse the metadata as size)
                     if !actual_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized()) {
                         bug!("[assumption] actual type {actual_ty} behind vtable should be sized");
                     }
@@ -1133,7 +999,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     }
                 };
 
-                // check whether the metadata is a ZST
+                // check whether the metadata should be a ZST
                 // NOTE: we only handle size-based metadata for now
                 let need_metadata =
                     !actual_sub_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized());
@@ -1205,13 +1071,13 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 }
                             }
                         }
-                        Err(null_mark) => {
+                        Err(mark) => {
                             if metadata != 0 {
-                                bug!("[invariant] unexpected non-zero metadata for null pointers");
+                                bug!("[invariant] expect zero as metadata for null pointers");
                             }
                             match mutability {
-                                Mutability::Not => SolConst::PtrMetaSizedNullImm(null_mark),
-                                Mutability::Mut => SolConst::PtrMetaSizedNullMut(null_mark),
+                                Mutability::Not => SolConst::PtrMetaSizedNullImm(mark),
+                                Mutability::Mut => SolConst::PtrMetaSizedNullMut(mark),
                             }
                         }
                     }
@@ -1221,7 +1087,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         if pointer_size != layout.size {
                             bug!(
                                 "[invariant] invalid layout size for {normalized_ty},
-                            expect no metadata but got {}",
+                                expect no more metadata behind dyn reference but got {}",
                                 layout.size.bytes_usize()
                             );
                         }
@@ -1528,45 +1394,46 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
                             // parse the tag value
                             let tag_size = tag_type.size(&self.tcx);
-                            let tag_value = match read_primitive(
+                            let tag_scalar = read_primitive(
                                 self.tcx,
                                 offset + tag_offset,
                                 tag_size,
                                 matches!(tag_type, Primitive::Pointer(_)),
-                            ) {
-                                Scalar::Int(val) => val,
-                                Scalar::Ptr(..) => bug!("[unsupported] non-null pointer as tag"),
-                            };
+                            );
 
                             // derive variant index
                             let variant_idx = match tag_encoding {
                                 TagEncoding::Direct => {
-                                    // look for a variant with the same discriminant value
-                                    let mut variant_idx_found = None;
-                                    for (variant_idx, discr) in def.discriminants(self.tcx) {
-                                        if scalar_eq_discr(tag_value, discr) {
-                                            variant_idx_found = Some(variant_idx);
-                                            break;
-                                        }
-                                    }
-                                    variant_idx_found.unwrap_or_else(|| {
-                                        bug!("[invariant] invalid discriminant {tag_value} for {normalized_ty}");
-                                    })
+                                    // direct tag encoding, the scalar value is the discriminant
+                                    let tag_value = expect_scalar_val(tag_scalar);
+                                    get_variant_by_discriminant(self.tcx, *def, tag_value)
                                 }
                                 TagEncoding::Niche {
                                     untagged_variant,
                                     niche_variants,
                                     niche_start,
                                 } => {
-                                    // NOTE: the discriminant and variant index of each variant coincide
-                                    let tag_index = tag_value
-                                        .to_uint(tag_size)
-                                        .wrapping_sub(*niche_start)
-                                        .wrapping_add(niche_variants.start().index() as u128);
-                                    if tag_index >= def.variants().len() as u128 {
-                                        *untagged_variant
-                                    } else {
-                                        VariantIdx::from_usize(tag_index as usize)
+                                    // recover the variant index from the niche tag
+                                    match tag_scalar {
+                                        Scalar::Int(int) => {
+                                            // NOTE: the discriminant and variant index of each variant coincide
+                                            let tag_index = int
+                                                .to_bits_unchecked()
+                                                .wrapping_sub(*niche_start)
+                                                .wrapping_add(
+                                                    niche_variants.start().index() as u128
+                                                );
+
+                                            if tag_index >= def.variants().len() as u128 {
+                                                *untagged_variant
+                                            } else {
+                                                VariantIdx::from_usize(tag_index as usize)
+                                            }
+                                        }
+                                        Scalar::Ptr(..) => {
+                                            // if we get a pointer as a tag, it must be on the untagged variant
+                                            *untagged_variant
+                                        }
                                     }
                                 }
                             };
@@ -1666,6 +1533,30 @@ impl<'tcx> SolContextBuilder<'tcx> {
         (layout.size, parsed)
     }
 
+    /// Create a constant known in the type system
+    fn mk_ty_const(&mut self, ty_const: TyConst<'tcx>) -> SolTyConst {
+        match ty_const.kind() {
+            TyConstKind::Value(val) => {
+                let const_ty = self.mk_type(val.ty);
+                let const_val = self.mk_const_from_valtree(val.ty, val.valtree);
+                SolTyConst::Simple { ty: const_ty, val: const_val }
+            }
+            TyConstKind::Param(..)
+            | TyConstKind::Infer(..)
+            | TyConstKind::Bound(..)
+            | TyConstKind::Placeholder(..)
+            | TyConstKind::Unevaluated(..) => {
+                bug!("[assumption] uninstantiated type constant {ty_const:?}");
+            }
+            TyConstKind::Expr(expr) => {
+                bug!("[unsupported] expression type constant {expr:?}");
+            }
+            TyConstKind::Error(_) => {
+                bug!("[invariant] error type constant");
+            }
+        }
+    }
+
     /// Create a constant known in the value system together with its type
     fn mk_val_const_with_ty(&mut self, val_const: ConstValue, ty: Ty<'tcx>) -> SolConst {
         // normalize the type first
@@ -1674,112 +1565,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
         // switch by the kind of constant value
         match val_const {
-            ConstValue::ZeroSized => self.mk_val_const_from_zst(normalized_ty),
-            ConstValue::Scalar(scalar) => match normalized_ty.kind() {
-                // basic types
-                ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) => {
-                    let val = match scalar {
-                        Scalar::Int(scalar_int) => scalar_int,
-                        Scalar::Ptr(..) => {
-                            bug!("[invariant] unexpected ptr scalar for {normalized_ty}");
-                        }
-                    };
-                    self.mk_val_const_from_scalar_val(normalized_ty, val)
-                }
-
-                // adt
-                ty::Adt(..) => match scalar {
-                    Scalar::Int(scalar_int) => {
-                        self.mk_val_const_from_scalar_val(normalized_ty, scalar_int)
-                    }
-                    Scalar::Ptr(scalar_ptr, _) => {
-                        let (prov, offset) = scalar_ptr.into_raw_parts();
-                        self.mk_val_const_from_scalar_ptr(normalized_ty, prov, offset)
-                    }
-                },
-
-                // pointers or references
-                ty::Ref(_, sub_ty, mutability) | ty::RawPtr(sub_ty, mutability) => {
-                    // we only know how to convert a scalar to a sized reference/pointer for now
-                    if !sub_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized()) {
-                        bug!("[unsupported] unsized pointee type {sub_ty} as const scalar");
-                    }
-
-                    // get the pointer (or possibly null if RawPtr type)
-                    let ptr = match scalar {
-                        Scalar::Ptr(scalar_ptr, _) => scalar_ptr,
-                        Scalar::Int(scalar_int) => {
-                            if !normalized_ty.is_raw_ptr() {
-                                bug!("[invariant] got int scalar for non-ptr type {normalized_ty}");
-                            }
-
-                            // shortcut and early return for null pointers
-                            let null_mark = scalar_int.to_target_usize(self.tcx) as usize;
-                            return match mutability {
-                                Mutability::Not => SolConst::PtrSizedNullImm(null_mark),
-                                Mutability::Mut => SolConst::PtrSizedNullMut(null_mark),
-                            };
-                        }
-                    };
-
-                    let (prov, offset) = ptr.into_raw_parts();
-                    let offset = SolOffset(offset.bytes_usize());
-
-                    // try to probe the memory behind the pointer
-                    let parsed_prov = self.make_provenance(prov, *sub_ty, *mutability);
-
-                    // construct the constant based on mutability and whether it is a raw pointer
-                    match (parsed_prov, normalized_ty.is_raw_ptr()) {
-                        (SolProvenance::Const(val), true) => {
-                            SolConst::PtrSizedConst(val.into(), offset)
-                        }
-                        (SolProvenance::Const(val), false) => {
-                            SolConst::RefSizedConst(val.into(), offset)
-                        }
-                        (SolProvenance::VarImm(ident), true) => {
-                            SolConst::PtrSizedVarImm(ident, offset)
-                        }
-                        (SolProvenance::VarImm(ident), false) => {
-                            SolConst::RefSizedVarImm(ident, offset)
-                        }
-                        (SolProvenance::VarMut(ident), true) => {
-                            SolConst::PtrSizedVarMut(ident, offset)
-                        }
-                        (SolProvenance::VarMut(ident), false) => {
-                            SolConst::RefSizedVarMut(ident, offset)
-                        }
-                    }
-                }
-
-                // function pointers
-                ty::FnPtr(..) => match scalar {
-                    Scalar::Ptr(scalar_ptr, _) => {
-                        let (prov, offset) = scalar_ptr.into_raw_parts();
-                        if offset != Size::ZERO {
-                            bug!("[invariant] unexpected non-zero offset for function pointer");
-                        }
-
-                        match self.tcx.global_alloc(prov.alloc_id()) {
-                            GlobalAlloc::Function { instance } => {
-                                let (kind, ident, ty_args) = self.make_instance(instance);
-                                SolConst::FuncPtr(kind, ident, ty_args)
-                            }
-                            _ => bug!("[invariant] unexpected allocation for function pointer"),
-                        }
-                    }
-                    Scalar::Int(scalar_int) => {
-                        if !scalar_int.is_null() {
-                            bug!("[invariant] unexpected non-null integer for function pointer");
-                        }
-                        SolConst::FuncPtrNull
-                    }
-                },
-
-                // all others
-                _ => {
-                    bug!("[assumption] unexpected type {normalized_ty} for scalar {scalar}");
-                }
-            },
+            ConstValue::ZeroSized => self.mk_const_from_zst(normalized_ty),
+            ConstValue::Scalar(scalar) => self.mk_const_from_scalar(ty, scalar),
             ConstValue::Slice { alloc_id, meta } => {
                 let memory = match self.tcx.global_alloc(alloc_id) {
                     GlobalAlloc::Memory(a) => a.inner(),
@@ -3306,10 +3093,6 @@ impl SolConst {
         };
         Some(val)
     }
-
-    fn is_usize_zero(&self) -> bool {
-        self.as_usize().map_or(false, |v| v == 0)
-    }
 }
 
 impl Display for SolPathDescWithArgs {
@@ -3323,7 +3106,8 @@ impl Display for SolPathDescWithArgs {
  */
 
 /// Compare a scalar int and a discriminant
-fn scalar_eq_discr(scalar: ScalarInt, discr: Discr<'_>) -> bool {
+#[inline]
+fn scalar_eq_discriminant(scalar: ScalarInt, discr: Discr<'_>) -> bool {
     let tmp = discr.val;
     match discr.ty.kind() {
         ty::Int(sub_ty) => {
@@ -3341,6 +3125,187 @@ fn scalar_eq_discr(scalar: ScalarInt, discr: Discr<'_>) -> bool {
         ty::Uint(_) => scalar.to_uint(scalar.size()) == tmp,
         _ => scalar.to_bits_unchecked() == discr.val,
     }
+}
+
+/// Get a uniquely feasible variant for an enum
+#[inline]
+fn get_variant_by_discriminant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: AdtDef<'tcx>,
+    scalar: ScalarInt,
+) -> VariantIdx {
+    let mut variant_idx_found = None;
+    for (variant_idx, discr) in def.discriminants(tcx) {
+        if scalar_eq_discriminant(scalar, discr) {
+            variant_idx_found = Some(variant_idx);
+            break;
+        }
+    }
+    variant_idx_found.unwrap_or_else(|| {
+        bug!("[invariant] no discriminant matches {scalar} for {}", tcx.def_path_str(def.did()));
+    })
+}
+
+/// Get a uniquely feasible variant for an enum
+#[inline]
+fn get_uniquely_feasible_variant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: AdtDef<'tcx>,
+    generics: GenericArgsRef<'tcx>,
+) -> Option<VariantIdx> {
+    let mut feasible_variant = None;
+    for (variant_idx, variant_def) in def.variants().iter_enumerated() {
+        let mut is_variant_feasible = true;
+        for (_, field_def) in variant_def.fields.iter_enumerated() {
+            let field_ty = field_def.ty(tcx, generics);
+            let feasible = match field_ty.kind() {
+                ty::Never => false,
+                ty::Adt(adt_def, _)
+                    if adt_def.adt_kind() == AdtKind::Enum && adt_def.variants().is_empty() =>
+                {
+                    false
+                }
+                _ => true,
+            };
+
+            // the variant is not feasible as long as any field is not feasible
+            if !feasible {
+                is_variant_feasible = false;
+                break;
+            }
+        }
+        if !is_variant_feasible {
+            continue;
+        }
+
+        // found more than one feasible variants
+        if feasible_variant.is_some() {
+            return None;
+        }
+        feasible_variant = Some(variant_idx);
+    }
+
+    // return the uniquely feasible variant, if any
+    feasible_variant
+}
+
+/// Convert a scalar to value
+#[inline]
+fn expect_scalar_val(scalar: Scalar) -> ScalarInt {
+    match scalar {
+        Scalar::Int(int) => int,
+        Scalar::Ptr(ptr, _) => bug!("[invariant] unexpected pointer scalar {ptr:?}"),
+    }
+}
+
+/// Convert a scalar to bool
+#[inline]
+fn expect_scalar_bool(scalar: Scalar) -> bool {
+    !expect_scalar_val(scalar).is_null()
+}
+
+/// Convert a scalar to char
+#[inline]
+fn expect_scalar_char(scalar: Scalar) -> char {
+    expect_scalar_val(scalar).try_into().unwrap_or_else(|_| {
+        bug!("[invariant] invalid scalar for char {scalar:?}");
+    })
+}
+
+/// Convert a scalar to u8
+#[inline]
+fn expect_scalar_u8(scalar: Scalar) -> u8 {
+    expect_scalar_val(scalar).to_u8()
+}
+
+/// Convert a scalar to i8
+#[inline]
+fn expect_scalar_i8(scalar: Scalar) -> i8 {
+    expect_scalar_val(scalar).to_i8()
+}
+
+/// Convert a scalar to u16
+#[inline]
+fn expect_scalar_u16(scalar: Scalar) -> u16 {
+    expect_scalar_val(scalar).to_u16()
+}
+
+/// Convert a scalar to i16
+#[inline]
+fn expect_scalar_i16(scalar: Scalar) -> i16 {
+    expect_scalar_val(scalar).to_i16()
+}
+
+/// Convert a scalar to u32
+#[inline]
+fn expect_scalar_u32(scalar: Scalar) -> u32 {
+    expect_scalar_val(scalar).to_u32()
+}
+
+/// Convert a scalar to i32
+#[inline]
+fn expect_scalar_i32(scalar: Scalar) -> i32 {
+    expect_scalar_val(scalar).to_i32()
+}
+
+/// Convert a scalar to u64
+#[inline]
+fn expect_scalar_u64(scalar: Scalar) -> u64 {
+    expect_scalar_val(scalar).to_u64()
+}
+
+/// Convert a scalar to i64
+#[inline]
+fn expect_scalar_i64(scalar: Scalar) -> i64 {
+    expect_scalar_val(scalar).to_i64()
+}
+
+/// Convert a scalar to u128
+#[inline]
+fn expect_scalar_u128(scalar: Scalar) -> u128 {
+    expect_scalar_val(scalar).to_u128()
+}
+
+/// Convert a scalar to i128
+#[inline]
+fn expect_scalar_i128(scalar: Scalar) -> i128 {
+    expect_scalar_val(scalar).to_i128()
+}
+
+/// Convert a scalar to usize
+#[inline]
+fn expect_scalar_usize(tcx: TyCtxt<'_>, scalar: Scalar) -> usize {
+    expect_scalar_val(scalar).to_target_usize(tcx) as usize
+}
+
+/// Convert a scalar to isize
+#[inline]
+fn expect_scalar_isize(tcx: TyCtxt<'_>, scalar: Scalar) -> isize {
+    expect_scalar_val(scalar).to_target_isize(tcx) as isize
+}
+
+/// Convert a scalar to f16
+#[inline]
+fn expect_scalar_f16(scalar: Scalar) -> String {
+    expect_scalar_val(scalar).to_f16().to_string()
+}
+
+/// Convert a scalar to f32
+#[inline]
+fn expect_scalar_f32(scalar: Scalar) -> String {
+    expect_scalar_val(scalar).to_f32().to_string()
+}
+
+/// Convert a scalar to f64
+#[inline]
+fn expect_scalar_f64(scalar: Scalar) -> String {
+    expect_scalar_val(scalar).to_f64().to_string()
+}
+
+/// Convert a scalar to f128
+#[inline]
+fn expect_scalar_f128(scalar: Scalar) -> String {
+    expect_scalar_val(scalar).to_f128().to_string()
 }
 
 /// A depth counter for indentation in logging
