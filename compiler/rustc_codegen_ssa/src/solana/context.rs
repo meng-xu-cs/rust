@@ -215,7 +215,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let output = self.mk_type(sig.output());
                 SolType::FnPtr(inputs, Box::new(output))
             }
-            ty::Dynamic(predicates, _, _) => {
+            ty::Dynamic(predicates, _) => {
                 let mut trait_refs = vec![];
                 for pred_bounded in predicates {
                     let pred_instiated =
@@ -1744,7 +1744,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     RawPtrKind::FakeForPtrMetadata => SolExpr::FakePointer(converted_place),
                 }
             }
-            Rvalue::Len(place) => SolExpr::Length(self.mk_place(*place)),
             Rvalue::Cast(cast_kind, operand, ty) => {
                 let opcode = match cast_kind {
                     CastKind::IntToInt => SolOpcodeCast::IntToInt,
@@ -2615,7 +2614,6 @@ pub(crate) enum SolExpr {
     PointerImm(SolPlace),
     PointerMut(SolPlace),
     FakePointer(SolPlace),
-    Length(SolPlace),
     Cast { opcode: SolOpcodeCast, place: SolOperand, ty: SolType },
     OpNullary { opcode: SolOpcodeNullary, ty: SolType },
     OpUnary { opcode: SolOpcodeUnary, val: SolOperand },
