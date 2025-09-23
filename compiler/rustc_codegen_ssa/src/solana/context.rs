@@ -506,6 +506,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
 
     /// Create a constant if the type is a ZST
     fn mk_const_when_zst(&mut self, ty: Ty<'tcx>) -> Option<SolConst> {
+        // record the type
+        self.mk_type(ty);
+
         // normalize the type first
         let normalized_ty =
             self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
@@ -575,6 +578,9 @@ impl<'tcx> SolContextBuilder<'tcx> {
     }
 
     fn mk_const_from_scalar(&mut self, ty: Ty<'tcx>, scalar: Scalar) -> SolConst {
+        // record the type
+        self.mk_type(ty);
+
         // normalize the type first
         let normalized_ty =
             self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty);
@@ -738,7 +744,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             },
 
             // reference and pointer types
-            ty::Ref(_, sub_ty, mutability) | ty::RawPtr(sub_ty, mutability) => {
+            ty::Ref(_, sub_ty, _) | ty::RawPtr(sub_ty, _) => {
                 // we only know how to convert a scalar to a sized reference or pointer for now (i.e., ZST as metadata)
                 if !sub_ty.is_sized(self.tcx, TypingEnv::fully_monomorphized()) {
                     bug!("[unsupported] unsized pointee type {sub_ty} as scalar");
@@ -753,18 +759,15 @@ impl<'tcx> SolContextBuilder<'tcx> {
                         }
 
                         // null pointer with an absolute value (which might be non-zero) as a mark
-                        let mark = int.to_target_usize(self.tcx) as usize;
-                        match mutability {
-                            Mutability::Not => SolConst::PtrSizedNullImm(mark),
-                            Mutability::Mut => SolConst::PtrSizedNullMut(mark),
-                        }
+                        let addr = SolAddress(int.to_target_usize(self.tcx) as usize);
+                        SolConst::PtrSizedNull(addr)
                     }
                     Scalar::Ptr(ptr, _) => {
                         // try to probe the memory behind the pointer
                         let (prov, offset) = ptr.prov_and_relative_offset();
-                        let parsed_prov = self.make_provenance(prov, *sub_ty, *mutability);
+                        let parsed_prov = self.make_provenance(prov, *sub_ty);
 
-                        // construct the constant based on mutability and whether it is a raw pointer
+                        // construct the constant
                         let offset = SolOffset(offset.bytes_usize());
                         match (parsed_prov, normalized_ty.is_raw_ptr()) {
                             (SolProvenance::Const(val), true) => {
@@ -773,17 +776,20 @@ impl<'tcx> SolContextBuilder<'tcx> {
                             (SolProvenance::Const(val), false) => {
                                 SolConst::RefSizedConst(val.into(), offset)
                             }
-                            (SolProvenance::VarImm(ident), true) => {
-                                SolConst::PtrSizedVarImm(ident, offset)
+                            (SolProvenance::Var(ident), true) => {
+                                SolConst::PtrSizedVar(ident, offset)
                             }
-                            (SolProvenance::VarImm(ident), false) => {
-                                SolConst::RefSizedVarImm(ident, offset)
+                            (SolProvenance::Var(ident), false) => {
+                                SolConst::RefSizedVar(ident, offset)
                             }
-                            (SolProvenance::VarMut(ident), true) => {
-                                SolConst::PtrSizedVarMut(ident, offset)
+                            (SolProvenance::Type(ty), true) => {
+                                if offset.0 != 0 {
+                                    bug!("[invariant] unexpected non-zero offset for type id");
+                                }
+                                SolConst::TypeId(ty)
                             }
-                            (SolProvenance::VarMut(ident), false) => {
-                                SolConst::RefSizedVarMut(ident, offset)
+                            (SolProvenance::Type(_), false) => {
+                                bug!("[invariant] unexpected type id for ref {normalized_ty}");
                             }
                         }
                     }
@@ -913,7 +919,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             }
 
             // pointers
-            ty::RawPtr(sub_ty, mutability) | ty::Ref(_, sub_ty, mutability) => {
+            ty::RawPtr(sub_ty, _) | ty::Ref(_, sub_ty, _) => {
                 // sanity check on the variants
                 match &layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
@@ -988,14 +994,30 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     Scalar::Ptr(ptr, _) => {
                         let (prov, offset) = ptr.into_raw_parts();
                         let offset = SolOffset(offset.bytes_usize());
-                        let parsed_prov = self.make_provenance(prov, actual_sub_ty, *mutability);
+                        let parsed_prov = self.make_provenance(prov, actual_sub_ty);
+                        // shortcircuit if we found a type id in memory
+                        if let SolProvenance::Type(tyid) = &parsed_prov {
+                            if !matches!(normalized_ty.kind(), ty::RawPtr(_, _)) {
+                                bug!("[invariant] unexpected type id for ref {normalized_ty}");
+                            }
+                            if !sub_ty.is_unit() {
+                                bug!("[invariant] unexpected type id subtype: {sub_ty}");
+                            }
+                            if layout.size != pointer_size {
+                                bug!(
+                                    "[invariant] unexpected layout size for type id: {}",
+                                    layout.size.bytes_usize()
+                                );
+                            }
+                            return (layout.size, SolConst::TypeId(tyid.clone()));
+                        }
                         Ok((parsed_prov, offset))
                     }
                     Scalar::Int(int) => {
                         if !normalized_ty.is_raw_ptr() {
                             bug!("[invariant] unexpected scalar int for {normalized_ty} in memory");
                         }
-                        Err(int.to_target_usize(self.tcx) as usize)
+                        Err(SolAddress(int.to_target_usize(self.tcx) as usize))
                     }
                 };
 
@@ -1057,28 +1079,22 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 (SolProvenance::Const(val), false) => {
                                     SolConst::RefMetaSizedConst(ptr_metadata, val.into(), offset)
                                 }
-                                (SolProvenance::VarImm(ident), true) => {
-                                    SolConst::PtrMetaSizedVarImm(ptr_metadata, ident, offset)
+                                (SolProvenance::Var(ident), true) => {
+                                    SolConst::PtrMetaSizedVar(ptr_metadata, ident, offset)
                                 }
-                                (SolProvenance::VarImm(ident), false) => {
-                                    SolConst::RefMetaSizedVarImm(ptr_metadata, ident, offset)
+                                (SolProvenance::Var(ident), false) => {
+                                    SolConst::RefMetaSizedVar(ptr_metadata, ident, offset)
                                 }
-                                (SolProvenance::VarMut(ident), true) => {
-                                    SolConst::PtrMetaSizedVarMut(ptr_metadata, ident, offset)
-                                }
-                                (SolProvenance::VarMut(ident), false) => {
-                                    SolConst::RefMetaSizedVarMut(ptr_metadata, ident, offset)
+                                (SolProvenance::Type(_), _) => {
+                                    bug!("[invariant] type id should be handled earlier");
                                 }
                             }
                         }
-                        Err(mark) => {
+                        Err(addr) => {
                             if metadata != 0 {
                                 bug!("[invariant] expect zero as metadata for null pointers");
                             }
-                            match mutability {
-                                Mutability::Not => SolConst::PtrMetaSizedNullImm(mark),
-                                Mutability::Mut => SolConst::PtrMetaSizedNullMut(mark),
-                            }
+                            SolConst::PtrMetaSizedNull(addr)
                         }
                     }
                 } else {
@@ -1107,24 +1123,18 @@ impl<'tcx> SolContextBuilder<'tcx> {
                                 (SolProvenance::Const(val), false) => {
                                     SolConst::RefSizedConst(val.into(), offset)
                                 }
-                                (SolProvenance::VarImm(ident), true) => {
-                                    SolConst::PtrSizedVarImm(ident, offset)
+                                (SolProvenance::Var(ident), true) => {
+                                    SolConst::PtrSizedVar(ident, offset)
                                 }
-                                (SolProvenance::VarImm(ident), false) => {
-                                    SolConst::RefSizedVarImm(ident, offset)
+                                (SolProvenance::Var(ident), false) => {
+                                    SolConst::RefSizedVar(ident, offset)
                                 }
-                                (SolProvenance::VarMut(ident), true) => {
-                                    SolConst::PtrSizedVarMut(ident, offset)
-                                }
-                                (SolProvenance::VarMut(ident), false) => {
-                                    SolConst::RefSizedVarMut(ident, offset)
+                                (SolProvenance::Type(_), _) => {
+                                    bug!("[invariant] type id should be handled earlier");
                                 }
                             }
                         }
-                        Err(null_mark) => match mutability {
-                            Mutability::Not => SolConst::PtrSizedNullImm(null_mark),
-                            Mutability::Mut => SolConst::PtrSizedNullMut(null_mark),
-                        },
+                        Err(addr) => SolConst::PtrSizedNull(addr),
                     }
                 }
             }
@@ -2110,6 +2120,21 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     }
                 }
 
+                // check if this is a function in a native crate
+                if !self.tcx.is_mir_available(def_id) {
+                    let crate_name = self.tcx.crate_name(def_id.krate);
+                    let known_crate = match crate_name.as_str() {
+                        "core" => Some(SolNativeCrate::Core),
+                        "alloc" => Some(SolNativeCrate::Alloc),
+                        "std" => Some(SolNativeCrate::Std),
+                        _ => None,
+                    };
+                    if let Some(native) = known_crate {
+                        info!("{}-- native {native:?}: {def_desc}", self.depth);
+                        return (SolInstanceKind::Native(native), ident, ty_args);
+                    }
+                }
+
                 // not a builtin, continue processing
                 SolInstanceKind::Regular
             }
@@ -2205,7 +2230,8 @@ impl<'tcx> SolContextBuilder<'tcx> {
             | SolInstanceKind::ClosureOnceShim => self.tcx.mir_shims(instance.def).clone(),
 
             // already handled before
-            SolInstanceKind::Builtin(_)
+            SolInstanceKind::Native(_)
+            | SolInstanceKind::Builtin(_)
             | SolInstanceKind::Intrinsic
             | SolInstanceKind::Virtual(_) => {
                 bug!("[invariant] unexpected instance kind");
@@ -2285,12 +2311,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         (kind, ident, ty_args)
     }
 
-    fn make_provenance(
-        &mut self,
-        prov: CtfeProvenance,
-        ty: Ty<'tcx>,
-        mutability: Mutability,
-    ) -> SolProvenance {
+    fn make_provenance(&mut self, prov: CtfeProvenance, ty: Ty<'tcx>) -> SolProvenance {
         match self.tcx.global_alloc(prov.alloc_id()) {
             GlobalAlloc::Memory(allocated) => {
                 let (_, const_val) =
@@ -2316,15 +2337,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     self.globals.insert(ident.clone(), (init_ty, init_val));
                 }
 
-                // split by mutability
-                match mutability {
-                    Mutability::Not => SolProvenance::VarImm(ident),
-                    Mutability::Mut => SolProvenance::VarMut(ident),
-                }
+                // return the provenance
+                SolProvenance::Var(ident)
             }
+            GlobalAlloc::TypeId { ty } => SolProvenance::Type(self.mk_type(ty)),
             GlobalAlloc::Function { .. } => bug!("[invariant] unexpected function in provenance"),
             GlobalAlloc::VTable(..) => bug!("[unsupported] vtable in provenance"),
-            GlobalAlloc::TypeId { .. } => bug!("[unsupported] type id in provenance"),
         }
     }
 
@@ -2777,14 +2795,17 @@ pub(crate) struct SolFnDef {
 pub(crate) struct SolOffset(pub(crate) usize);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolAddress(pub(crate) usize);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolPtrMetadata(pub(crate) usize);
 
 /// A provenance origin
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolProvenance {
     Const(SolConst),
-    VarImm(SolIdent),
-    VarMut(SolIdent),
+    Var(SolIdent),
+    Type(SolType),
 }
 
 /*
@@ -2844,28 +2865,25 @@ pub(crate) enum SolConst {
     RefString(String),
 
     RefSizedConst(Box<SolConst>, SolOffset),
-    RefSizedVarImm(SolIdent, SolOffset),
-    RefSizedVarMut(SolIdent, SolOffset),
+    RefSizedVar(SolIdent, SolOffset),
     RefMetaSizedConst(SolPtrMetadata, Box<SolConst>, SolOffset),
-    RefMetaSizedVarImm(SolPtrMetadata, SolIdent, SolOffset),
-    RefMetaSizedVarMut(SolPtrMetadata, SolIdent, SolOffset),
+    RefMetaSizedVar(SolPtrMetadata, SolIdent, SolOffset),
 
     /* pointers */
     PtrSizedConst(Box<SolConst>, SolOffset),
-    PtrSizedVarImm(SolIdent, SolOffset),
-    PtrSizedVarMut(SolIdent, SolOffset),
+    PtrSizedVar(SolIdent, SolOffset),
     PtrMetaSizedConst(SolPtrMetadata, Box<SolConst>, SolOffset),
-    PtrMetaSizedVarImm(SolPtrMetadata, SolIdent, SolOffset),
-    PtrMetaSizedVarMut(SolPtrMetadata, SolIdent, SolOffset),
+    PtrMetaSizedVar(SolPtrMetadata, SolIdent, SolOffset),
 
-    PtrSizedNullImm(usize),
-    PtrSizedNullMut(usize),
-    PtrMetaSizedNullImm(usize),
-    PtrMetaSizedNullMut(usize),
+    PtrSizedNull(SolAddress),
+    PtrMetaSizedNull(SolAddress),
 
     /* function pointers */
     FuncPtrNull,
     FuncPtr(SolInstanceKind, SolIdent, Vec<SolGenericArg>),
+
+    /* type id */
+    TypeId(SolType),
 }
 
 /*
@@ -2875,6 +2893,7 @@ pub(crate) enum SolConst {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolInstanceKind {
     Regular,
+    Native(SolNativeCrate),
     Builtin(SolBuiltinFunc),
 
     /* drop operation */
@@ -2895,36 +2914,14 @@ pub(crate) enum SolInstanceKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolNativeCrate {
+    Core,
+    Alloc,
+    Std,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolBuiltinFunc {
-    /* panics */
-    IntrinsicsAssertFailedInner,
-    IntrinsicsPanic,
-    IntrinsicsPanicNounwind,
-    IntrinsicsPanicFmt,
-    IntrinsicsPanicNounwindFmt,
-    IntrinsicsResultUnwrapFailed,
-    IntrinsicsOptionUnwrapFailed,
-    IntrinsicsVecRemoveAssertFailed,
-    IntrinsicsSliceIndexFailed,
-    IntrinsicsSliceLenMismatchFailed,
-    /* alloc */
-    AllocGlobalAllocImpl,
-    AllocRustAlloc,
-    AllocRustAllocZeroed,
-    AllocRustRealloc,
-    AllocRustDealloc,
-    AllocExchangeMalloc,
-    AllocHandleAllocError,
-    AllocRawVecHandleError,
-    LayoutIsSizeAlignValid,
-    /* casting */
-    DowncastRef,
-    /* formatter */
-    StdFmtWrite,
-    DebugFmt,
-    FormatInner,
-    CoreFmt,
-    SpecToString,
     /* rust unit test */
     TestMainStatic,
     /* solana */
@@ -2992,37 +2989,6 @@ impl From<FloatTy> for SolTypeFloat {
 impl SolBuiltinFunc {
     fn regex(&self) -> Regex {
         let pattern = match self {
-            /* panics */
-            Self::IntrinsicsAssertFailedInner => r"panicking::assert_failed_inner",
-            Self::IntrinsicsPanic => r"panic",
-            Self::IntrinsicsPanicNounwind => r"panic_nounwind",
-            Self::IntrinsicsPanicFmt => r"panic_fmt",
-            Self::IntrinsicsPanicNounwindFmt => r"panic_nounwind_fmt",
-            Self::IntrinsicsResultUnwrapFailed => r"result::unwrap_failed",
-            Self::IntrinsicsOptionUnwrapFailed => r"option::unwrap_failed",
-            Self::IntrinsicsVecRemoveAssertFailed => r"Vec::<.*>::remove::assert_failed",
-            Self::IntrinsicsSliceIndexFailed => "core::slice::index::slice_index_fail",
-            Self::IntrinsicsSliceLenMismatchFailed => {
-                "core::slice::<.*>::copy_from_slice::len_mismatch_fail"
-            }
-            /* alloc */
-            Self::AllocGlobalAllocImpl => r"std::alloc::Global::alloc_impl",
-            Self::AllocRustAlloc => r"alloc::alloc::__rust_alloc",
-            Self::AllocRustAllocZeroed => r"alloc::alloc::__rust_alloc_zeroed",
-            Self::AllocRustRealloc => r"alloc::alloc::__rust_realloc",
-            Self::AllocRustDealloc => r"alloc::alloc::__rust_dealloc",
-            Self::AllocExchangeMalloc => r"alloc::alloc::exchange_malloc",
-            Self::AllocHandleAllocError => r"handle_alloc_error",
-            Self::AllocRawVecHandleError => r"alloc::raw_vec::handle_error",
-            Self::LayoutIsSizeAlignValid => r"Layout::is_size_align_valid",
-            /* casting */
-            Self::DowncastRef => r"<.*>::downcast_ref::<.*>",
-            /* formatter */
-            Self::StdFmtWrite => r"std::fmt::write",
-            Self::DebugFmt => r"<.* as Debug>::fmt",
-            Self::FormatInner => r"format::format_inner",
-            Self::CoreFmt => r"core::fmt::.*::fmt",
-            Self::SpecToString => r"<.* as string::SpecToString>::spec_to_string",
             /* rust unit test */
             Self::TestMainStatic => r"test_main_static",
             /* solana */
@@ -3036,34 +3002,6 @@ impl SolBuiltinFunc {
 
     fn all() -> Vec<Self> {
         vec![
-            /* panics */
-            Self::IntrinsicsAssertFailedInner,
-            Self::IntrinsicsPanic,
-            Self::IntrinsicsPanicNounwind,
-            Self::IntrinsicsPanicFmt,
-            Self::IntrinsicsPanicNounwindFmt,
-            Self::IntrinsicsResultUnwrapFailed,
-            Self::IntrinsicsOptionUnwrapFailed,
-            Self::IntrinsicsVecRemoveAssertFailed,
-            Self::IntrinsicsSliceIndexFailed,
-            /* alloc */
-            Self::AllocGlobalAllocImpl,
-            Self::AllocRustAlloc,
-            Self::AllocRustAllocZeroed,
-            Self::AllocRustRealloc,
-            Self::AllocRustDealloc,
-            Self::AllocExchangeMalloc,
-            Self::AllocHandleAllocError,
-            Self::AllocRawVecHandleError,
-            Self::LayoutIsSizeAlignValid,
-            /* casting */
-            Self::DowncastRef,
-            /* formatter */
-            Self::StdFmtWrite,
-            Self::DebugFmt,
-            Self::FormatInner,
-            Self::CoreFmt,
-            Self::SpecToString,
             /* rust unit test */
             Self::TestMainStatic,
             /* solana */
