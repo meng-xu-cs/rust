@@ -820,6 +820,12 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
             },
 
+            // closure
+            ty::Closure(def_id, generics) => {
+                let (kind, ident, ty_args) = self.make_type_closure(*def_id, generics);
+                SolConst::Closure(kind, ident, ty_args)
+            }
+
             // all others
             _ => {
                 bug!("[unsupported] type {normalized_ty} as scalar constant {scalar}");
@@ -3063,21 +3069,32 @@ impl Display for SolPathDescWithArgs {
 /// Compare a scalar int and a discriminant
 #[inline]
 fn scalar_eq_discriminant(scalar: ScalarInt, discr: Discr<'_>) -> bool {
-    let tmp = discr.val;
+    let scalar_size = scalar.size().bytes();
     match discr.ty.kind() {
-        ty::Int(sub_ty) => {
-            let lhs = scalar.to_int(scalar.size());
-            let rhs = match sub_ty {
-                IntTy::I8 => tmp as u8 as i8 as i128,
-                IntTy::I16 => tmp as u16 as i16 as i128,
-                IntTy::I32 => tmp as u32 as i32 as i128,
-                IntTy::I64 => tmp as u64 as i64 as i128,
-                IntTy::I128 => tmp as i128,
-                IntTy::Isize => tmp as isize as i128,
-            };
-            lhs == rhs
-        }
-        ty::Uint(_) => scalar.to_uint(scalar.size()) == tmp,
+        ty::Int(sub_ty) => match (sub_ty, scalar_size) {
+            (IntTy::I8, 1) => scalar.to_i8() == discr.val as i8,
+            (IntTy::I16, 1) => scalar.to_i8() == discr.val as i8,
+            (IntTy::I16, 2) => scalar.to_i16() == discr.val as i16,
+            (IntTy::I32, 1) => scalar.to_i8() == discr.val as i8,
+            (IntTy::I32, 2) => scalar.to_i16() == discr.val as i16,
+            (IntTy::I32, 4) => scalar.to_i32() == discr.val as i32,
+            (IntTy::I64, 1) => scalar.to_i8() == discr.val as i8,
+            (IntTy::I64, 2) => scalar.to_i16() == discr.val as i16,
+            (IntTy::I64, 4) => scalar.to_i32() == discr.val as i32,
+            (IntTy::I64, 8) => scalar.to_i64() == discr.val as i64,
+            (IntTy::I128, 1) => scalar.to_i8() == discr.val as i8,
+            (IntTy::I128, 2) => scalar.to_i16() == discr.val as i16,
+            (IntTy::I128, 4) => scalar.to_i32() == discr.val as i32,
+            (IntTy::I128, 8) => scalar.to_i64() == discr.val as i64,
+            (IntTy::I128, 16) => scalar.to_i128() == discr.val as i128,
+            (IntTy::Isize, 1) => scalar.to_i8() == discr.val as i8,
+            (IntTy::Isize, 2) => scalar.to_i16() == discr.val as i16,
+            (IntTy::Isize, 4) => scalar.to_i32() == discr.val as i32,
+            (IntTy::Isize, 8) => scalar.to_i64() == discr.val as i64,
+            (IntTy::Isize, 16) => scalar.to_i128() == discr.val as i128,
+            _ => bug!("[invariant] unexpected ({scalar_size}, {}) pair for discriminant", discr.ty),
+        },
+        ty::Uint(_) => scalar.to_uint(scalar.size()) == discr.val,
         _ => scalar.to_bits_unchecked() == discr.val,
     }
 }
