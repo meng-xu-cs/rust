@@ -3,8 +3,8 @@ use std::fmt::Display;
 
 use regex::Regex;
 use rustc_abi::{
-    BackendRepr, FieldIdx, FieldsShape, HasDataLayout, Primitive, Scalar as ScalarAbi, Size,
-    TagEncoding, VariantIdx, Variants,
+    BackendRepr, CanonAbi, FieldIdx, FieldsShape, HasDataLayout, Primitive, Scalar as ScalarAbi,
+    Size, TagEncoding, VariantIdx, Variants,
 };
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
@@ -2135,6 +2135,21 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     }
                 }
 
+                // check if this is an extern function
+                let abi = self
+                    .tcx
+                    .fn_abi_of_instance(
+                        TypingEnv::fully_monomorphized()
+                            .as_query_input((instance, ty::List::empty())),
+                    )
+                    .unwrap_or_else(|e| {
+                        bug!("[invariant] unable to get ABI of instance {def_desc}: {e:#?}")
+                    });
+                if !matches!(abi.conv, CanonAbi::Rust | CanonAbi::RustCold) {
+                    info!("{}-- extern {}: {def_desc}", self.depth, abi.conv);
+                    return (SolInstanceKind::Extern, ident, ty_args);
+                }
+
                 // not a builtin, continue processing
                 SolInstanceKind::Regular
             }
@@ -2232,6 +2247,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
             // already handled before
             SolInstanceKind::Native(_)
             | SolInstanceKind::Builtin(_)
+            | SolInstanceKind::Extern
             | SolInstanceKind::Intrinsic
             | SolInstanceKind::Virtual(_) => {
                 bug!("[invariant] unexpected instance kind");
@@ -2893,8 +2909,11 @@ pub(crate) enum SolConst {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolInstanceKind {
     Regular,
+
+    /* handled by the runtime */
     Native(SolNativeCrate),
     Builtin(SolBuiltinFunc),
+    Extern,
 
     /* drop operation */
     DropEmpty,
