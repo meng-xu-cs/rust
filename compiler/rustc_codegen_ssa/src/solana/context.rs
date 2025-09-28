@@ -2221,7 +2221,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
         let instance_mir = match kind {
             SolInstanceKind::Regular => {
                 if !self.tcx.is_mir_available(def_id) {
-                    warn!("{}-- external dependency: {def_desc}", self.depth);
+                    warn!("{}-- dependency: {def_desc}", self.depth);
                     let deps_inner = self
                         .dep_fns
                         .entry(ident.clone())
