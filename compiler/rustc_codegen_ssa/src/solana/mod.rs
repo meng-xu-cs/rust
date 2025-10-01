@@ -4,6 +4,7 @@ use rustc_middle::ty::{Instance, TyCtxt};
 pub(crate) mod common;
 pub(crate) mod context;
 pub(crate) mod pipeline_anchor;
+pub(crate) mod pipeline_selftest;
 pub(crate) mod pipeline_shared;
 pub(crate) mod pipeline_spl;
 
@@ -19,6 +20,7 @@ pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
     // work on the monomorphised MIR
     match sol.phase {
         Phase::Bootstrap => match sol.build_system {
+            BuildSystem::SelfTest => pipeline_selftest::phase_bootstrap(tcx, sol, instance),
             BuildSystem::Spl => pipeline_spl::phase_bootstrap(tcx, sol, instance),
             BuildSystem::Anchor => pipeline_anchor::phase_bootstrap(tcx, sol, instance),
         },
