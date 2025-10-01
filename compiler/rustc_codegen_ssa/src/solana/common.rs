@@ -16,13 +16,18 @@ const COMPONENT_NAME: &str = "solanalysis";
 /// Supported build systems
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum BuildSystem {
+    /// Self-test projects for the toolchain itself
+    SelfTest,
+    /// Solana Program Library (SPL) program Rust unit tests
     Spl,
+    /// Anchor-based programs
     Anchor,
 }
 
 impl Display for BuildSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::SelfTest => write!(f, "selftest"),
             Self::Spl => write!(f, "spl"),
             Self::Anchor => write!(f, "anchor"),
         }
@@ -81,6 +86,7 @@ pub(crate) fn retrieve_env(tcx: TyCtxt<'_>) -> Option<SolEnv> {
     // grab information from the environment variables
     let build_system = match env::var(format!("{env_prefix}_BUILD_SYSTEM")) {
         Ok(val) => match val.as_str() {
+            "selftest" => BuildSystem::SelfTest,
             "spl" => BuildSystem::Spl,
             "anchor" => BuildSystem::Anchor,
             _ => bug!("[user-input] unexpected build system: {val}"),
