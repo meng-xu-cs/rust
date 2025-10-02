@@ -545,11 +545,17 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     let mut fields = vec![];
                     for (field_idx, field_def) in variant.fields.iter_enumerated() {
                         let field_val = self.mk_const_when_zst(field_def.ty(self.tcx, generics))?;
-                        fields.push((SolFieldIndex(field_idx.as_usize()), field_val));
+                        fields.push((SolFieldIndex(field_idx.index()), field_val));
                     }
                     SolConst::Struct(fields)
                 }
-                AdtKind::Union => return None, // unions cannot be ZSTs
+                AdtKind::Union => {
+                    // a union is a ZST if it has only one feasible field and the field is a ZST
+                    let field_idx = get_uniquely_feasible_field(self.tcx, *def, generics)?;
+                    let field_def = def.non_enum_variant().fields.get(field_idx).unwrap();
+                    let field_val = self.mk_const_when_zst(field_def.ty(self.tcx, generics))?;
+                    SolConst::Union(SolFieldIndex(field_idx.index()), field_val.into())
+                }
                 AdtKind::Enum => {
                     // an enum is a ZST if it has only one feasible variant and all fields in that variant are ZSTs
                     let variant_idx = get_uniquely_feasible_variant(self.tcx, *def, generics)?;
@@ -559,7 +565,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     let mut fields = vec![];
                     for (field_idx, field_def) in variant_def.fields.iter_enumerated() {
                         let field_val = self.mk_const_when_zst(field_def.ty(self.tcx, generics))?;
-                        fields.push((SolFieldIndex(field_idx.as_usize()), field_val));
+                        fields.push((SolFieldIndex(field_idx.index()), field_val));
                     }
                     SolConst::Enum(SolVariantIndex(variant_idx.index()), fields)
                 }
@@ -3165,6 +3171,27 @@ fn has_feasible_value<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
         // should not appear
         _ => bug!("[invariant] unexpected type in feasibility query: {ty}"),
     }
+}
+
+/// Get a uniquely feasible field for a union
+#[inline]
+fn get_uniquely_feasible_field<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: AdtDef<'tcx>,
+    generics: GenericArgsRef<'tcx>,
+) -> Option<FieldIdx> {
+    let mut feasible_field = None;
+    for (field_idx, field_def) in def.non_enum_variant().fields.iter_enumerated() {
+        if has_feasible_value(tcx, field_def.ty(tcx, generics)) {
+            if feasible_field.is_some() {
+                // found more than one feasible fields
+                return None;
+            }
+            feasible_field = Some(field_idx);
+        }
+    }
+    // return the uniquely feasible field, if any
+    feasible_field
 }
 
 /// Get a uniquely feasible variant for an enum
