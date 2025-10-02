@@ -3118,6 +3118,55 @@ fn get_variant_by_discriminant<'tcx>(
     })
 }
 
+/// Check whether a type has any feasible value
+#[inline]
+fn has_feasible_value<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    match ty.kind() {
+        // infeasible
+        ty::Never => false,
+
+        // feasible
+        ty::Bool
+        | ty::Char
+        | ty::Int(_)
+        | ty::Uint(_)
+        | ty::Float(_)
+        | ty::Str
+        | ty::FnDef(..)
+        | ty::Closure(..)
+        | ty::FnPtr(..) => true,
+
+        // conditional
+        ty::Tuple(elems) => elems.iter().all(|e| has_feasible_value(tcx, e)),
+        ty::Adt(adt_def, generics) => match adt_def.adt_kind() {
+            AdtKind::Struct => adt_def
+                .non_enum_variant()
+                .fields
+                .iter()
+                .all(|f| has_feasible_value(tcx, f.ty(tcx, generics))),
+            AdtKind::Union => adt_def
+                .non_enum_variant()
+                .fields
+                .iter()
+                .any(|f| has_feasible_value(tcx, f.ty(tcx, generics))),
+            AdtKind::Enum => adt_def.variants().iter().any(|variant| {
+                variant.fields.iter().all(|f| has_feasible_value(tcx, f.ty(tcx, generics)))
+            }),
+        },
+
+        // inner-type
+        ty::Array(sub, _) | ty::Slice(sub) | ty::Ref(_, sub, _) | ty::RawPtr(sub, _) => {
+            has_feasible_value(tcx, *sub)
+        }
+
+        // unsupported
+        ty::Dynamic(..) => bug!("[unsupported] feasibility query for dynamic type"),
+
+        // should not appear
+        _ => bug!("[invariant] unexpected type in feasibility query: {ty}"),
+    }
+}
+
 /// Get a uniquely feasible variant for an enum
 #[inline]
 fn get_uniquely_feasible_variant<'tcx>(
@@ -3127,36 +3176,14 @@ fn get_uniquely_feasible_variant<'tcx>(
 ) -> Option<VariantIdx> {
     let mut feasible_variant = None;
     for (variant_idx, variant_def) in def.variants().iter_enumerated() {
-        let mut is_variant_feasible = true;
-        for (_, field_def) in variant_def.fields.iter_enumerated() {
-            let field_ty = field_def.ty(tcx, generics);
-            let feasible = match field_ty.kind() {
-                ty::Never => false,
-                ty::Adt(adt_def, _)
-                    if adt_def.adt_kind() == AdtKind::Enum && adt_def.variants().is_empty() =>
-                {
-                    false
-                }
-                _ => true,
-            };
-
-            // the variant is not feasible as long as any field is not feasible
-            if !feasible {
-                is_variant_feasible = false;
-                break;
+        if variant_def.fields.iter().all(|f| has_feasible_value(tcx, f.ty(tcx, generics))) {
+            if feasible_variant.is_some() {
+                // found more than one feasible variants
+                return None;
             }
+            feasible_variant = Some(variant_idx);
         }
-        if !is_variant_feasible {
-            continue;
-        }
-
-        // found more than one feasible variants
-        if feasible_variant.is_some() {
-            return None;
-        }
-        feasible_variant = Some(variant_idx);
     }
-
     // return the uniquely feasible variant, if any
     feasible_variant
 }
