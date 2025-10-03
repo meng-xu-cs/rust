@@ -1715,7 +1715,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 let variant_index = SolVariantIndex(variant.index());
                 SolProjection::Downcast { symbol, variant: variant_index }
             }
-            PlaceElem::Subtype(ty) => SolProjection::Subtype(self.mk_type(ty)),
             PlaceElem::OpaqueCast(ty) => {
                 bug!("[invariant] unexpected opaque cast in place conversion: {ty}");
             }
@@ -1775,6 +1774,7 @@ impl<'tcx> SolContextBuilder<'tcx> {
                     CastKind::PtrToPtr => SolOpcodeCast::PtrToPtr,
                     CastKind::FnPtrToPtr => SolOpcodeCast::FnPtrToPtr,
                     CastKind::Transmute => SolOpcodeCast::Transmute,
+                    CastKind::Subtype => SolOpcodeCast::Subtype,
                     CastKind::PointerCoercion(coercion_type, _) => match coercion_type {
                         PointerCoercion::UnsafeFnPointer => SolOpcodeCast::SafeToUnsafe,
                         PointerCoercion::Unsize => SolOpcodeCast::Unsize,
@@ -2629,7 +2629,6 @@ pub(crate) enum SolProjection {
     ConstantIndex { offset: usize, min_length: usize, from_end: bool },
     Subslice { from: usize, to: usize, from_end: bool },
     Downcast { symbol: SolVariantName, variant: SolVariantIndex },
-    Subtype(SolType),
 }
 
 /// A constant known in the operation system
@@ -2679,6 +2678,7 @@ pub(crate) enum SolOpcodeCast {
     PtrToPtr,
     FnPtrToPtr,
     Transmute,
+    Subtype,
     ReifyFnPtr,
     SafeToUnsafe,
     Unsize,
@@ -2964,14 +2964,19 @@ pub(crate) enum SolBuiltinFunc {
  */
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolAnchorInstruction {
+pub(crate) struct SolSelfTest {
     pub(crate) function: SolIdent,
-    pub(crate) ty_state: SolIdent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolSplTestEntrypoint {
     pub(crate) function: SolIdent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolAnchorInstruction {
+    pub(crate) function: SolIdent,
+    pub(crate) ty_state: SolIdent,
 }
 
 /* --- END OF SYNC --- */
