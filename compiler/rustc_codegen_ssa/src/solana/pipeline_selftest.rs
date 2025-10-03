@@ -3,7 +3,7 @@ use rustc_middle::ty::{Instance, InstanceKind, TyCtxt};
 use tracing::{info, warn};
 
 use crate::solana::common::SolEnv;
-use crate::solana::context::{SolContextBuilder, SolSplTestEntrypoint};
+use crate::solana::context::{SolContextBuilder, SolSelfTest};
 
 pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: Instance<'tcx>) {
     info!(
@@ -55,7 +55,7 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     let ctxt_file = sol.context_to_file(&context);
 
     // save the metadata to file
-    let entrypoint = SolSplTestEntrypoint { function: inst_ident };
+    let entrypoint = SolSelfTest { function: inst_ident };
     sol.summary_to_file("selftest", &entrypoint);
 
     // done
