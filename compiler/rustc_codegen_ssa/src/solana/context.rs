@@ -1974,14 +1974,15 @@ impl<'tcx> SolContextBuilder<'tcx> {
                 }
             }
             // storage
-            StatementKind::Deinit(place) => SolStatement::Deinit(self.mk_place(**place)),
             StatementKind::StorageLive(local_idx) => {
                 SolStatement::StorageLive(SolLocalSlot(local_idx.index()))
             }
             StatementKind::StorageDead(local_idx) => {
                 SolStatement::StorageDead(SolLocalSlot(local_idx.index()))
             }
-            StatementKind::PlaceMention(place) => SolStatement::Deinit(self.mk_place(**place)),
+            StatementKind::PlaceMention(place) => {
+                SolStatement::PlaceMention(self.mk_place(**place))
+            }
             // intrinsic
             StatementKind::Intrinsic(intrinsic) => match intrinsic.as_ref() {
                 NonDivergingIntrinsic::Assume(operand) => {
@@ -2752,7 +2753,6 @@ pub(crate) enum SolUnwindAction {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolStatement {
     Nop,
-    Deinit(SolPlace),
     StorageLive(SolLocalSlot),
     StorageDead(SolLocalSlot),
     PlaceMention(SolPlace),
