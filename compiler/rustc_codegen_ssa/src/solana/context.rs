@@ -2960,23 +2960,12 @@ pub(crate) enum SolBuiltinFunc {
 }
 
 /*
- * Platform-specifics
+ * Platform
  */
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolSelfTest {
+pub(crate) struct SolEntrypoint {
     pub(crate) function: SolIdent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolSplTestEntrypoint {
-    pub(crate) function: SolIdent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolAnchorInstruction {
-    pub(crate) function: SolIdent,
-    pub(crate) ty_state: SolIdent,
 }
 
 /* --- END OF SYNC --- */
