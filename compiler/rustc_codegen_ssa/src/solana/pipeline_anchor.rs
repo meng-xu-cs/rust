@@ -4,7 +4,7 @@ use rustc_middle::{bug, ty};
 use tracing::{info, warn};
 
 use crate::solana::common::SolEnv;
-use crate::solana::context::{SolAnchorInstruction, SolContextBuilder};
+use crate::solana::context::{SolContextBuilder, SolEntrypoint};
 
 pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: Instance<'tcx>) {
     info!(
@@ -91,14 +91,12 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     };
 
     // assert that the state type must be user-defined
-    let ty_state_def_id = match ty_state.kind() {
-        ty::Adt(ty_state_def, _) => ty_state_def.did(),
-        _ => bug!("[assumption] expect the state type to be an adt, found: {ty_state}"),
-    };
+    if !matches!(ty_state.kind(), ty::Adt(..)) {
+        bug!("[assumption] expect the state type to be an adt, found: {ty_state}");
+    }
 
     // collect information
-    warn!("- found instruction {def_desc} with argument {ty_state}");
-
+    warn!("- found instruction {def_desc} with state {ty_state}");
     let mut builder = SolContextBuilder::new(tcx, sol);
     let (_, inst_ident, _) = builder.make_instance(instance);
     let (sol, context) = builder.build();
@@ -107,11 +105,8 @@ pub(crate) fn phase_bootstrap<'tcx>(tcx: TyCtxt<'tcx>, sol: SolEnv, instance: In
     let ctxt_file = sol.context_to_file(&context);
 
     // save the instruction to file
-    let instruction = SolAnchorInstruction {
-        function: inst_ident,
-        ty_state: SolContextBuilder::mk_ident_no_cache(tcx, ty_state_def_id),
-    };
-    sol.summary_to_file("instruction", &instruction);
+    let entrypoint = SolEntrypoint { function: inst_ident };
+    sol.summary_to_file("entrypoint", &entrypoint);
 
     // done
     info!("- done with instruction {def_desc}, context saved at {}", ctxt_file.display());
