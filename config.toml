@@ -109,7 +109,7 @@ link-shared = false
 #allow-old-toolchain = false
 
 # Which LLVM projects to build along with the LLVM base libraries/tools
-enable-projects = "clang;lld;lldb"
+enable-projects = "clang;lld"
 
 download-ci-llvm = false
 
