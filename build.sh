@@ -42,4 +42,5 @@ if [ -n "${WITH_NIX}" ]; then
     nix-shell src/tools/nix-dev-shell/shell.nix --pure --run "x build --stage 1 --target ${HOST_TRIPLE},sbf-solana-solana,sbpf-solana-solana,sbpfv1-solana-solana,sbpfv2-solana-solana"
 else
     ./x.py build --stage 1 --target "${HOST_TRIPLE}",sbf-solana-solana,sbpf-solana-solana,sbpfv1-solana-solana,sbpfv2-solana-solana
+    ./x.py build --stage 1 --target "${HOST_TRIPLE}",sbf-solana-solana,sbpf-solana-solana,sbpfv1-solana-solana,sbpfv2-solana-solana library/std library/proc_macro
 fi
