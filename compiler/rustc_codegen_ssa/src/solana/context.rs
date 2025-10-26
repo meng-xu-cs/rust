@@ -1797,8 +1797,6 @@ impl<'tcx> SolContextBuilder<'tcx> {
             },
             Rvalue::NullaryOp(op, ty) => {
                 let opcode = match op {
-                    NullOp::SizeOf => SolOpcodeNullary::SizeOf,
-                    NullOp::AlignOf => SolOpcodeNullary::AlignOf,
                     NullOp::OffsetOf(indices) => SolOpcodeNullary::OffsetOf(
                         indices
                             .iter()
@@ -2690,8 +2688,6 @@ pub(crate) enum SolOpcodeCast {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolOpcodeNullary {
-    SizeOf,
-    AlignOf,
     OffsetOf(Vec<(SolVariantIndex, SolFieldIndex)>),
     UbCheckEnabled,
     ContractCheckEnabled,
