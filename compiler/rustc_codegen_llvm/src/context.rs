@@ -131,6 +131,7 @@ pub(crate) struct FullCx<'ll, 'tcx> {
 
     /// Extra per-CGU codegen state needed when coverage instrumentation is enabled.
     pub coverage_cx: Option<coverageinfo::CguCoverageContext<'ll, 'tcx>>,
+    pub solcov_cx: coverageinfo::CguCoverageContext<'ll, 'tcx>,
     pub dbg_cx: Option<debuginfo::CodegenUnitDebugContext<'ll, 'tcx>>,
 
     eh_personality: Cell<Option<&'ll Value>>,
@@ -619,6 +620,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
                 type_lowering: Default::default(),
                 scalar_lltypes: Default::default(),
                 coverage_cx,
+                solcov_cx: coverageinfo::CguCoverageContext::new(),
                 dbg_cx,
                 eh_personality: Cell::new(None),
                 eh_catch_typeinfo: Cell::new(None),
@@ -649,6 +651,11 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
         llvm::set_initializer(g, array);
         llvm::set_linkage(g, llvm::Linkage::AppendingLinkage);
         llvm::set_section(g, c"llvm.metadata");
+    }
+
+    #[inline]
+    pub(crate) fn solcov_cx(&self) -> &coverageinfo::CguCoverageContext<'ll, 'tcx> {
+        &self.solcov_cx
     }
 }
 impl<'ll> SimpleCx<'ll> {

@@ -17,6 +17,7 @@ use crate::llvm;
 pub(crate) mod ffi;
 mod llvm_cov;
 mod mapgen;
+mod solcov;
 
 /// Extra per-CGU context/state needed for coverage instrumentation.
 pub(crate) struct CguCoverageContext<'ll, 'tcx> {
@@ -131,6 +132,12 @@ impl<'tcx> CoverageInfoBuilderMethods<'tcx> for Builder<'_, '_, 'tcx> {
         // (Either the statement was not inlined and directly belongs to this
         // instance, or it was inlined *from* this instance.)
 
+        // Hijack the control flow here to instrument coverage for Solana
+        if let CoverageKind::SolMarker { kind, value } = kind {
+            solcov::process_solcov(self, instance, *kind, *value);
+            return;
+        };
+
         let bx = self;
 
         // Due to LocalCopy instantiation or MIR inlining, coverage statements
@@ -198,6 +205,9 @@ impl<'tcx> CoverageInfoBuilderMethods<'tcx> for Builder<'_, '_, 'tcx> {
                 let bitmap_index = bx.const_u32(bitmap_idx);
                 bx.mcdc_tvbitmap_update(fn_name, hash, bitmap_index, cond_bitmap);
                 bx.mcdc_condbitmap_reset(cond_bitmap);
+            }
+            CoverageKind::SolMarker { .. } => {
+                unreachable!("Solana marker should be handled earlier")
             }
         }
     }

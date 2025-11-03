@@ -62,8 +62,18 @@ pub(crate) struct SolEnv {
     pub output_dir: PathBuf,
 }
 
+/// Instrumentation information
+pub(crate) struct SolExtra {
+    pub target: PathBuf,
+}
+
+pub(crate) enum SolCommand {
+    Analyze(SolEnv),
+    Instrument(SolExtra),
+}
+
 /// Entrypoint to the solana-specific logic
-pub(crate) fn retrieve_env(tcx: TyCtxt<'_>) -> Option<SolEnv> {
+pub(crate) fn retrieve_command(tcx: TyCtxt<'_>) -> Option<SolCommand> {
     // enable the component is explicitly enabled via environment variable
     let env_prefix = COMPONENT_NAME.to_uppercase();
     match env::var_os(&env_prefix)?
@@ -82,6 +92,11 @@ pub(crate) fn retrieve_env(tcx: TyCtxt<'_>) -> Option<SolEnv> {
             bug!("[user-input] unexpected value for {env_prefix}: {others}");
         }
     };
+
+    // check if we are in instrumentation mode
+    if let Some(val) = env::var_os(format!("{env_prefix}_INSTRUMENT")) {
+        return Some(SolCommand::Instrument(SolExtra { target: val.into() }));
+    }
 
     // grab information from the environment variables
     let build_system = match env::var(format!("{env_prefix}_BUILD_SYSTEM")) {
@@ -142,7 +157,8 @@ pub(crate) fn retrieve_env(tcx: TyCtxt<'_>) -> Option<SolEnv> {
     };
 
     // return the context
-    Some(SolEnv { build_system, phase, source_dir, src_file_name, src_path_full, output_dir })
+    let env = SolEnv { build_system, phase, source_dir, src_file_name, src_path_full, output_dir };
+    Some(SolCommand::Analyze(env))
 }
 
 impl SolEnv {

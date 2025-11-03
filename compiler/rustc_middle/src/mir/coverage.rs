@@ -119,6 +119,9 @@ pub enum CoverageKind {
     ///
     /// This is eventually lowered to `llvm.instrprof.mcdc.tvbitmap.update` in LLVM IR.
     TestVectorBitmapUpdate { bitmap_idx: u32, decision_depth: u16 },
+
+    /// Solana coverage
+    SolMarker { kind: u16, value: u32 },
 }
 
 impl Debug for CoverageKind {
@@ -134,6 +137,7 @@ impl Debug for CoverageKind {
             TestVectorBitmapUpdate { bitmap_idx, decision_depth } => {
                 write!(fmt, "TestVectorUpdate({:?}, depth={:?})", bitmap_idx, decision_depth)
             }
+            SolMarker { kind, value } => write!(fmt, "SolMarker(kind={kind}, value={value})"),
         }
     }
 }

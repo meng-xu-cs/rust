@@ -188,7 +188,14 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         mir = tcx.arena.alloc(optimize_use_clone::<Bx>(cx, monomorphized_mir));
     }
 
-    crate::solana::entrypoint(tcx, instance);
+    if crate::solana::entrypoint(tcx, instance) {
+        let monomorphized_mir = instance.instantiate_mir_and_normalize_erasing_regions(
+            tcx,
+            ty::TypingEnv::fully_monomorphized(),
+            ty::EarlyBinder::bind(mir.clone()),
+        );
+        mir = tcx.arena.alloc(crate::solana::instrument::codecov(tcx, instance, monomorphized_mir));
+    }
 
     let debug_context = cx.create_function_debug_context(instance, fn_abi, llfn, &mir);
 
