@@ -40,14 +40,16 @@ pub(crate) fn process_solcov<'a, 'll, 'tcx>(
         let align = builder.tcx.data_layout.i32_align.abi;
         let size = Size::from_bytes(4);
         let slot = builder.alloca(size, align);
-        llvm::set_value_name(slot, format!("solana.cov").as_bytes());
+        llvm::set_value_name(slot, format!("solcov.slot").as_bytes());
+        output_u32(builder, slot, 0);
         builder.solcov_cx().mcdc_condition_bitmap_map.borrow_mut().insert(instance, vec![slot]);
     }
 
     // output in sequence
     let slot = builder.solcov_cx().mcdc_condition_bitmap_map.borrow().get(&instance).unwrap()[0];
-    output_u32(builder, slot, 0x736f6c63); // "solc"
-    output_u32(builder, slot, 0x6f760000 | (kind as u32)); // "ov"|kind
+    output_u32(builder, slot, 0x63_6c_6f_73); // "solc" encoded backwards
+    output_u32(builder, slot, 0x00_00_76_6f | (kind as u32) << 16); // "ov"|kind encoded backwards
+
     match kind {
         COV_KIND_PC => {
             let def_path_hash = builder.tcx.def_path_hash(instance.def_id());

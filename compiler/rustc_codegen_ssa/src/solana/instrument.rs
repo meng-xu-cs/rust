@@ -3,8 +3,9 @@ use std::path::PathBuf;
 
 use rustc_middle::bug;
 use rustc_middle::mir::coverage::CoverageKind;
-use rustc_middle::mir::{Body, Statement, StatementKind};
+use rustc_middle::mir::{Body, SourceInfo, Statement, StatementKind, traversal};
 use rustc_middle::ty::{Instance, InstanceKind, TyCtxt};
+use rustc_span::DUMMY_SP;
 use tempfile::tempdir;
 use tracing::{info, warn};
 
@@ -132,18 +133,23 @@ const COV_KIND_PC: u16 = 1;
 
 /// Apply code coverage instrumentation to the given MIR body
 pub(crate) fn codecov<'tcx>(
-    _tcx: TyCtxt<'tcx>,
-    _instance: Instance<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
     mut body: Body<'tcx>,
 ) -> Body<'tcx> {
     // add coverage tracking at the beginning of each basic block
-    for (i, block) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated_mut() {
-        let cov = CoverageKind::SolMarker { kind: COV_KIND_PC, value: i.as_u32() };
+    let traversal_order = traversal::mono_reachable_reverse_postorder(&body, tcx, instance);
+    for block_id in traversal_order {
+        let block = body.basic_blocks_mut().get_mut(block_id).unwrap();
+        let coverage = CoverageKind::SolMarker { kind: COV_KIND_PC, value: block_id.as_u32() };
         block.statements.insert(
-            0,
+            block.statements.len(),
             Statement {
-                source_info: block.terminator().source_info,
-                kind: StatementKind::Coverage(cov),
+                // NOTE: attempted to use the source information of block terminator
+                // but it seems to cause some issues with later LLVM passes, so we just
+                // use a dummy source information instead.
+                source_info: SourceInfo::outermost(DUMMY_SP),
+                kind: StatementKind::Coverage(coverage),
             },
         );
     }
