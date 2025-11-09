@@ -6,10 +6,15 @@ use rustc_middle::ty::Instance;
 use crate::builder::Builder;
 use crate::llvm;
 
+/// Markers
+const MARKER1: u32 = 0x73_63_6F_76; // "scov"
+const MARKER2: u32 = 0x56_4F_53_43; // "VOSC" ("scov" spelled backwards in uppercase)
+
 /// Coverage kind for PC tracking
 const COV_KIND_PC: u16 = 1;
 
-fn output_u32<'a, 'll, 'tcx>(
+#[inline]
+fn output_u32_nocheck<'a, 'll, 'tcx>(
     builder: &mut Builder<'a, 'll, 'tcx>,
     slot: &'ll llvm::Value,
     value: u32,
@@ -17,6 +22,20 @@ fn output_u32<'a, 'll, 'tcx>(
     let align = builder.tcx.data_layout.i32_align.abi;
     builder.store(builder.const_u32(value), slot, align);
     builder.call_intrinsic("llvm.fake.use", &[], &[slot]);
+}
+
+#[inline]
+fn output_u32<'a, 'll, 'tcx>(
+    builder: &mut Builder<'a, 'll, 'tcx>,
+    slot: &'ll llvm::Value,
+    value: u32,
+) {
+    // ensure that we don't accidentally create inbalanced markers
+    assert_ne!(value, MARKER1);
+    assert_ne!(value, MARKER2);
+
+    // create the store instruction
+    output_u32_nocheck(builder, slot, value);
 }
 
 fn output_u64<'a, 'll, 'tcx>(
@@ -47,9 +66,8 @@ pub(crate) fn process_solcov<'a, 'll, 'tcx>(
 
     // output in sequence
     let slot = builder.solcov_cx().mcdc_condition_bitmap_map.borrow().get(&instance).unwrap()[0];
-    output_u32(builder, slot, 0x63_6c_6f_73); // "solc" encoded backwards
-    output_u32(builder, slot, 0x00_00_76_6f | (kind as u32) << 16); // "ov"|kind encoded backwards
-
+    output_u32_nocheck(builder, slot, MARKER1);
+    output_u32(builder, slot, 0x74_79_00_00 | kind as u32); // "ty"|kind
     match kind {
         COV_KIND_PC => {
             let def_path_hash = builder.tcx.def_path_hash(instance.def_id());
@@ -59,4 +77,5 @@ pub(crate) fn process_solcov<'a, 'll, 'tcx>(
         }
         _ => bug!("[invariant] unexpected solana coverage kind {kind}"),
     }
+    output_u32_nocheck(builder, slot, MARKER2);
 }
