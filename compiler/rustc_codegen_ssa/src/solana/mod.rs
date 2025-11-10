@@ -11,13 +11,12 @@ pub(crate) mod pipeline_spl;
 
 use common::{BuildSystem, Phase, retrieve_command};
 
-use crate::solana::common::SolCommand;
+use crate::solana::common::{SolCommand, SolExtra};
 
 /// Entrypoint for the solana-specific codegen logic
-pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
-    match retrieve_command(tcx) {
-        None => false,
-        Some(SolCommand::Analyze(env)) => {
+pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Option<SolExtra> {
+    match retrieve_command(tcx)? {
+        SolCommand::Analyze(env) => {
             // work on the monomorphised MIR
             match env.phase {
                 Phase::Bootstrap => match env.build_system {
@@ -30,10 +29,10 @@ pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> b
             }
 
             // indicate that we don't need to modify the instance
-            false
+            None
         }
-        Some(SolCommand::Instrument(extra)) => {
-            instrument::should_instrument(tcx, extra.target, instance)
+        SolCommand::Instrument(extra) => {
+            instrument::should_instrument(tcx, &extra, instance).then_some(extra)
         }
     }
 }

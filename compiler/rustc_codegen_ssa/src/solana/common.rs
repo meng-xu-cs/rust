@@ -64,7 +64,9 @@ pub(crate) struct SolEnv {
 
 /// Instrumentation information
 pub(crate) struct SolExtra {
+    pub build_system: BuildSystem,
     pub target: PathBuf,
+    pub extra_inputs: Option<PathBuf>,
 }
 
 pub(crate) enum SolCommand {
@@ -93,12 +95,7 @@ pub(crate) fn retrieve_command(tcx: TyCtxt<'_>) -> Option<SolCommand> {
         }
     };
 
-    // check if we are in instrumentation mode
-    if let Some(val) = env::var_os(format!("{env_prefix}_INSTRUMENT")) {
-        return Some(SolCommand::Instrument(SolExtra { target: val.into() }));
-    }
-
-    // grab information from the environment variables
+    // get the build system
     let build_system = match env::var(format!("{env_prefix}_BUILD_SYSTEM")) {
         Ok(val) => match val.as_str() {
             "selftest" => BuildSystem::SelfTest,
@@ -108,6 +105,19 @@ pub(crate) fn retrieve_command(tcx: TyCtxt<'_>) -> Option<SolCommand> {
         },
         Err(e) => bug!("[user-input] unable to locate build system in environment variables: {e}"),
     };
+
+    // check if we are in instrumentation mode
+    if let Some(val) = env::var_os(format!("{env_prefix}_INSTRUMENT")) {
+        let extra_inputs =
+            env::var_os(format!("{env_prefix}_EXTRA_INPUTS")).map(|v| PathBuf::from(v));
+        return Some(SolCommand::Instrument(SolExtra {
+            build_system,
+            target: val.into(),
+            extra_inputs,
+        }));
+    }
+
+    // grab information from the environment variables for analysis
     let phase = match env::var(format!("{env_prefix}_PHASE")) {
         Ok(val) => {
             if val.as_str() == "bootstrap" {

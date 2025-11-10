@@ -13,6 +13,9 @@ const MARKER2: u32 = 0x56_4F_53_43; // "VOSC" ("scov" spelled backwards in upper
 /// Coverage kind for PC tracking
 const COV_KIND_PC: u16 = 1;
 
+/// Coverage kind for Anchor entry marking
+const COV_KIND_ANCHOR_ENTRY: u16 = 2;
+
 #[inline]
 fn output_u32_nocheck<'a, 'll, 'tcx>(
     builder: &mut Builder<'a, 'll, 'tcx>,
@@ -74,6 +77,9 @@ pub(crate) fn process_solcov<'a, 'll, 'tcx>(
             output_u64(builder, slot, def_path_hash.stable_crate_id().as_u64());
             output_u64(builder, slot, def_path_hash.local_hash().as_u64());
             output_u32(builder, slot, value);
+        }
+        COV_KIND_ANCHOR_ENTRY => {
+            // intentionally do nothing for now
         }
         _ => bug!("[invariant] unexpected solana coverage kind {kind}"),
     }

@@ -3,18 +3,18 @@ use std::path::PathBuf;
 
 use rustc_middle::bug;
 use rustc_middle::mir::coverage::CoverageKind;
-use rustc_middle::mir::{Body, SourceInfo, Statement, StatementKind, traversal};
+use rustc_middle::mir::{BasicBlock, Body, SourceInfo, Statement, StatementKind, traversal};
 use rustc_middle::ty::{Instance, InstanceKind, TyCtxt};
 use rustc_span::DUMMY_SP;
 use tempfile::tempdir;
 use tracing::{info, warn};
 
-use crate::solana::common::{BuildSystem, Phase, SolEnv};
-use crate::solana::context::{SolContextBuilder, SolDeps, SolInstanceKind};
+use crate::solana::common::{BuildSystem, Phase, SolEnv, SolExtra};
+use crate::solana::context::{SolContextBuilder, SolDeps, SolIdent, SolInstanceKind};
 
 pub(crate) fn should_instrument<'tcx>(
     tcx: TyCtxt<'tcx>,
-    path: PathBuf,
+    extra: &SolExtra,
     instance: Instance<'tcx>,
 ) -> bool {
     // debug marking
@@ -23,7 +23,7 @@ pub(crate) fn should_instrument<'tcx>(
     info!("processing {def_desc}");
 
     // load the targets
-    let content = fs::read_to_string(path)
+    let content = fs::read_to_string(&extra.target)
         .unwrap_or_else(|e| bug!("[invariant] failed to read instrumentation targets: {e}"));
     let deps: SolDeps = serde_json::from_str(&content)
         .unwrap_or_else(|e| bug!("[invariant] failed to deserialize deps.json: {e}"));
@@ -34,11 +34,11 @@ pub(crate) fn should_instrument<'tcx>(
     // create a dummy env for temporary phase
     let temp_dir = tempdir().expect("[invariant] failed to create temporary output directory");
     let env = SolEnv {
-        build_system: BuildSystem::Anchor, // dummy
+        build_system: extra.build_system,
         phase: Phase::Temporary,
-        source_dir: PathBuf::new(),
-        src_file_name: PathBuf::new(),
-        src_path_full: PathBuf::new(),
+        source_dir: PathBuf::new(),    // dummy information
+        src_file_name: PathBuf::new(), // dummy information
+        src_path_full: PathBuf::new(), // dummy information
         output_dir: temp_dir.path().to_path_buf(),
     };
 
@@ -131,9 +131,13 @@ pub(crate) fn should_instrument<'tcx>(
 /// Coverage kind for PC tracking
 const COV_KIND_PC: u16 = 1;
 
+/// Coverage kind for Anchor entry marking
+const COV_KIND_ANCHOR_ENTRY: u16 = 2;
+
 /// Apply code coverage instrumentation to the given MIR body
 pub(crate) fn codecov<'tcx>(
     tcx: TyCtxt<'tcx>,
+    extra: SolExtra,
     instance: Instance<'tcx>,
     mut body: Body<'tcx>,
 ) -> Body<'tcx> {
@@ -143,7 +147,7 @@ pub(crate) fn codecov<'tcx>(
         let block = body.basic_blocks_mut().get_mut(block_id).unwrap();
         let coverage = CoverageKind::SolMarker { kind: COV_KIND_PC, value: block_id.as_u32() };
         block.statements.insert(
-            block.statements.len(),
+            0,
             Statement {
                 // NOTE: attempted to use the source information of block terminator
                 // but it seems to cause some issues with later LLVM passes, so we just
@@ -154,6 +158,52 @@ pub(crate) fn codecov<'tcx>(
         );
     }
 
+    // try to see if we need other instrumentations
+    match &extra.build_system {
+        BuildSystem::Anchor => {
+            // read the extra input file
+            let extra_inputs = extra.extra_inputs.unwrap_or_else(|| {
+                bug!("[user-input] expect extra input for Anchor instrumentation")
+            });
+
+            let content = fs::read_to_string(extra_inputs)
+                .unwrap_or_else(|e| bug!("[invariant] failed to read extra_info.json: {e}"));
+            let entry_ident: SolIdent = serde_json::from_str(&content)
+                .unwrap_or_else(|e| bug!("[invariant] failed to deserialize extra_info.json: {e}"));
+
+            // check if this instance is the ident function
+            if SolContextBuilder::mk_ident_no_cache(tcx, instance.def_id()) == entry_ident {
+                // instrument the entry function
+                anchor_instrument_entry(tcx, instance, &mut body);
+            }
+        }
+        BuildSystem::SelfTest | BuildSystem::Spl => {
+            bug!("[user-input] custom instrumentation not supported yet")
+        }
+    }
+
     // done with the instrumentation
     body
+}
+
+/// Apply instrumentation to the entry function in Anchor
+fn anchor_instrument_entry<'tcx>(
+    _tcx: TyCtxt<'tcx>,
+    _instance: Instance<'tcx>,
+    body: &mut Body<'tcx>,
+) {
+    let block = body
+        .basic_blocks
+        .as_mut()
+        .get_mut(BasicBlock::from_usize(0))
+        .unwrap_or_else(|| bug!("[invariant] unable to gen entry block"));
+
+    let coverage = CoverageKind::SolMarker { kind: COV_KIND_ANCHOR_ENTRY, value: 0 };
+    block.statements.insert(
+        0,
+        Statement {
+            source_info: SourceInfo::outermost(DUMMY_SP),
+            kind: StatementKind::Coverage(coverage),
+        },
+    );
 }
