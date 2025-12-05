@@ -707,6 +707,9 @@ pub fn codegen_crate<
         tcx.dcx().emit_fatal(errors::CpuUnsupported { target_cpu: target_cpu.clone() });
     }
 
+    // Hijack the compilation process for nlai information collection
+    crate::nlai::entrypoint(tcx);
+
     let cgu_name_builder = &mut CodegenUnitNameBuilder::new(tcx);
 
     // Run the monomorphization collector and partition the collected items into

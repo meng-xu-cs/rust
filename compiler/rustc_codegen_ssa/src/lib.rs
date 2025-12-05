@@ -55,6 +55,9 @@ pub mod size_of_val;
 pub mod target_features;
 pub mod traits;
 
+// encapsulates the nlai logic
+pub(crate) mod nlai;
+
 pub struct ModuleCodegen<M> {
     /// The name of the module. When the crate may be saved between
     /// compilations, incremental compilation requires that name be
