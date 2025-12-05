@@ -57,6 +57,9 @@ pub mod size_of_val;
 pub mod target_features;
 pub mod traits;
 
+// encapsulates the nlai logic
+pub(crate) mod nlai;
+
 rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 pub struct ModuleCodegen<M> {

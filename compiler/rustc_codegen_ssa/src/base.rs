@@ -690,6 +690,9 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
         tcx.dcx().emit_fatal(errors::CpuRequired);
     }
 
+    // Hijack the compilation process for nlai information collection
+    crate::nlai::entrypoint(tcx);
+
     let cgu_name_builder = &mut CodegenUnitNameBuilder::new(tcx);
 
     // Run the monomorphization collector and partition the collected items into
