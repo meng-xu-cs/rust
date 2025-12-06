@@ -19,7 +19,7 @@ impl<'tcx> Builder<'tcx> {
     }
 
     /// Create an identifier
-    fn _mk_ident(&mut self, def_id: DefId) -> SolIdent {
+    fn mk_ident(&mut self, def_id: DefId) -> SolIdent {
         // check cache first
         if let Some((ident, _)) = self.id_cache.get(&def_id) {
             return ident.clone();
@@ -41,21 +41,33 @@ impl<'tcx> Builder<'tcx> {
     }
 
     /// Build the module
-    pub(crate) fn build(self) -> SolModule {
-        // crate-level information
-        let krate = SolCrateName(self.tcx.crate_name(LOCAL_CRATE).to_ident_string());
+    pub(crate) fn build(mut self) -> SolModule {
+        // collect crate-level information
+        let crate_name = SolCrateName(self.tcx.crate_name(LOCAL_CRATE).to_ident_string());
+        let crate_ident = self.mk_ident(LOCAL_CRATE.as_def_id());
 
-        // unpack the fields
+        // collect crate-level comments
+        let mut crate_comments = Vec::new();
+        for attr in self.tcx.hir_krate_attrs() {
+            if let Some((comment, _)) = attr.doc_str_and_comment_kind() {
+                crate_comments.push(comment.to_string());
+            }
+        }
+
+        // unpack the builder
+        let Self { tcx: _, id_cache } = self;
+
+        // collect the id to description mappings
         let mut id_desc = vec![];
 
         // we don't care about the ordering of the values
         #[allow(rustc::potential_query_instability)]
-        for (ident, desc) in self.id_cache.into_values() {
+        for (ident, desc) in id_cache.into_values() {
             id_desc.push((ident, desc));
         }
 
         // construct the module
-        SolModule { krate, id_desc }
+        SolModule { crate_name, crate_ident, crate_comments, id_desc }
     }
 }
 
@@ -68,7 +80,9 @@ impl<'tcx> Builder<'tcx> {
 /// A complete nlai module
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolModule {
-    pub(crate) krate: SolCrateName,
+    pub(crate) crate_name: SolCrateName,
+    pub(crate) crate_ident: SolIdent,
+    pub(crate) crate_comments: Vec<String>,
     pub(crate) id_desc: Vec<(SolIdent, SolPathDesc)>,
 }
 
