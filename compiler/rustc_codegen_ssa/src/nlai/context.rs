@@ -40,8 +40,8 @@ impl<'tcx> Builder<'tcx> {
         ident
     }
 
-    /// Build the module
-    pub(crate) fn build(mut self) -> SolModule {
+    /// Build the crate
+    pub(crate) fn build(mut self) -> SolCrate {
         // collect crate-level information
         let crate_name = SolCrateName(self.tcx.crate_name(LOCAL_CRATE).to_ident_string());
         let crate_ident = self.mk_ident(LOCAL_CRATE.as_def_id());
@@ -66,20 +66,20 @@ impl<'tcx> Builder<'tcx> {
             id_desc.push((ident, desc));
         }
 
-        // construct the module
-        SolModule { crate_name, crate_ident, crate_comments, id_desc }
+        // construct the crate
+        SolCrate { crate_name, crate_ident, crate_comments, id_desc }
     }
 }
 
 /* --- BEGIN OF SYNC --- */
 
 /*
- * Module
+ * Crate
  */
 
-/// A complete nlai module
+/// A complete crate
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolModule {
+pub(crate) struct SolCrate {
     pub(crate) crate_name: SolCrateName,
     pub(crate) crate_ident: SolIdent,
     pub(crate) crate_comments: Vec<String>,
@@ -90,7 +90,7 @@ pub(crate) struct SolModule {
  * Naming
  */
 
-/// An identifier in the Solana context
+/// An identifier in the crate
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolIdent {
     pub(crate) krate: SolHash64,
