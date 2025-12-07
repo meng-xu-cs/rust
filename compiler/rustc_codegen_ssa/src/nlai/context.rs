@@ -1,5 +1,7 @@
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
+use rustc_hir::{ItemKind, Mod};
+use rustc_middle::bug;
 use rustc_middle::ty::TyCtxt;
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +42,50 @@ impl<'tcx> Builder<'tcx> {
         ident
     }
 
+    /// Collect all information about a module
+    fn mk_module(&mut self, module: &'tcx Mod<'tcx>) {
+        for item_id in module.item_ids {
+            let item = self.tcx.hir_item(*item_id);
+            match item.kind {
+                // dependencies
+                ItemKind::ExternCrate(..) => {}
+                ItemKind::Use(..) => {}
+
+                // macro
+                ItemKind::Macro(..) => {}
+
+                // globals
+                ItemKind::Static(..) => {}
+                ItemKind::Const(..) => {}
+
+                // functions
+                ItemKind::Fn { .. } => {}
+
+                // datatypes
+                ItemKind::Struct(..) => {}
+                ItemKind::Enum(..) => {}
+                ItemKind::Union(..) => {}
+                ItemKind::TyAlias(..) => {}
+
+                // traits
+                ItemKind::Trait(..) => {}
+                ItemKind::TraitAlias(..) => {}
+
+                // nested modules
+                ItemKind::Mod(..) => {}
+                ItemKind::ForeignMod { .. } => {}
+
+                // impl blocks
+                ItemKind::Impl(..) => {}
+
+                // unsupported items
+                ItemKind::GlobalAsm { .. } => {
+                    bug!("[unsupported] global assembly");
+                }
+            }
+        }
+    }
+
     /// Build the crate
     pub(crate) fn build(mut self) -> SolCrate {
         // collect crate-level information
@@ -53,6 +99,9 @@ impl<'tcx> Builder<'tcx> {
                 crate_comments.push(comment.to_string());
             }
         }
+
+        // recursively build the modules starting from the root module
+        self.mk_module(self.tcx.hir_root_module());
 
         // unpack the builder
         let Self { tcx: _, id_cache } = self;
