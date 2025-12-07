@@ -105,8 +105,8 @@ impl SolEnv {
         file_path
     }
 
-    /// Serialize a module to a file
-    pub(crate) fn serialize_module<T: Serialize>(&self, data: &T) -> PathBuf {
-        self.serialize_to_file("f", "module", data)
+    /// Serialize a crate to a file
+    pub(crate) fn serialize_crate<T: Serialize>(&self, data: &T) -> PathBuf {
+        self.serialize_to_file("f", "crate", data)
     }
 }

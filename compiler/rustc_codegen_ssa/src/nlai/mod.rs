@@ -17,8 +17,8 @@ pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>) {
     warn!("{COMPONENT_NAME} context: {env}");
 
     // build the module
-    let module = Builder::new(tcx).build();
+    let krate = Builder::new(tcx).build();
 
-    // emit the module to the output directory
-    env.serialize_module(&module);
+    // emit the crate to the output directory
+    env.serialize_crate(&krate);
 }
