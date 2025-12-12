@@ -95,7 +95,7 @@ impl<'tcx> Builder<'tcx> {
         // collect crate-level comments
         let mut crate_comments = Vec::new();
         for attr in self.tcx.hir_krate_attrs() {
-            if let Some((comment, _)) = attr.doc_str_and_comment_kind() {
+            if let Some(comment) = attr.doc_str() {
                 crate_comments.push(comment.to_string());
             }
         }
