@@ -109,4 +109,12 @@ impl SolEnv {
     pub(crate) fn serialize_crate<T: Serialize>(&self, data: &T) -> PathBuf {
         self.serialize_to_file("f", "crate", data)
     }
+
+    /// Prepare source directory
+    pub(crate) fn prepare_source_directory(&self) -> PathBuf {
+        let path = self.fresh_output_dir("s");
+        fs::create_dir_all(&path)
+            .unwrap_or_else(|e| bug!("[invariant] failed to create source dir: {e}"));
+        path
+    }
 }

@@ -2125,7 +2125,7 @@ impl fmt::Debug for SourceFile {
     Debug, Clone, Copy, Hash, PartialEq, Eq, StableHash, Encodable, Decodable, Default, PartialOrd,
     Ord
 )]
-pub struct StableSourceFileId(Hash128);
+pub struct StableSourceFileId(pub Hash128);
 
 impl StableSourceFileId {
     fn from_filename_in_current_crate(filename: &FileName) -> Self {
