@@ -142,9 +142,6 @@ impl<'tcx> Builder<'tcx> {
 
     /// Build the crate
     pub(crate) fn build(mut self) -> SolCrate {
-        // collect crate-level information
-        let ident = self.mk_ident(LOCAL_CRATE.as_def_id());
-
         // recursively build the modules starting from the root module
         let module = self.mk_module(
             CRATE_HIR_ID,
@@ -165,7 +162,7 @@ impl<'tcx> Builder<'tcx> {
         }
 
         // construct the crate
-        SolCrate { ident, module, id_desc }
+        SolCrate { module, id_desc }
     }
 }
 
@@ -178,7 +175,6 @@ impl<'tcx> Builder<'tcx> {
 /// A complete crate
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolCrate {
-    pub(crate) ident: SolIdent,
     pub(crate) module: SolModule,
     pub(crate) id_desc: Vec<(SolIdent, SolPathDesc)>,
 }
