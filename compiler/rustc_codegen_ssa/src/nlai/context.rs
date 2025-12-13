@@ -1,11 +1,13 @@
+use std::path::PathBuf;
+
 use rustc_ast::AttrStyle;
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, ItemKind, Mod};
 use rustc_middle::bug;
 use rustc_middle::ty::TyCtxt;
-use rustc_span::Ident;
+use rustc_span::{Ident, Span, StableSourceFileId};
 use serde::{Deserialize, Serialize};
 
 /// A builder for creating a nlai module
@@ -13,14 +15,20 @@ pub(crate) struct Builder<'tcx> {
     /// compiler context
     tcx: TyCtxt<'tcx>,
 
+    //// source directory
+    src_dir: PathBuf,
+
+    /// source cache
+    src_cache: FxHashSet<StableSourceFileId>,
+
     /// a cache of id to identifier mappings
     id_cache: FxHashMap<DefId, (SolIdent, SolPathDesc)>,
 }
 
 impl<'tcx> Builder<'tcx> {
     /// Create a new builder
-    pub(crate) fn new(tcx: TyCtxt<'tcx>) -> Self {
-        Self { tcx, id_cache: FxHashMap::default() }
+    pub(crate) fn new(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> Self {
+        Self { tcx, src_dir, src_cache: FxHashSet::default(), id_cache: FxHashMap::default() }
     }
 
     /// Create an identifier
@@ -43,6 +51,62 @@ impl<'tcx> Builder<'tcx> {
 
         // return ident
         ident
+    }
+
+    /// Create a span
+    fn mk_span(&mut self, span: Span) -> SolSpan {
+        let source_map = self.tcx.sess.source_map();
+
+        // skip invisible spans
+        if !span.is_visible(source_map) {
+            return SolSpan {
+                file_id: SolHash128(0),
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            };
+        }
+
+        // ensure the span is within a single file
+        let start_loc = source_map.lookup_char_pos(span.lo());
+        let end_loc = source_map.lookup_char_pos(span.hi());
+
+        let file_id = start_loc.file.stable_id;
+        if end_loc.file.stable_id != file_id {
+            bug!(
+                "[invariant] span crosses multiple files: {} to {}",
+                start_loc.file.name.prefer_local(),
+                end_loc.file.name.prefer_local()
+            );
+        }
+
+        // dump the source content if not yet cached
+        if !self.src_cache.contains(&file_id) {
+            let src_code = start_loc.file.src.as_ref().map_or_else(
+                || bug!("[invariant] visible span has no source code"),
+                |src| src.clone(),
+            );
+
+            let src_path = self.src_dir.join(format!("{:x}", file_id.0.as_u128()));
+            if src_path.exists() {
+                bug!("[invariant] source file {} already exists", src_path.display());
+            }
+
+            std::fs::write(&src_path, src_code.as_str()).unwrap_or_else(|e| {
+                bug!("[invariant] failed to write source code to file {}: {e}", src_path.display())
+            });
+            self.src_cache.insert(file_id.clone());
+        }
+
+        // construct the span
+        SolSpan {
+            file_id: SolHash128(file_id.0.as_u128()),
+            start_line: start_loc.line as u32,
+            start_column: start_loc.col.0 as u32,
+            end_line: end_loc.line as u32,
+            end_column: end_loc.col.0 as u32,
+        }
     }
 
     /// Collect all information about a module
@@ -95,13 +159,6 @@ impl<'tcx> Builder<'tcx> {
                     continue;
                 }
 
-                // globals
-                ItemKind::Static(..) => {}
-                ItemKind::Const(..) => {}
-
-                // functions
-                ItemKind::Fn { .. } => {}
-
                 // datatypes
                 ItemKind::Struct(..) => {}
                 ItemKind::Enum(..) => {}
@@ -112,17 +169,24 @@ impl<'tcx> Builder<'tcx> {
                 ItemKind::Trait(..) => {}
                 ItemKind::TraitAlias(..) => {}
 
-                // nested modules
-                ItemKind::Mod(submod_ident, submod_content) => {
-                    let submod_parsed = self.mk_module(item_hir_id, submod_ident, submod_content);
-                    item_modules.push(submod_parsed);
-                }
+                // functions
+                ItemKind::Fn { .. } => {}
 
                 // impl blocks
                 ItemKind::Impl(..) => {}
 
                 // foreign interfaces
                 ItemKind::ForeignMod { .. } => {}
+
+                // globals
+                ItemKind::Static(..) => {}
+                ItemKind::Const(..) => {}
+
+                // nested modules
+                ItemKind::Mod(submod_ident, submod_content) => {
+                    let submod_parsed = self.mk_module(item_hir_id, submod_ident, submod_content);
+                    item_modules.push(submod_parsed);
+                }
 
                 // unsupported items
                 ItemKind::GlobalAsm { .. } => {
@@ -134,7 +198,9 @@ impl<'tcx> Builder<'tcx> {
         // construct the module
         SolModule {
             name: SolSymbol(ident.name.to_ident_string()),
+            span: self.mk_span(module.spans.inner_span),
             ident: self.mk_ident(def_id),
+            embed: self.mk_span(ident.span),
             doc_comments,
             item_modules,
         }
@@ -150,7 +216,7 @@ impl<'tcx> Builder<'tcx> {
         );
 
         // unpack the builder
-        let Self { tcx: _, id_cache } = self;
+        let Self { tcx: _, src_dir: _, src_cache: _, id_cache } = self;
 
         // collect the id to description mappings
         let mut id_desc = vec![];
@@ -187,7 +253,9 @@ pub(crate) struct SolCrate {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolModule {
     pub(crate) name: SolSymbol,
+    pub(crate) span: SolSpan,
     pub(crate) ident: SolIdent,
+    pub(crate) embed: SolSpan,
     pub(crate) doc_comments: Vec<SolDocComment>,
     pub(crate) item_modules: Vec<SolModule>,
 }
@@ -218,6 +286,10 @@ pub(crate) struct SolIdent {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolHash64(pub(crate) u64);
 
+/// A 128-bit hash
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolHash128(pub(crate) u128);
+
 /// A name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolSymbol(pub(crate) String);
@@ -225,5 +297,15 @@ pub(crate) struct SolSymbol(pub(crate) String);
 /// A description of a definition path
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolPathDesc(pub(crate) String);
+
+/// A span description
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolSpan {
+    pub(crate) file_id: SolHash128,
+    pub(crate) start_line: u32,
+    pub(crate) start_column: u32,
+    pub(crate) end_line: u32,
+    pub(crate) end_column: u32,
+}
 
 /* --- END OF SYNC --- */
