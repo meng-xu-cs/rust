@@ -1,8 +1,11 @@
+use rustc_ast::AttrStyle;
 use rustc_data_structures::fx::FxHashMap;
+use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
-use rustc_hir::{ItemKind, Mod};
+use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, ItemKind, Mod};
 use rustc_middle::bug;
 use rustc_middle::ty::TyCtxt;
+use rustc_span::Ident;
 use serde::{Deserialize, Serialize};
 
 /// A builder for creating a nlai module
@@ -43,16 +46,54 @@ impl<'tcx> Builder<'tcx> {
     }
 
     /// Collect all information about a module
-    fn mk_module(&mut self, module: &'tcx Mod<'tcx>) {
+    fn mk_module(&mut self, hir_id: HirId, ident: Ident, module: &'tcx Mod<'tcx>) -> SolModule {
+        // must have a def_id
+        let def_id = hir_id.expect_owner().to_def_id();
+
+        // collect comments
+        let mut doc_comments = Vec::new();
+        for attr in self.tcx.hir_attrs(hir_id) {
+            match attr {
+                Attribute::Parsed(AttributeKind::DocComment {
+                    style,
+                    kind: _,
+                    span: _,
+                    comment,
+                }) => match style {
+                    AttrStyle::Outer => {
+                        doc_comments.push(SolDocComment::Outer(comment.to_string()))
+                    }
+                    AttrStyle::Inner => {
+                        doc_comments.push(SolDocComment::Inner(comment.to_string()))
+                    }
+                },
+                _ => continue,
+            }
+        }
+
+        // collect items defined in the module
+        let mut item_modules = vec![];
+
+        // iterate over all items in the module
         for item_id in module.item_ids {
             let item = self.tcx.hir_item(*item_id);
+            let item_hir_id = item_id.hir_id();
             match item.kind {
                 // dependencies
-                ItemKind::ExternCrate(..) => {}
-                ItemKind::Use(..) => {}
+                ItemKind::ExternCrate(..) | ItemKind::Use(..) => {
+                    // we don't dump information about dependencies or naming aliases
+                    // as they have been already encoded in the identifier we dump.
+                    continue;
+                }
 
                 // macro
-                ItemKind::Macro(..) => {}
+                ItemKind::Macro(..) => {
+                    // we don't dump information about macros under the assumption that
+                    // they are expanded away during compilation, however, this also means
+                    // that we will lose information that is only present in macros, e.g.,
+                    // their comments, or some higher-level abstraction.
+                    continue;
+                }
 
                 // globals
                 ItemKind::Static(..) => {}
@@ -72,11 +113,16 @@ impl<'tcx> Builder<'tcx> {
                 ItemKind::TraitAlias(..) => {}
 
                 // nested modules
-                ItemKind::Mod(..) => {}
-                ItemKind::ForeignMod { .. } => {}
+                ItemKind::Mod(submod_ident, submod_content) => {
+                    let submod_parsed = self.mk_module(item_hir_id, submod_ident, submod_content);
+                    item_modules.push(submod_parsed);
+                }
 
                 // impl blocks
                 ItemKind::Impl(..) => {}
+
+                // foreign interfaces
+                ItemKind::ForeignMod { .. } => {}
 
                 // unsupported items
                 ItemKind::GlobalAsm { .. } => {
@@ -84,24 +130,27 @@ impl<'tcx> Builder<'tcx> {
                 }
             }
         }
+
+        // construct the module
+        SolModule {
+            name: SolSymbol(ident.name.to_ident_string()),
+            ident: self.mk_ident(def_id),
+            doc_comments,
+            item_modules,
+        }
     }
 
     /// Build the crate
     pub(crate) fn build(mut self) -> SolCrate {
         // collect crate-level information
-        let crate_name = SolCrateName(self.tcx.crate_name(LOCAL_CRATE).to_ident_string());
-        let crate_ident = self.mk_ident(LOCAL_CRATE.as_def_id());
-
-        // collect crate-level comments
-        let mut crate_comments = Vec::new();
-        for attr in self.tcx.hir_krate_attrs() {
-            if let Some(comment) = attr.doc_str() {
-                crate_comments.push(comment.to_string());
-            }
-        }
+        let ident = self.mk_ident(LOCAL_CRATE.as_def_id());
 
         // recursively build the modules starting from the root module
-        self.mk_module(self.tcx.hir_root_module());
+        let module = self.mk_module(
+            CRATE_HIR_ID,
+            Ident::with_dummy_span(self.tcx.crate_name(LOCAL_CRATE)),
+            self.tcx.hir_root_module(),
+        );
 
         // unpack the builder
         let Self { tcx: _, id_cache } = self;
@@ -116,7 +165,7 @@ impl<'tcx> Builder<'tcx> {
         }
 
         // construct the crate
-        SolCrate { crate_name, crate_ident, crate_comments, id_desc }
+        SolCrate { ident, module, id_desc }
     }
 }
 
@@ -129,10 +178,33 @@ impl<'tcx> Builder<'tcx> {
 /// A complete crate
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolCrate {
-    pub(crate) crate_name: SolCrateName,
-    pub(crate) crate_ident: SolIdent,
-    pub(crate) crate_comments: Vec<String>,
+    pub(crate) ident: SolIdent,
+    pub(crate) module: SolModule,
     pub(crate) id_desc: Vec<(SolIdent, SolPathDesc)>,
+}
+
+/*
+ * Module
+ */
+
+/// A module
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolModule {
+    pub(crate) name: SolSymbol,
+    pub(crate) ident: SolIdent,
+    pub(crate) doc_comments: Vec<SolDocComment>,
+    pub(crate) item_modules: Vec<SolModule>,
+}
+
+/*
+* Comment
+ */
+
+/// A documentation comment
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolDocComment {
+    Outer(String),
+    Inner(String),
 }
 
 /*
@@ -150,12 +222,12 @@ pub(crate) struct SolIdent {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolHash64(pub(crate) u64);
 
+/// A name
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolSymbol(pub(crate) String);
+
 /// A description of a definition path
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolPathDesc(pub(crate) String);
-
-/// A crate name
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolCrateName(pub(crate) String);
 
 /* --- END OF SYNC --- */
