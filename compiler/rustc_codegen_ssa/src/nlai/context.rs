@@ -18,7 +18,7 @@ pub(crate) struct Builder<'tcx> {
     /// compiler context
     tcx: TyCtxt<'tcx>,
 
-    //// source directory
+    /// source directory
     src_dir: PathBuf,
 
     /// source cache
@@ -114,7 +114,7 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
-    fn mk_item_base(&mut self, hir_id: HirId, span: Span) -> SolItemBase {
+    fn mk_base(&mut self, hir_id: HirId, span: Span) -> SolBase {
         // must have a def_id
         let def_id = hir_id.expect_owner().to_def_id();
 
@@ -140,7 +140,7 @@ impl<'tcx> Builder<'tcx> {
         }
 
         // construct the base
-        SolItemBase { span: self.mk_span(span), ident: self.mk_ident(def_id), doc_comments }
+        SolBase { span: self.mk_span(span), ident: self.mk_ident(def_id), doc_comments }
     }
 
     fn mk_generic_param<'hir>(&mut self, param: GenericParam<'hir>) -> SolGenericParam {
@@ -152,8 +152,11 @@ impl<'tcx> Builder<'tcx> {
             bug!("[invariant] generic param has error name");
         }
 
+        // construct the base
+        let base = self.mk_base(param.hir_id, param.span);
+
         // switch case by kind
-        match param.kind {
+        let kind = match param.kind {
             GenericParamKind::Lifetime { kind } => match kind {
                 LifetimeParamKind::Elided(reason) => {
                     match param.name {
@@ -165,10 +168,10 @@ impl<'tcx> Builder<'tcx> {
                     }
                     match reason {
                         MissingLifetimeKind::Underscore => {
-                            SolGenericParam::Lifetime { name: SolLifetimeName::ElidedExplicit }
+                            SolGenericParamKind::Lifetime { name: SolLifetimeName::ElidedExplicit }
                         }
                         MissingLifetimeKind::Ampersand => {
-                            SolGenericParam::Lifetime { name: SolLifetimeName::ElidedImplicit }
+                            SolGenericParamKind::Lifetime { name: SolLifetimeName::ElidedImplicit }
                         }
                         MissingLifetimeKind::Comma => {
                             bug!("[unsupported] MissingLifetimeKind::Comma");
@@ -179,7 +182,7 @@ impl<'tcx> Builder<'tcx> {
                     }
                 }
                 LifetimeParamKind::Explicit => match param.name {
-                    ParamName::Plain(ident) => SolGenericParam::Lifetime {
+                    ParamName::Plain(ident) => SolGenericParamKind::Lifetime {
                         name: SolLifetimeName::Named(self.mk_symbol(ident)),
                     },
                     ParamName::Fresh => {
@@ -198,7 +201,7 @@ impl<'tcx> Builder<'tcx> {
                 }
                 match param.name {
                     ParamName::Plain(ident) => {
-                        SolGenericParam::Type { name: self.mk_symbol(ident) }
+                        SolGenericParamKind::Type { name: self.mk_symbol(ident) }
                     }
                     ParamName::Fresh => {
                         bug!("[invariant] generic type param has fresh name");
@@ -206,14 +209,19 @@ impl<'tcx> Builder<'tcx> {
                     ParamName::Error(_) => unreachable!(),
                 }
             }
-            GenericParamKind::Const { .. } => match param.name {
-                ParamName::Plain(ident) => SolGenericParam::Type { name: self.mk_symbol(ident) },
+            GenericParamKind::Const { ty: _, default: _ } => match param.name {
+                ParamName::Plain(ident) => {
+                    SolGenericParamKind::Const { name: self.mk_symbol(ident) }
+                }
                 ParamName::Fresh => {
                     bug!("[invariant] generic const param has fresh name");
                 }
                 ParamName::Error(_) => unreachable!(),
             },
-        }
+        };
+
+        // construct the generic param
+        SolGenericParam { base, kind }
     }
 
     fn mk_generics<'hir>(&mut self, generics: &Generics<'hir>) -> SolGenerics {
@@ -290,7 +298,7 @@ impl<'tcx> Builder<'tcx> {
             };
 
             // parse item base and make the final item
-            let item_base = self.mk_item_base(item_id.hir_id(), item.span);
+            let item_base = self.mk_base(item_id.hir_id(), item.span);
             items.push(SolItem { base: item_base, kind: item_kind });
         }
 
@@ -305,7 +313,7 @@ impl<'tcx> Builder<'tcx> {
     /// Build the crate
     pub(crate) fn build(mut self) -> SolCrate {
         // construct the base
-        let base = self.mk_item_base(CRATE_HIR_ID, DUMMY_SP);
+        let base = self.mk_base(CRATE_HIR_ID, DUMMY_SP);
 
         // recursively build the modules starting from the root module
         let module = self.mk_module(self.tcx.crate_name(LOCAL_CRATE), self.tcx.hir_root_module());
@@ -330,13 +338,25 @@ impl<'tcx> Builder<'tcx> {
 /* --- BEGIN OF SYNC --- */
 
 /*
+* Common
+ */
+
+/// The base information associated with any HIR element
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolBase {
+    pub(crate) span: SolSpan,
+    pub(crate) ident: SolIdent,
+    pub(crate) doc_comments: Vec<SolDocComment>,
+}
+
+/*
  * Crate
  */
 
 /// A complete crate
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolCrate {
-    pub(crate) base: SolItemBase,
+    pub(crate) base: SolBase,
     pub(crate) module: SolModule,
     pub(crate) id_desc: Vec<(SolIdent, SolPathDesc)>,
 }
@@ -354,45 +374,8 @@ pub(crate) struct SolModule {
 }
 
 /*
-* Type
-*/
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) enum SolLifetimeName {
-    ElidedExplicit,
-    ElidedImplicit,
-    Named(SolSymbol),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) enum SolGenericParam {
-    Lifetime { name: SolLifetimeName },
-    Type { name: SolSymbol },
-    Const { name: SolSymbol },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolGenerics {
-    pub(crate) params: Vec<SolGenericParam>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolStruct {
-    pub(crate) name: SolSymbol,
-    pub(crate) generics: SolGenerics,
-}
-
-/*
  * Item
  */
-
-/// The base information for an item
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolItemBase {
-    pub(crate) span: SolSpan,
-    pub(crate) ident: SolIdent,
-    pub(crate) doc_comments: Vec<SolDocComment>,
-}
 
 /// Details associated with an item
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -404,8 +387,47 @@ pub(crate) enum SolItemKind {
 /// An item recognizable in the crate
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolItem {
-    pub(crate) base: SolItemBase,
+    pub(crate) base: SolBase,
     pub(crate) kind: SolItemKind,
+}
+
+/*
+* Generics
+*/
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolLifetimeName {
+    ElidedExplicit,
+    ElidedImplicit,
+    Named(SolSymbol),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolGenericParamKind {
+    Lifetime { name: SolLifetimeName },
+    Type { name: SolSymbol },
+    Const { name: SolSymbol },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolGenericParam {
+    pub(crate) base: SolBase,
+    pub(crate) kind: SolGenericParamKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolGenerics {
+    pub(crate) params: Vec<SolGenericParam>,
+}
+
+/*
+* Type
+*/
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolStruct {
+    pub(crate) name: SolSymbol,
+    pub(crate) generics: SolGenerics,
 }
 
 /*
