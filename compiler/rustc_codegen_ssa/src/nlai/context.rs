@@ -10,7 +10,7 @@ use rustc_hir::{
 };
 use rustc_middle::bug;
 use rustc_middle::ty::TyCtxt;
-use rustc_span::{DUMMY_SP, Ident, Span, StableSourceFileId, Symbol};
+use rustc_span::{DUMMY_SP, Ident, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
 use serde::{Deserialize, Serialize};
 
 /// A builder for creating a nlai module
@@ -81,8 +81,8 @@ impl<'tcx> Builder<'tcx> {
         if end_loc.file.stable_id != file_id {
             bug!(
                 "[invariant] span crosses multiple files: {} to {}",
-                start_loc.file.name.prefer_local(),
-                end_loc.file.name.prefer_local()
+                start_loc.file.name.display(RemapPathScopeComponents::OBJECT),
+                end_loc.file.name.display(RemapPathScopeComponents::OBJECT)
             );
         }
 
