@@ -4,7 +4,6 @@ use std::{env, fs};
 
 use rustc_middle::bug;
 use rustc_middle::ty::TyCtxt;
-use rustc_span::FileNameDisplayPreference;
 use serde::Serialize;
 
 /// The name of the component
@@ -46,12 +45,14 @@ pub(crate) fn retrieve_env(tcx: TyCtxt<'_>) -> Option<SolEnv> {
     // retrieve the full input path
     let input_path = match tcx.sess.local_crate_source_file() {
         None => bug!("[invariant] unable to locate local crate source file"),
-        Some(src) => src.local_path_if_available().canonicalize().unwrap_or_else(|e| {
-            bug!(
-                "[invariant] failed to canonicalize source path for {}: {e}",
-                src.to_path(FileNameDisplayPreference::Local).display()
-            )
-        }),
+        Some(src) => {
+            let local_path = src
+                .local_path()
+                .unwrap_or_else(|| bug!("[invariant] unable to get local path for local crate"));
+            local_path.canonicalize().unwrap_or_else(|e| {
+                bug!("[invariant] failed to canonicalize path for {}: {e}", local_path.display())
+            })
+        }
     };
 
     // return the context
