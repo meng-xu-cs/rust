@@ -1,16 +1,18 @@
+use std::fmt::Debug;
 use std::path::PathBuf;
 
 use rustc_ast::AttrStyle;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
-use rustc_hir::def_id::{DefId, LOCAL_CRATE};
+use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE};
 use rustc_hir::{
     Attribute, CRATE_HIR_ID, GenericParam, GenericParamKind, Generics, HirId, ItemKind,
-    LifetimeParamKind, MissingLifetimeKind, Mod, ParamName,
+    LifetimeParamKind, MissingLifetimeKind, Mod, OwnerId, ParamName,
 };
 use rustc_middle::bug;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{DUMMY_SP, Ident, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// A builder for creating a nlai module
@@ -24,6 +26,9 @@ pub(crate) struct Builder<'tcx> {
     /// source cache
     src_cache: FxHashSet<StableSourceFileId>,
 
+    /// hir stack
+    hir_stack: Vec<OwnerId>,
+
     /// a cache of id to identifier mappings
     id_cache: FxHashMap<DefId, (SolIdent, SolPathDesc)>,
 }
@@ -31,7 +36,17 @@ pub(crate) struct Builder<'tcx> {
 impl<'tcx> Builder<'tcx> {
     /// Create a new builder
     pub(crate) fn new(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> Self {
-        Self { tcx, src_dir, src_cache: FxHashSet::default(), id_cache: FxHashMap::default() }
+        Self {
+            tcx,
+            src_dir,
+            src_cache: FxHashSet::default(),
+            hir_stack: Vec::new(),
+            id_cache: FxHashMap::default(),
+        }
+    }
+
+    fn mk_symbol(&self, ident: Ident) -> SolSymbol {
+        SolSymbol(ident.name.to_ident_string())
     }
 
     fn mk_ident(&mut self, def_id: DefId) -> SolIdent {
@@ -53,10 +68,6 @@ impl<'tcx> Builder<'tcx> {
 
         // return ident
         ident
-    }
-
-    fn mk_symbol(&self, ident: Ident) -> SolSymbol {
-        SolSymbol(ident.name.to_ident_string())
     }
 
     fn mk_span(&mut self, span: Span) -> SolSpan {
@@ -114,11 +125,7 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
-    fn mk_base(&mut self, hir_id: HirId, span: Span) -> SolBase {
-        // must have a def_id
-        let def_id = hir_id.expect_owner().to_def_id();
-
-        // collect comments
+    fn mk_doc_comments(&self, hir_id: HirId) -> Vec<SolDocComment> {
         let mut doc_comments = Vec::new();
         for attr in self.tcx.hir_attrs(hir_id) {
             match attr {
@@ -138,25 +145,80 @@ impl<'tcx> Builder<'tcx> {
                 _ => continue,
             }
         }
-
-        // construct the base
-        SolBase { span: self.mk_span(span), ident: self.mk_ident(def_id), doc_comments }
+        doc_comments
     }
 
-    fn mk_generic_param<'hir>(&mut self, param: GenericParam<'hir>) -> SolGenericParam {
+    fn mk_spanned<T: SolIR>(&mut self, span: Span, data: T) -> SolSpanned<T> {
+        SolSpanned { span: self.mk_span(span), data }
+    }
+
+    #[allow(unused)]
+    fn mk_hir<T: SolIR>(&mut self, hir_id: HirId, span: Span, data: T) -> SolHIR<T> {
         // sanity check
-        if param.hir_id.expect_owner().def_id != param.def_id {
-            bug!("[invariant] generic param hir_id and def_id do not match");
+        if hir_id.is_owner() {
+            bug!("[invariant] owner hir_id should be used to build SolMIR instead of SolHIR");
         }
-        if matches!(param.name, ParamName::Error(_)) {
-            bug!("[invariant] generic param has error name");
+        if !self.hir_stack.last().is_some_and(|owner| *owner == hir_id.owner) {
+            bug!(
+                "[invariant] hir_id owner {:?} does not match current HIR stack top {:?}",
+                hir_id.owner,
+                self.hir_stack.last()
+            );
         }
 
-        // construct the base
-        let base = self.mk_base(param.hir_id, param.span);
+        // pack the information
+        SolHIR { span: self.mk_span(span), doc_comments: self.mk_doc_comments(hir_id), data }
+    }
 
+    fn mk_mir<T: SolIR>(&mut self, hir_id: HirId, span: Span, data: T) -> SolMIR<T> {
+        // sanity check
+        if !hir_id.is_owner() {
+            bug!("[invariant] non-owner hir_id should be used to build SolHIR instead of SolMIR");
+        }
+
+        // pack the information
+        SolMIR {
+            ident: self.mk_ident(hir_id.expect_owner().to_def_id()),
+            span: self.mk_span(span),
+            doc_comments: self.mk_doc_comments(hir_id),
+            data,
+        }
+    }
+
+    fn mk_mir_from_hir<T: SolIR>(
+        &mut self,
+        hir_id: HirId,
+        def_id: DefId,
+        span: Span,
+        data: T,
+    ) -> SolMIR<T> {
+        // sanity check
+        if hir_id.is_owner() {
+            bug!("[invariant] owner hir_id should be used to build SolMIR instead of SolHIR");
+        }
+        if !self.hir_stack.last().is_some_and(|owner| *owner == hir_id.owner) {
+            bug!(
+                "[invariant] hir_id owner {:?} does not match current HIR stack top {:?}",
+                hir_id.owner,
+                self.hir_stack.last()
+            );
+        }
+        if hir_id.owner.to_def_id() == def_id {
+            bug!("[invariant] hir_id owner def_id should be different from provided def_id");
+        }
+
+        // pack the information
+        SolMIR {
+            ident: self.mk_ident(def_id),
+            span: self.mk_span(span),
+            doc_comments: self.mk_doc_comments(hir_id),
+            data,
+        }
+    }
+
+    fn mk_generic_param<'hir>(&mut self, param: GenericParam<'hir>) -> SolMIR<SolGenericParam> {
         // switch case by kind
-        let kind = match param.kind {
+        let param_data = match param.kind {
             GenericParamKind::Lifetime { kind } => match kind {
                 LifetimeParamKind::Elided(reason) => {
                     match param.name {
@@ -168,10 +230,10 @@ impl<'tcx> Builder<'tcx> {
                     }
                     match reason {
                         MissingLifetimeKind::Underscore => {
-                            SolGenericParamKind::Lifetime { name: SolLifetimeName::ElidedExplicit }
+                            SolGenericParam::Lifetime { name: SolLifetimeName::ElidedExplicit }
                         }
                         MissingLifetimeKind::Ampersand => {
-                            SolGenericParamKind::Lifetime { name: SolLifetimeName::ElidedImplicit }
+                            SolGenericParam::Lifetime { name: SolLifetimeName::ElidedImplicit }
                         }
                         MissingLifetimeKind::Comma => {
                             bug!("[unsupported] MissingLifetimeKind::Comma");
@@ -182,7 +244,7 @@ impl<'tcx> Builder<'tcx> {
                     }
                 }
                 LifetimeParamKind::Explicit => match param.name {
-                    ParamName::Plain(ident) => SolGenericParamKind::Lifetime {
+                    ParamName::Plain(ident) => SolGenericParam::Lifetime {
                         name: SolLifetimeName::Named(self.mk_symbol(ident)),
                     },
                     ParamName::Fresh => {
@@ -201,7 +263,7 @@ impl<'tcx> Builder<'tcx> {
                 }
                 match param.name {
                     ParamName::Plain(ident) => {
-                        SolGenericParamKind::Type { name: self.mk_symbol(ident) }
+                        SolGenericParam::Type { name: self.mk_symbol(ident) }
                     }
                     ParamName::Fresh => {
                         bug!("[invariant] generic type param has fresh name");
@@ -210,9 +272,7 @@ impl<'tcx> Builder<'tcx> {
                 }
             }
             GenericParamKind::Const { ty: _, default: _ } => match param.name {
-                ParamName::Plain(ident) => {
-                    SolGenericParamKind::Const { name: self.mk_symbol(ident) }
-                }
+                ParamName::Plain(ident) => SolGenericParam::Const { name: self.mk_symbol(ident) },
                 ParamName::Fresh => {
                     bug!("[invariant] generic const param has fresh name");
                 }
@@ -221,32 +281,48 @@ impl<'tcx> Builder<'tcx> {
         };
 
         // construct the generic param
-        SolGenericParam { base, kind }
+        self.mk_mir_from_hir(param.hir_id, param.def_id.to_def_id(), param.span, param_data)
     }
 
-    fn mk_generics<'hir>(&mut self, generics: &Generics<'hir>) -> SolGenerics {
+    fn mk_generics<'hir>(&mut self, generics: &Generics<'hir>) -> SolSpanned<SolGenerics> {
         let mut params = vec![];
         for param in generics.params {
             params.push(self.mk_generic_param(*param));
         }
-        SolGenerics { params }
+
+        // pack the generics
+        self.mk_spanned(generics.span, SolGenerics { params })
     }
 
-    fn mk_struct<'hir>(&mut self, name: Symbol, generics: &Generics<'hir>) -> SolStruct {
+    fn mk_struct<'hir>(
+        &mut self,
+        owner: OwnerId,
+        name: Symbol,
+        generics: &Generics<'hir>,
+    ) -> SolStruct {
+        // prepare the stack
+        self.hir_stack.push(owner);
+
+        // convert generics
         let generics = self.mk_generics(generics);
 
-        // construct the struct
+        // construct the struct after popping the stack
+        let last_owner = self.hir_stack.pop();
+        assert_eq!(Some(owner), last_owner, "[invariant] HIR stack corrupted when building struct");
         SolStruct { name: SolSymbol(name.to_ident_string()), generics }
     }
 
-    fn mk_module(&mut self, name: Symbol, module: &'tcx Mod<'tcx>) -> SolModule {
+    fn mk_module(&mut self, owner: OwnerId, name: Symbol, module: &'tcx Mod<'tcx>) -> SolModule {
+        // prepare the stack
+        self.hir_stack.push(owner);
+
         // collect items defined in the module
         let mut items = vec![];
 
         // iterate over all items in the module
         for item_id in module.item_ids {
             let item = self.tcx.hir_item(*item_id);
-            let item_kind = match item.kind {
+            let item_mir = match item.kind {
                 // dependencies
                 ItemKind::ExternCrate(..) | ItemKind::Use(..) => {
                     // we don't dump information about dependencies or naming aliases
@@ -265,7 +341,8 @@ impl<'tcx> Builder<'tcx> {
 
                 // datatypes
                 ItemKind::Struct(ident, generics, _) => {
-                    SolItemKind::Struct(self.mk_struct(ident.name, generics))
+                    let struct_data = self.mk_struct(item.owner_id, ident.name, generics);
+                    self.mk_mir(item.hir_id(), item.span, SolItem::Struct(struct_data))
                 }
                 ItemKind::Enum(..) => todo!(),
                 ItemKind::Union(..) => todo!(),
@@ -289,20 +366,22 @@ impl<'tcx> Builder<'tcx> {
                 ItemKind::Const(..) => todo!(),
 
                 // nested modules
-                ItemKind::Mod(submod_ident, submod_content) => {
-                    SolItemKind::Module(self.mk_module(submod_ident.name, submod_content))
+                ItemKind::Mod(mod_ident, mod_content) => {
+                    let module_data = self.mk_module(item.owner_id, mod_ident.name, mod_content);
+                    self.mk_mir(item.hir_id(), item.span, SolItem::Module(module_data))
                 }
 
                 // unsupported items
                 ItemKind::GlobalAsm { .. } => bug!("[unsupported] global assembly"),
             };
 
-            // parse item base and make the final item
-            let item_base = self.mk_base(item_id.hir_id(), item.span);
-            items.push(SolItem { base: item_base, kind: item_kind });
+            // make the final item
+            items.push(item_mir);
         }
 
-        // construct the module
+        // construct the module after popping the stack
+        let last_owner = self.hir_stack.pop();
+        assert_eq!(Some(owner), last_owner, "[invariant] HIR stack corrupted when building module");
         SolModule {
             name: SolSymbol(name.to_ident_string()),
             scope: self.mk_span(module.spans.inner_span),
@@ -312,14 +391,17 @@ impl<'tcx> Builder<'tcx> {
 
     /// Build the crate
     pub(crate) fn build(mut self) -> SolCrate {
-        // construct the base
-        let base = self.mk_base(CRATE_HIR_ID, DUMMY_SP);
-
         // recursively build the modules starting from the root module
-        let module = self.mk_module(self.tcx.crate_name(LOCAL_CRATE), self.tcx.hir_root_module());
+        let module_data = self.mk_module(
+            OwnerId { def_id: CRATE_DEF_ID },
+            self.tcx.crate_name(LOCAL_CRATE),
+            self.tcx.hir_root_module(),
+        );
+        let module_mir = self.mk_mir(CRATE_HIR_ID, DUMMY_SP, module_data);
 
-        // unpack the builder
-        let Self { tcx: _, src_dir: _, src_cache: _, id_cache } = self;
+        // unpack the builder and sanity check
+        let Self { tcx: _, src_dir: _, src_cache: _, hir_stack, id_cache } = self;
+        assert!(hir_stack.is_empty(), "[invariant] HIR stack is not empty after building crate");
 
         // collect the id to description mappings
         let mut id_desc = vec![];
@@ -331,22 +413,45 @@ impl<'tcx> Builder<'tcx> {
         }
 
         // construct the crate
-        SolCrate { base, module, id_desc }
+        SolCrate { root: module_mir, id_desc }
     }
 }
 
 /* --- BEGIN OF SYNC --- */
 
+/// A trait alias for all sorts IR elements
+pub(crate) trait SolIR =
+    Debug + Clone + PartialEq + Eq + PartialOrd + Ord + Serialize + DeserializeOwned;
+
 /*
 * Common
  */
 
-/// The base information associated with any HIR element
+/// Anything that has a span without an hir_id
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolBase {
+#[serde(bound = "T: Serialize + DeserializeOwned")]
+pub(crate) struct SolSpanned<T: SolIR> {
     pub(crate) span: SolSpan,
-    pub(crate) ident: SolIdent,
+    pub(crate) data: T,
+}
+
+/// The base information associated with anything that has an hir_id (and span)
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(bound = "T: Serialize + DeserializeOwned")]
+pub(crate) struct SolHIR<T: SolIR> {
+    pub(crate) span: SolSpan,
     pub(crate) doc_comments: Vec<SolDocComment>,
+    pub(crate) data: T,
+}
+
+/// The base information associated with anything that has an hir_id (and span)
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(bound = "T: Serialize + DeserializeOwned")]
+pub(crate) struct SolMIR<T: SolIR> {
+    pub(crate) ident: SolIdent,
+    pub(crate) span: SolSpan,
+    pub(crate) doc_comments: Vec<SolDocComment>,
+    pub(crate) data: T,
 }
 
 /*
@@ -356,8 +461,7 @@ pub(crate) struct SolBase {
 /// A complete crate
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolCrate {
-    pub(crate) base: SolBase,
-    pub(crate) module: SolModule,
+    pub(crate) root: SolMIR<SolModule>,
     pub(crate) id_desc: Vec<(SolIdent, SolPathDesc)>,
 }
 
@@ -370,7 +474,7 @@ pub(crate) struct SolCrate {
 pub(crate) struct SolModule {
     pub(crate) name: SolSymbol,
     pub(crate) scope: SolSpan,
-    pub(crate) items: Vec<SolItem>,
+    pub(crate) items: Vec<SolMIR<SolItem>>,
 }
 
 /*
@@ -379,16 +483,9 @@ pub(crate) struct SolModule {
 
 /// Details associated with an item
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) enum SolItemKind {
+pub(crate) enum SolItem {
     Module(SolModule),
     Struct(SolStruct),
-}
-
-/// An item recognizable in the crate
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolItem {
-    pub(crate) base: SolBase,
-    pub(crate) kind: SolItemKind,
 }
 
 /*
@@ -403,21 +500,15 @@ pub(crate) enum SolLifetimeName {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) enum SolGenericParamKind {
+pub(crate) enum SolGenericParam {
     Lifetime { name: SolLifetimeName },
     Type { name: SolSymbol },
     Const { name: SolSymbol },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolGenericParam {
-    pub(crate) base: SolBase,
-    pub(crate) kind: SolGenericParamKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolGenerics {
-    pub(crate) params: Vec<SolGenericParam>,
+    pub(crate) params: Vec<SolMIR<SolGenericParam>>,
 }
 
 /*
@@ -427,7 +518,7 @@ pub(crate) struct SolGenerics {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolStruct {
     pub(crate) name: SolSymbol,
-    pub(crate) generics: SolGenerics,
+    pub(crate) generics: SolSpanned<SolGenerics>,
 }
 
 /*
