@@ -1,14 +1,14 @@
 use std::fmt::Debug;
 use std::path::PathBuf;
 
-use rustc_ast::AttrStyle;
+use rustc_ast::{AttrStyle, Mutability};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
-use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE};
+use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{
-    Attribute, CRATE_HIR_ID, GenericParam, GenericParamKind, Generics, HirId, ItemKind,
-    LifetimeParamKind, MissingLifetimeKind, Mod, OwnerId, ParamName, Ty as HirTy,
-    TyKind as HirTyKind,
+    Attribute, CRATE_HIR_ID, GenericParam, GenericParamKind, Generics, HirId, ItemKind, Lifetime,
+    LifetimeKind, LifetimeParamKind, MissingLifetimeKind, Mod, MutTy, OwnerId, ParamName,
+    Ty as HirTy, TyKind as HirTyKind,
 };
 use rustc_middle::bug;
 use rustc_middle::ty::TyCtxt;
@@ -189,7 +189,7 @@ impl<'tcx> Builder<'tcx> {
     fn mk_mir_from_hir<T: SolIR>(
         &mut self,
         hir_id: HirId,
-        def_id: DefId,
+        def_id: LocalDefId,
         span: Span,
         data: T,
     ) -> SolMIR<T> {
@@ -204,13 +204,13 @@ impl<'tcx> Builder<'tcx> {
                 self.hir_stack.last()
             );
         }
-        if hir_id.owner.to_def_id() == def_id {
+        if hir_id.owner.def_id == def_id {
             bug!("[invariant] hir_id owner def_id should be different from provided def_id");
         }
 
         // pack the information
         SolMIR {
-            ident: self.mk_ident(def_id),
+            ident: self.mk_ident(def_id.to_def_id()),
             span: self.mk_span(span),
             doc_comments: self.mk_doc_comments(hir_id),
             data,
@@ -297,7 +297,7 @@ impl<'tcx> Builder<'tcx> {
         };
 
         // construct the generic param
-        self.mk_mir_from_hir(hir_id, def_id.to_def_id(), span, param_data)
+        self.mk_mir_from_hir(hir_id, def_id, span, param_data)
     }
 
     fn mk_generics<'hir>(&mut self, generics: Generics<'hir>) -> SolSpanned<SolGenerics> {
@@ -339,12 +339,68 @@ impl<'tcx> Builder<'tcx> {
         SolStruct { name: SolSymbol(name.to_ident_string()), generics }
     }
 
+    fn mk_lifetime(&mut self, lifetime: Lifetime) -> SolHIR<SolLifetime> {
+        let Lifetime { hir_id, ident, kind, source: _, syntax: _ } = lifetime;
+
+        // switch case by name
+        let lifetime_data = match kind {
+            LifetimeKind::Param(def_id) => SolLifetime::Param(self.mk_ident(def_id.to_def_id())),
+            LifetimeKind::Static => SolLifetime::Static,
+            LifetimeKind::Infer | LifetimeKind::ImplicitObjectLifetimeDefault => {
+                bug!("[invariant] inferred lifetime should not appear in THIR context");
+            }
+            LifetimeKind::Error => unreachable!(),
+        };
+
+        // pack all the information about the lifetime
+        self.mk_hir(hir_id, ident.span, lifetime_data)
+    }
+
     fn mk_hir_type<'hir>(&mut self, ty: HirTy<'hir>) -> SolHIR<SolHirType> {
         let HirTy { hir_id, span, kind } = ty;
 
         // switch case by kind
         let data = match kind {
+            // basics
             HirTyKind::Never => SolHirType::Never,
+
+            // composite
+            HirTyKind::Slice(inner_ty) => SolHirType::Slice(Box::new(self.mk_hir_type(*inner_ty))),
+            HirTyKind::Tup(tys) => {
+                let mut inner_tys = vec![];
+                for ty in tys {
+                    inner_tys.push(self.mk_hir_type(*ty));
+                }
+                SolHirType::Tuple(inner_tys)
+            }
+
+            // references
+            HirTyKind::Ptr(MutTy { ty: inner_ty, mutbl: Mutability::Not }) => {
+                SolHirType::ImmPtr(Box::new(self.mk_hir_type(*inner_ty)))
+            }
+            HirTyKind::Ptr(MutTy { ty: inner_ty, mutbl: Mutability::Mut }) => {
+                SolHirType::MutPtr(Box::new(self.mk_hir_type(*inner_ty)))
+            }
+            HirTyKind::Ref(lifetime, MutTy { ty: inner_ty, mutbl: Mutability::Not }) => {
+                SolHirType::ImmRef(
+                    self.mk_lifetime(*lifetime),
+                    Box::new(self.mk_hir_type(*inner_ty)),
+                )
+            }
+            HirTyKind::Ref(lifetime, MutTy { ty: inner_ty, mutbl: Mutability::Mut }) => {
+                SolHirType::MutRef(
+                    self.mk_lifetime(*lifetime),
+                    Box::new(self.mk_hir_type(*inner_ty)),
+                )
+            }
+
+            // inference
+            HirTyKind::Infer(..) | HirTyKind::InferDelegation(..) => {
+                bug!("[invariant] inferred type should not appear in THIR context");
+            }
+
+            // unexpected
+            HirTyKind::Err(_) => unreachable!(),
             _ => todo!(),
         };
 
@@ -566,6 +622,18 @@ pub(crate) struct SolStruct {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolHirType {
     Never,
+    Slice(Box<SolHIR<SolHirType>>),
+    Tuple(Vec<SolHIR<SolHirType>>),
+    ImmPtr(Box<SolHIR<SolHirType>>),
+    MutPtr(Box<SolHIR<SolHirType>>),
+    ImmRef(SolHIR<SolLifetime>, Box<SolHIR<SolHirType>>),
+    MutRef(SolHIR<SolLifetime>, Box<SolHIR<SolHirType>>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolLifetime {
+    Static,
+    Param(SolIdent),
 }
 
 /*
