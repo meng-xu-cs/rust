@@ -1,14 +1,16 @@
 use std::fmt::Debug;
 use std::path::PathBuf;
 
-use rustc_ast::{AttrStyle, Mutability};
+use rustc_abi::ExternAbi;
+use rustc_ast::{AttrStyle, FloatTy, IntTy, LitFloatType, LitIntType, LitKind, Mutability, UintTy};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{
-    Attribute, CRATE_HIR_ID, GenericParam, GenericParamKind, Generics, HirId, ItemKind, Lifetime,
-    LifetimeKind, LifetimeParamKind, MissingLifetimeKind, Mod, MutTy, OwnerId, ParamName,
-    Ty as HirTy, TyKind as HirTyKind,
+    Attribute, CRATE_HIR_ID, ConstArg, ConstArgKind, FnDecl, FnPtrTy, FnRetTy, GenericParam,
+    GenericParamKind, Generics, HirId, ImplicitSelfKind, ItemKind, Lifetime, LifetimeKind,
+    LifetimeParamKind, MissingLifetimeKind, Mod, MutTy, OwnerId, ParamName, Safety, Ty as HirTy,
+    TyKind as HirTyKind, TyPat, TyPatKind,
 };
 use rustc_middle::bug;
 use rustc_middle::ty::TyCtxt;
@@ -279,21 +281,15 @@ impl<'tcx> Builder<'tcx> {
                     ParamName::Error(_) => unreachable!(),
                 }
             }
-            GenericParamKind::Const { ty, default } => {
-                if default.is_some() {
-                    bug!("[unsupported] const param has a default value");
-                }
-                match name {
-                    ParamName::Plain(ident) => SolGenericParam::Const {
-                        name: self.mk_symbol(ident),
-                        ty: self.mk_hir_type(*ty),
-                    },
-                    ParamName::Fresh => {
-                        bug!("[invariant] generic const param has a fresh name");
-                    }
-                    ParamName::Error(_) => unreachable!(),
-                }
-            }
+            GenericParamKind::Const { ty, default } => match name {
+                ParamName::Plain(ident) => SolGenericParam::Const {
+                    name: self.mk_symbol(ident),
+                    ty: self.mk_hir_type(*ty),
+                    default: default.map(|arg| self.mk_const_arg(*arg)),
+                },
+                ParamName::Fresh => bug!("[invariant] generic const param has a fresh name"),
+                ParamName::Error(_) => unreachable!(),
+            },
         };
 
         // construct the generic param
@@ -356,6 +352,92 @@ impl<'tcx> Builder<'tcx> {
         self.mk_hir(hir_id, ident.span, lifetime_data)
     }
 
+    fn mk_literal(&mut self, lit: LitKind) -> SolLiteral {
+        match lit {
+            LitKind::Bool(val) => SolLiteral::Bool(val),
+            LitKind::Byte(val) => SolLiteral::Byte(val),
+            LitKind::Char(val) => SolLiteral::Char(val),
+            LitKind::Str(val, _) => SolLiteral::String(val.to_string()),
+            LitKind::CStr(val, _) => SolLiteral::CString(val.as_byte_str().to_vec()),
+            LitKind::ByteStr(val, _) => SolLiteral::Bytes(val.as_byte_str().to_vec()),
+            LitKind::Int(val, ty) => match ty {
+                LitIntType::Signed(IntTy::I8) => SolLiteral::I8(val.get() as i8),
+                LitIntType::Signed(IntTy::I16) => SolLiteral::I16(val.get() as i16),
+                LitIntType::Signed(IntTy::I32) => SolLiteral::I32(val.get() as i32),
+                LitIntType::Signed(IntTy::I64) => SolLiteral::I64(val.get() as i64),
+                LitIntType::Signed(IntTy::I128) => SolLiteral::I128(val.get() as i128),
+                LitIntType::Signed(IntTy::Isize) => SolLiteral::Isize(val.get() as isize),
+                LitIntType::Unsigned(UintTy::U8) => SolLiteral::U8(val.get() as u8),
+                LitIntType::Unsigned(UintTy::U16) => SolLiteral::U16(val.get() as u16),
+                LitIntType::Unsigned(UintTy::U32) => SolLiteral::U32(val.get() as u32),
+                LitIntType::Unsigned(UintTy::U64) => SolLiteral::U64(val.get() as u64),
+                LitIntType::Unsigned(UintTy::U128) => SolLiteral::U128(val.get() as u128),
+                LitIntType::Unsigned(UintTy::Usize) => SolLiteral::Usize(val.get() as usize),
+                LitIntType::Unsuffixed => SolLiteral::Int(val.to_string()),
+            },
+            LitKind::Float(symbol, ty) => match ty {
+                LitFloatType::Suffixed(FloatTy::F64) => SolLiteral::F64(symbol.to_string()),
+                LitFloatType::Suffixed(FloatTy::F32) => SolLiteral::F32(symbol.to_string()),
+                LitFloatType::Suffixed(FloatTy::F16) => SolLiteral::F16(symbol.to_string()),
+                LitFloatType::Suffixed(FloatTy::F128) => SolLiteral::F128(symbol.to_string()),
+                LitFloatType::Unsuffixed => SolLiteral::Float(symbol.to_string()),
+            },
+            LitKind::Err(..) => unreachable!(),
+        }
+    }
+
+    fn mk_const_arg<'hir>(&mut self, arg: ConstArg<'hir>) -> SolHIR<SolConstArg> {
+        let ConstArg { hir_id, kind, span } = arg;
+
+        // switch case by value
+        let arg_data = match kind {
+            ConstArgKind::Tup(elems) => {
+                let mut inner_args = vec![];
+                for &elem in elems {
+                    inner_args.push(self.mk_const_arg(*elem));
+                }
+                SolConstArg::Tuple(inner_args)
+            }
+            ConstArgKind::Literal(lit) => SolConstArg::Literal(self.mk_literal(lit)),
+
+            ConstArgKind::Path(..) | ConstArgKind::Struct(..) | ConstArgKind::TupleCall(..) => {
+                todo!()
+            }
+
+            ConstArgKind::Anon(..) => bug!("[unsupported] anonymous const arg"),
+            ConstArgKind::Infer(..) => {
+                bug!("[invariant] inferred const arg should not appear in THIR context");
+            }
+            ConstArgKind::Error(..) => unreachable!(),
+        };
+
+        // pack all the information about the const arg
+        self.mk_hir(hir_id, span, arg_data)
+    }
+
+    fn mk_ty_pat<'hir>(&mut self, pat: TyPat<'hir>) -> SolHIR<SolTyPat> {
+        let TyPat { hir_id, kind, span } = pat;
+
+        // construct the pattern type
+        let pat_data = match kind {
+            TyPatKind::NotNull => SolTyPat::NotNull,
+            TyPatKind::Range(start, end) => {
+                SolTyPat::Range(self.mk_const_arg(*start), self.mk_const_arg(*end))
+            }
+            TyPatKind::Or(pats) => {
+                let mut inner_pats = vec![];
+                for pat in pats {
+                    inner_pats.push(self.mk_ty_pat(*pat));
+                }
+                SolTyPat::Or(inner_pats)
+            }
+            TyPatKind::Err(..) => unreachable!(),
+        };
+
+        // pack all the information about the pattern type
+        self.mk_hir(hir_id, span, pat_data)
+    }
+
     fn mk_hir_type<'hir>(&mut self, ty: HirTy<'hir>) -> SolHIR<SolHirType> {
         let HirTy { hir_id, span, kind } = ty;
 
@@ -363,6 +445,11 @@ impl<'tcx> Builder<'tcx> {
         let data = match kind {
             // basics
             HirTyKind::Never => SolHirType::Never,
+
+            // pattern
+            HirTyKind::Pat(base, pat) => {
+                SolHirType::Pattern(Box::new(self.mk_hir_type(*base)), self.mk_ty_pat(*pat))
+            }
 
             // composite
             HirTyKind::Slice(inner_ty) => SolHirType::Slice(Box::new(self.mk_hir_type(*inner_ty))),
@@ -372,6 +459,9 @@ impl<'tcx> Builder<'tcx> {
                     inner_tys.push(self.mk_hir_type(*ty));
                 }
                 SolHirType::Tuple(inner_tys)
+            }
+            HirTyKind::Array(inner_ty, len) => {
+                SolHirType::Array(Box::new(self.mk_hir_type(*inner_ty)), self.mk_const_arg(*len))
             }
 
             // references
@@ -394,14 +484,94 @@ impl<'tcx> Builder<'tcx> {
                 )
             }
 
+            // function pointer
+            HirTyKind::FnPtr(FnPtrTy {
+                safety,
+                abi,
+                generic_params,
+                decl:
+                    FnDecl { inputs, output, c_variadic, implicit_self, lifetime_elision_allowed: _ },
+                param_idents,
+            }) => {
+                if !matches!(implicit_self, ImplicitSelfKind::None) {
+                    bug!(
+                        "[invariant] function pointer should not have an implicit self in THIR context"
+                    );
+                }
+                if param_idents.len() != inputs.len() {
+                    bug!(
+                        "[invariant] function pointer param idents length {} does not match inputs length {}",
+                        param_idents.len(),
+                        inputs.len()
+                    );
+                }
+
+                // parse abi
+                let abi_data = match abi {
+                    ExternAbi::Rust => {
+                        if *c_variadic {
+                            bug!("[invariant] Rust ABI function pointer should not be variadic");
+                        }
+                        match safety {
+                            Safety::Safe => SolExternAbi::Rust { safety: true },
+                            Safety::Unsafe => SolExternAbi::Rust { safety: false },
+                        }
+                    }
+                    ExternAbi::C { unwind: _ } => SolExternAbi::C { variadic: *c_variadic },
+                    ExternAbi::System { unwind: _ } => {
+                        if *c_variadic {
+                            bug!("[invariant] System ABI function pointer should not be variadic");
+                        }
+                        SolExternAbi::System
+                    }
+                    _ => bug!("[unsupported] function pointer with ABI {:?}", abi),
+                };
+
+                // parse generics
+                let mut generic_params_data = vec![];
+                for param in generic_params.iter() {
+                    generic_params_data.push(self.mk_generic_param(*param));
+                }
+
+                // parse inputs
+                let mut input_tys = vec![];
+                for (input_ty, input_ident) in inputs.iter().zip(param_idents.iter()) {
+                    input_tys.push((
+                        self.mk_hir_type(*input_ty),
+                        input_ident.map(|ident| self.mk_symbol(ident)),
+                    ));
+                }
+
+                // parse output
+                let output_ty = match *output {
+                    FnRetTy::DefaultReturn(_) => None,
+                    FnRetTy::Return(ret_ty) => Some(Box::new(self.mk_hir_type(*ret_ty))),
+                };
+
+                // construct the function pointer type
+                SolHirType::FnPtr {
+                    abi: abi_data,
+                    generics: generic_params_data,
+                    inputs: input_tys,
+                    output: output_ty,
+                }
+            }
+
             // inference
             HirTyKind::Infer(..) | HirTyKind::InferDelegation(..) => {
                 bug!("[invariant] inferred type should not appear in THIR context");
             }
 
+            // unsupported
+            HirTyKind::UnsafeBinder(..) => bug!("[unsupported] unsafe binder type"),
+
             // unexpected
             HirTyKind::Err(_) => unreachable!(),
-            _ => todo!(),
+
+            HirTyKind::OpaqueDef(..)
+            | HirTyKind::TraitAscription(..)
+            | HirTyKind::TraitObject(..)
+            | HirTyKind::Path(..) => todo!(),
         };
 
         // pack all the information about the type
@@ -601,7 +771,7 @@ pub(crate) enum SolLifetimeName {
 pub(crate) enum SolGenericParam {
     Lifetime { name: SolLifetimeName },
     Type { name: SolSymbol, default: Option<SolHIR<SolHirType>> },
-    Const { name: SolSymbol, ty: SolHIR<SolHirType> },
+    Const { name: SolSymbol, ty: SolHIR<SolHirType>, default: Option<SolHIR<SolConstArg>> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -610,7 +780,7 @@ pub(crate) struct SolGenerics {
 }
 
 /*
-* Type
+* Type defs
 */
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -619,21 +789,85 @@ pub(crate) struct SolStruct {
     pub(crate) generics: SolSpanned<SolGenerics>,
 }
 
+/*
+ * Type uses
+ */
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) enum SolHirType {
-    Never,
-    Slice(Box<SolHIR<SolHirType>>),
-    Tuple(Vec<SolHIR<SolHirType>>),
-    ImmPtr(Box<SolHIR<SolHirType>>),
-    MutPtr(Box<SolHIR<SolHirType>>),
-    ImmRef(SolHIR<SolLifetime>, Box<SolHIR<SolHirType>>),
-    MutRef(SolHIR<SolLifetime>, Box<SolHIR<SolHirType>>),
+pub(crate) enum SolExternAbi {
+    C { variadic: bool },
+    Rust { safety: bool },
+    System,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolLifetime {
     Static,
     Param(SolIdent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolTyPat {
+    NotNull,
+    Range(SolHIR<SolConstArg>, SolHIR<SolConstArg>),
+    Or(Vec<SolHIR<SolTyPat>>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolHirType {
+    Never,
+    Slice(Box<SolHIR<SolHirType>>),
+    Tuple(Vec<SolHIR<SolHirType>>),
+    Array(Box<SolHIR<SolHirType>>, SolHIR<SolConstArg>),
+    ImmPtr(Box<SolHIR<SolHirType>>),
+    MutPtr(Box<SolHIR<SolHirType>>),
+    ImmRef(SolHIR<SolLifetime>, Box<SolHIR<SolHirType>>),
+    MutRef(SolHIR<SolLifetime>, Box<SolHIR<SolHirType>>),
+    Pattern(Box<SolHIR<SolHirType>>, SolHIR<SolTyPat>),
+    FnPtr {
+        abi: SolExternAbi,
+        generics: Vec<SolMIR<SolGenericParam>>,
+        inputs: Vec<(SolHIR<SolHirType>, Option<SolSymbol>)>,
+        output: Option<Box<SolHIR<SolHirType>>>,
+    },
+}
+
+/*
+* Constants
+*/
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolLiteral {
+    Bool(bool),
+    Byte(u8),
+    Char(char),
+    String(String),
+    CString(Vec<u8>),
+    Bytes(Vec<u8>),
+    F16(String),
+    F32(String),
+    F64(String),
+    F128(String),
+    Float(String),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    I128(i128),
+    Isize(isize),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    U128(u128),
+    Usize(usize),
+    Int(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolConstArg {
+    Literal(SolLiteral),
+    Tuple(Vec<SolHIR<SolConstArg>>),
 }
 
 /*
