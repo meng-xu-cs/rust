@@ -5,12 +5,13 @@ use rustc_abi::ExternAbi;
 use rustc_ast::{AttrStyle, FloatTy, IntTy, LitFloatType, LitIntType, LitKind, Mutability, UintTy};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
+use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{
     Attribute, CRATE_HIR_ID, ConstArg, ConstArgKind, FnDecl, FnPtrTy, FnRetTy, GenericParam,
     GenericParamKind, Generics, HirId, ImplicitSelfKind, ItemKind, Lifetime, LifetimeKind,
-    LifetimeParamKind, MissingLifetimeKind, Mod, MutTy, OwnerId, ParamName, Safety, Ty as HirTy,
-    TyKind as HirTyKind, TyPat, TyPatKind,
+    LifetimeParamKind, MissingLifetimeKind, Mod, MutTy, OwnerId, ParamName, PrimTy, Safety,
+    Ty as HirTy, TyKind as HirTyKind, TyPat, TyPatKind,
 };
 use rustc_middle::bug;
 use rustc_middle::ty::TyCtxt;
@@ -438,6 +439,54 @@ impl<'tcx> Builder<'tcx> {
         self.mk_hir(hir_id, span, pat_data)
     }
 
+    fn mk_qpath_res_for_type(&mut self, res: Res<HirId>) -> SolHirType {
+        match res {
+            Res::Def(kind, def_id) => match kind {
+                DefKind::Struct
+                | DefKind::Union
+                | DefKind::Enum
+                | DefKind::ForeignTy
+                | DefKind::TyAlias
+                | DefKind::Trait
+                | DefKind::TraitAlias
+                | DefKind::AssocTy
+                | DefKind::TyParam => SolHirType::Defined(self.mk_ident(def_id)),
+                _ => bug!("[invariant] expect type kind in type resolution only"),
+            },
+            Res::PrimTy(prim_ty) => {
+                let converted = match prim_ty {
+                    PrimTy::Bool => SolPrimTy::Bool,
+                    PrimTy::Int(IntTy::I8) => SolPrimTy::I8,
+                    PrimTy::Int(IntTy::I16) => SolPrimTy::I16,
+                    PrimTy::Int(IntTy::I32) => SolPrimTy::I32,
+                    PrimTy::Int(IntTy::I64) => SolPrimTy::I64,
+                    PrimTy::Int(IntTy::I128) => SolPrimTy::I128,
+                    PrimTy::Int(IntTy::Isize) => SolPrimTy::Isize,
+                    PrimTy::Uint(UintTy::U8) => SolPrimTy::U8,
+                    PrimTy::Uint(UintTy::U16) => SolPrimTy::U16,
+                    PrimTy::Uint(UintTy::U32) => SolPrimTy::U32,
+                    PrimTy::Uint(UintTy::U64) => SolPrimTy::U64,
+                    PrimTy::Uint(UintTy::U128) => SolPrimTy::U128,
+                    PrimTy::Uint(UintTy::Usize) => SolPrimTy::Usize,
+                    PrimTy::Float(FloatTy::F16) => SolPrimTy::F16,
+                    PrimTy::Float(FloatTy::F32) => SolPrimTy::F32,
+                    PrimTy::Float(FloatTy::F64) => SolPrimTy::F64,
+                    PrimTy::Float(FloatTy::F128) => SolPrimTy::F128,
+                    PrimTy::Char => SolPrimTy::Char,
+                    PrimTy::Str => SolPrimTy::Str,
+                };
+                SolHirType::Primitive(converted)
+            }
+            Res::SelfTyParam { .. } => todo!(),
+            Res::SelfTyAlias { .. } => todo!(),
+
+            Res::Local(..) | Res::SelfCtor(..) | Res::NonMacroAttr(..) | Res::ToolMod => {
+                bug!("[invariant] expect type namespace in type resolution only")
+            }
+            Res::Err => unreachable!(),
+        }
+    }
+
     fn mk_hir_type<'hir>(&mut self, ty: HirTy<'hir>) -> SolHIR<SolHirType> {
         let HirTy { hir_id, span, kind } = ty;
 
@@ -449,6 +498,12 @@ impl<'tcx> Builder<'tcx> {
             // pattern
             HirTyKind::Pat(base, pat) => {
                 SolHirType::Pattern(Box::new(self.mk_hir_type(*base)), self.mk_ty_pat(*pat))
+            }
+
+            // resolved
+            HirTyKind::Path(path) => {
+                let res = self.tcx.typeck(hir_id.owner.def_id).qpath_res(&path, hir_id);
+                self.mk_qpath_res_for_type(res)
             }
 
             // composite
@@ -570,8 +625,7 @@ impl<'tcx> Builder<'tcx> {
 
             HirTyKind::OpaqueDef(..)
             | HirTyKind::TraitAscription(..)
-            | HirTyKind::TraitObject(..)
-            | HirTyKind::Path(..) => todo!(),
+            | HirTyKind::TraitObject(..) => todo!(),
         };
 
         // pack all the information about the type
@@ -814,8 +868,33 @@ pub(crate) enum SolTyPat {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolPrimTy {
+    Bool,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    Isize,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    Usize,
+    F16,
+    F32,
+    F64,
+    F128,
+    Char,
+    Str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolHirType {
     Never,
+    Primitive(SolPrimTy),
+    Defined(SolIdent),
     Slice(Box<SolHIR<SolHirType>>),
     Tuple(Vec<SolHIR<SolHirType>>),
     Array(Box<SolHIR<SolHirType>>, SolHIR<SolConstArg>),
