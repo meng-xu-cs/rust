@@ -156,7 +156,6 @@ impl<'tcx> Builder<'tcx> {
         SolSpanned { span: self.mk_span(span), data }
     }
 
-    #[allow(unused)]
     fn mk_hir<T: SolIR>(&mut self, hir_id: HirId, span: Span, data: T) -> SolHIR<T> {
         // sanity check
         if hir_id.is_owner() {
@@ -271,7 +270,7 @@ impl<'tcx> Builder<'tcx> {
             },
             GenericParamKind::Type { default, synthetic } => {
                 if synthetic {
-                    bug!("[unsupported] type param is synthetic");
+                    bug!("[unsupported] synthetic type param");
                 }
                 match name {
                     ParamName::Plain(ident) => SolGenericParam::Type {
@@ -401,7 +400,10 @@ impl<'tcx> Builder<'tcx> {
             }
             ConstArgKind::Literal(lit) => SolConstArg::Literal(self.mk_literal(lit)),
 
-            ConstArgKind::Path(..) | ConstArgKind::Struct(..) | ConstArgKind::TupleCall(..) => {
+            ConstArgKind::Path(..)
+            | ConstArgKind::Struct(..)
+            | ConstArgKind::TupleCall(..)
+            | ConstArgKind::Array(..) => {
                 todo!()
             }
 
