@@ -1,13 +1,15 @@
 use std::fmt::Debug;
 use std::path::PathBuf;
 
+use rustc_abi::ExternAbi;
 use rustc_ast::AttrStyle;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
-use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod};
+use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod, Safety};
 use rustc_middle::bug;
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::thir::{BodyTy, ExprId, Thir};
+use rustc_middle::ty::{FnSig, Ty, TyCtxt};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -191,16 +193,9 @@ impl<'tcx> Builder<'tcx> {
                     continue;
                 }
 
-                // functions
-                ItemKind::Fn { .. } => {
-                    // we don't dump function definitions at HIR level, we will dump their THIR
-                    continue;
-                }
-
-                // impl blocks
-                ItemKind::Impl(..) => {
-                    // we don't dump impl blocks, items inside the impl blocks that has THIR
-                    // will be dumped though
+                // functions and function-alikes
+                ItemKind::Fn { .. } | ItemKind::Impl(..) | ItemKind::GlobalAsm { .. } => {
+                    // we don't dump function-alikes at HIR level, we will dump their THIR
                     continue;
                 }
 
@@ -219,9 +214,6 @@ impl<'tcx> Builder<'tcx> {
                         SolItem::Module(module_data),
                     )
                 }
-
-                // unsupported items
-                ItemKind::GlobalAsm { .. } => bug!("[unsupported] global assembly"),
             };
 
             // make the final item
@@ -236,12 +228,101 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
+    pub(crate) fn mk_abi(
+        &mut self,
+        abi: ExternAbi,
+        c_variadic: bool,
+        safety: Safety,
+    ) -> SolExternAbi {
+        match abi {
+            ExternAbi::Rust => {
+                if c_variadic {
+                    bug!("[invariant] Rust ABI should not be variadic");
+                }
+                match safety {
+                    Safety::Safe => SolExternAbi::Rust { safety: true },
+                    Safety::Unsafe => SolExternAbi::Rust { safety: false },
+                }
+            }
+            ExternAbi::C { unwind: _ } => SolExternAbi::C { variadic: c_variadic },
+            ExternAbi::System { unwind: _ } => {
+                if c_variadic {
+                    bug!("[invariant] System ABI should not be variadic");
+                }
+                SolExternAbi::System
+            }
+            _ => bug!("[unsupported] ABI {:?}", abi),
+        }
+    }
+
+    pub(crate) fn mk_type(&mut self, _ty: Ty<'tcx>) -> SolType {
+        todo!()
+    }
+
+    pub(crate) fn mk_exec(&mut self, thir: Thir<'tcx>, _expr: ExprId) -> SolExec {
+        // switch-case on the body type
+        match thir.body_type {
+            BodyTy::Fn(sig) => {
+                let FnSig { abi, c_variadic, safety, inputs_and_output: _ } = sig;
+
+                // parse function signature
+                let parsed_abi = self.mk_abi(abi, c_variadic, safety);
+                let ret_ty = self.mk_type(sig.output());
+                let mut params = vec![];
+                for input_ty in sig.inputs() {
+                    params.push(self.mk_type(*input_ty));
+                }
+
+                // parse parameters
+                if thir.params.len() != params.len() {
+                    bug!(
+                        "[invariant] parameter count mismatch: THIR has {} but signature has {}",
+                        thir.params.len(),
+                        params.len()
+                    );
+                }
+
+                // pack the information
+                SolExec::Function(SolFnDef { abi: parsed_abi, ret_ty, params })
+            }
+            BodyTy::Const(ty) => {
+                // sanity checks
+                if !thir.params.is_empty() {
+                    bug!("[invariant] constant body should not have parameters");
+                }
+
+                // parse type
+                let const_ty = self.mk_type(ty);
+
+                // pack the information
+                SolExec::Constant(SolConst { ty: const_ty })
+            }
+            BodyTy::GlobalAsm(..) => bug!("[unsupported] global assembly"),
+        }
+    }
+
     /// Build the crate
     pub(crate) fn build(mut self) -> SolCrate {
         // recursively build the modules starting from the root module
         let module_data =
             self.mk_module(self.tcx.crate_name(LOCAL_CRATE), *self.tcx.hir_root_module());
         let module_mir = self.mk_mir(CRATE_HIR_ID, DUMMY_SP, module_data);
+
+        // process all body owners in this crate
+        let mut executables = vec![];
+        for owner_id in self.tcx.hir_body_owners() {
+            let (thir_body, thir_expr) = self.tcx.thir_body(owner_id).unwrap_or_else(|_| {
+                panic!(
+                    "[invariant] failed to retrieve THIR body for {}",
+                    self.tcx.def_path_debug_str(owner_id.to_def_id())
+                )
+            });
+
+            // build the executable body
+            let exec = self.mk_exec(thir_body.steal(), thir_expr);
+            let hir_id = HirId::make_owner(owner_id);
+            executables.push(self.mk_mir(hir_id, self.tcx.hir_span_with_body(hir_id), exec));
+        }
 
         // unpack the builder
         let Self { tcx: _, src_dir: _, src_cache: _, id_cache } = self;
@@ -322,7 +403,73 @@ pub(crate) enum SolItem {
 }
 
 /*
-* Comment
+ * Exec (THIR)
+ */
+
+/// The main body of a THIR (e.g., a function or a constant)
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolExec {
+    Function(SolFnDef),
+    Constant(SolConst),
+}
+
+/// THIR of a function
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolFnDef {
+    pub(crate) abi: SolExternAbi,
+    pub(crate) ret_ty: SolType,
+    pub(crate) params: Vec<SolType>,
+}
+
+/// THIR of a constant
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolConst {
+    pub(crate) ty: SolType,
+}
+
+/// External ABI of a function
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolExternAbi {
+    C { variadic: bool },
+    Rust { safety: bool },
+    System,
+}
+
+/*
+ * Typing
+ */
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolType {
+    // baseline
+    Never,
+    // primitive types
+    Bool,
+    Char,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    Isize,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    Usize,
+    F16,
+    F32,
+    F64,
+    F128,
+    Str,
+    // compound types
+    Tuple(Vec<SolType>),
+    Slice(Box<SolType>),
+}
+
+/*
+ * Comment
  */
 
 /// A documentation comment
