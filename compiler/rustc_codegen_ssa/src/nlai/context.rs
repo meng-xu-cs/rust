@@ -314,7 +314,7 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
-    pub(crate) fn mk_exec(&mut self, thir: Thir<'tcx>, _expr: ExprId) -> SolExec {
+    pub(crate) fn mk_exec(&mut self, thir: &Thir<'tcx>, _expr: ExprId) -> SolExec {
         // switch-case on the body type
         match thir.body_type {
             BodyTy::Fn(sig) => {
@@ -374,7 +374,8 @@ impl<'tcx> Builder<'tcx> {
             });
 
             // build the executable body
-            let exec = self.mk_exec(thir_body.steal(), thir_expr);
+            let thir_lock = thir_body.borrow();
+            let exec = self.mk_exec(&*thir_lock, thir_expr);
             let hir_id = HirId::make_owner(owner_id);
             executables.push(self.mk_mir(hir_id, self.tcx.hir_span_with_body(hir_id), exec));
         }
