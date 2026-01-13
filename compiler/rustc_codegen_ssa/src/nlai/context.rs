@@ -7,9 +7,9 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod, Safety};
-use rustc_middle::bug;
 use rustc_middle::thir::{BodyTy, ExprId, Thir};
 use rustc_middle::ty::{FnSig, Ty, TyCtxt};
+use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -255,8 +255,63 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
-    pub(crate) fn mk_type(&mut self, _ty: Ty<'tcx>) -> SolType {
-        todo!()
+    pub(crate) fn mk_type(&mut self, ty: Ty<'tcx>) -> SolType {
+        match ty.kind() {
+            // baseline
+            ty::Never => SolType::Never,
+
+            // primitive types
+            ty::Bool => SolType::Bool,
+            ty::Char => SolType::Char,
+            ty::Int(int_ty) => match int_ty {
+                ty::IntTy::I8 => SolType::I8,
+                ty::IntTy::I16 => SolType::I16,
+                ty::IntTy::I32 => SolType::I32,
+                ty::IntTy::I64 => SolType::I64,
+                ty::IntTy::I128 => SolType::I128,
+                ty::IntTy::Isize => SolType::Isize,
+            },
+            ty::Uint(uint_ty) => match uint_ty {
+                ty::UintTy::U8 => SolType::U8,
+                ty::UintTy::U16 => SolType::U16,
+                ty::UintTy::U32 => SolType::U32,
+                ty::UintTy::U64 => SolType::U64,
+                ty::UintTy::U128 => SolType::U128,
+                ty::UintTy::Usize => SolType::Usize,
+            },
+            ty::Float(float_ty) => match float_ty {
+                ty::FloatTy::F16 => SolType::F16,
+                ty::FloatTy::F32 => SolType::F32,
+                ty::FloatTy::F64 => SolType::F64,
+                ty::FloatTy::F128 => SolType::F128,
+            },
+            ty::Str => SolType::Str,
+
+            // compound types
+            ty::Tuple(sub_tys) => {
+                let mut elems = vec![];
+                for sub_ty in sub_tys.iter() {
+                    elems.push(self.mk_type(sub_ty));
+                }
+                SolType::Tuple(elems)
+            }
+            ty::Slice(inner_ty) => {
+                let elem_ty = self.mk_type(*inner_ty);
+                SolType::Slice(Box::new(elem_ty))
+            }
+
+            // unsupported
+            ty::Coroutine(..) | ty::CoroutineClosure(..) | ty::CoroutineWitness(..) => {
+                bug!("[unsupported] coroutine type {ty}")
+            }
+
+            // unexpected
+            ty::Infer(..) | ty::Placeholder(..) | ty::Error(..) => {
+                bug!("[invaraint] unexpected type {ty}")
+            }
+
+            _ => todo!(),
+        }
     }
 
     pub(crate) fn mk_exec(&mut self, thir: Thir<'tcx>, _expr: ExprId) -> SolExec {
@@ -337,7 +392,7 @@ impl<'tcx> Builder<'tcx> {
         }
 
         // construct the crate
-        SolCrate { root: module_mir, id_desc }
+        SolCrate { root: module_mir, execs: executables, id_desc }
     }
 }
 
@@ -377,6 +432,7 @@ pub(crate) struct SolMIR<T: SolIR> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolCrate {
     pub(crate) root: SolMIR<SolModule>,
+    pub(crate) execs: Vec<SolMIR<SolExec>>,
     pub(crate) id_desc: Vec<(SolIdent, SolPathDesc)>,
 }
 
