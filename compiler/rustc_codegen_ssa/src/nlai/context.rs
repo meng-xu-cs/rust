@@ -2,13 +2,15 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 
 use rustc_abi::ExternAbi;
-use rustc_ast::AttrStyle;
+use rustc_ast::{AttrStyle, Mutability};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod, Safety};
 use rustc_middle::thir::{BodyTy, ExprId, Thir};
-use rustc_middle::ty::{FnSig, Ty, TyCtxt};
+use rustc_middle::ty::{
+    Const, ConstKind, FnSig, ParamConst, ParamTy, Pattern, PatternKind, Ty, TyCtxt, ValTree,
+};
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
 use serde::de::DeserializeOwned;
@@ -255,6 +257,22 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
+    pub(crate) fn mk_ty_pat(&mut self, pat: Pattern<'tcx>) -> SolTyPat {
+        match *pat {
+            PatternKind::NotNull => SolTyPat::NotNull,
+            PatternKind::Range { start, end } => {
+                SolTyPat::Range(self.mk_const(start), self.mk_const(end))
+            }
+            PatternKind::Or(patterns) => {
+                let mut sub_pats = vec![];
+                for sub_pat in patterns.iter() {
+                    sub_pats.push(self.mk_ty_pat(sub_pat));
+                }
+                SolTyPat::Or(sub_pats)
+            }
+        }
+    }
+
     pub(crate) fn mk_type(&mut self, ty: Ty<'tcx>) -> SolType {
         match ty.kind() {
             // baseline
@@ -287,6 +305,35 @@ impl<'tcx> Builder<'tcx> {
             },
             ty::Str => SolType::Str,
 
+            // pattern types
+            ty::Pat(base_ty, pattern) => {
+                SolType::Pat(Box::new(self.mk_type(*base_ty)), Box::new(self.mk_ty_pat(*pattern)))
+            }
+
+            // reference types
+            ty::RawPtr(pointee_ty, mutability) => {
+                let sub_ty = self.mk_type(*pointee_ty);
+                match mutability {
+                    Mutability::Not => SolType::ImmPtr(Box::new(sub_ty)),
+                    Mutability::Mut => SolType::MutPtr(Box::new(sub_ty)),
+                }
+            }
+            ty::Ref(region, referent_ty, mutability) => {
+                if !region.is_erased() {
+                    bug!("[invariant] regions not erased in THIR: {region}");
+                }
+                let sub_ty = self.mk_type(*referent_ty);
+                match mutability {
+                    Mutability::Not => SolType::ImmRef(Box::new(sub_ty)),
+                    Mutability::Mut => SolType::MutRef(Box::new(sub_ty)),
+                }
+            }
+
+            // type parameter
+            ty::Param(ParamTy { index, name }) => {
+                SolType::Param(SolIndex(*index as usize), SolSymbol(name.to_ident_string()))
+            }
+
             // compound types
             ty::Tuple(sub_tys) => {
                 let mut elems = vec![];
@@ -295,9 +342,9 @@ impl<'tcx> Builder<'tcx> {
                 }
                 SolType::Tuple(elems)
             }
-            ty::Slice(inner_ty) => {
-                let elem_ty = self.mk_type(*inner_ty);
-                SolType::Slice(Box::new(elem_ty))
+            ty::Slice(elem_ty) => SolType::Slice(Box::new(self.mk_type(*elem_ty))),
+            ty::Array(elem_ty, size) => {
+                SolType::Array(Box::new(self.mk_type(*elem_ty)), Box::new(self.mk_const(*size)))
             }
 
             // unsupported
@@ -310,8 +357,37 @@ impl<'tcx> Builder<'tcx> {
                 bug!("[invaraint] unexpected type {ty}")
             }
 
-            _ => todo!(),
+            _ => todo!("[todo] unhandled type {ty}"),
         }
+    }
+
+    pub(crate) fn mk_const(&mut self, cval: Const<'tcx>) -> SolConst {
+        match cval.kind() {
+            ConstKind::Param(ParamConst { index, name }) => {
+                SolConst::Param(SolIndex(index as usize), SolSymbol(name.to_ident_string()))
+            }
+            ConstKind::Value(val) => {
+                SolConst::Value(self.mk_type(val.ty), self.mk_value(val.ty, val.valtree))
+            }
+
+            // unsupported
+            ConstKind::Expr(..) => {
+                bug!("[unsupported] const expr {cval}")
+            }
+
+            // unexpected
+            ConstKind::Infer(..)
+            | ConstKind::Bound(..)
+            | ConstKind::Unevaluated(..)
+            | ConstKind::Placeholder(..)
+            | ConstKind::Error(..) => {
+                bug!("[invaraint] unexpected const {cval}")
+            }
+        }
+    }
+
+    pub(crate) fn mk_value(&mut self, _ty: Ty<'tcx>, _valtree: ValTree<'tcx>) -> SolValue {
+        todo!()
     }
 
     pub(crate) fn mk_exec(&mut self, thir: &Thir<'tcx>, _expr: ExprId) -> SolExec {
@@ -350,7 +426,7 @@ impl<'tcx> Builder<'tcx> {
                 let const_ty = self.mk_type(ty);
 
                 // pack the information
-                SolExec::Constant(SolConst { ty: const_ty })
+                SolExec::Constant(SolCEval { ty: const_ty })
             }
             BodyTy::GlobalAsm(..) => bug!("[unsupported] global assembly"),
         }
@@ -467,7 +543,7 @@ pub(crate) enum SolItem {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolExec {
     Function(SolFnDef),
-    Constant(SolConst),
+    Constant(SolCEval),
 }
 
 /// THIR of a function
@@ -478,9 +554,9 @@ pub(crate) struct SolFnDef {
     pub(crate) params: Vec<SolType>,
 }
 
-/// THIR of a constant
+/// THIR of a constant evaluation
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolConst {
+pub(crate) struct SolCEval {
     pub(crate) ty: SolType,
 }
 
@@ -520,9 +596,59 @@ pub(crate) enum SolType {
     F64,
     F128,
     Str,
+    // pattern types
+    Pat(Box<SolType>, Box<SolTyPat>),
+    // reference types
+    ImmPtr(Box<SolType>),
+    MutPtr(Box<SolType>),
+    ImmRef(Box<SolType>),
+    MutRef(Box<SolType>),
+    // type parameter
+    Param(SolIndex, SolSymbol),
     // compound types
     Tuple(Vec<SolType>),
     Slice(Box<SolType>),
+    Array(Box<SolType>, Box<SolConst>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolTyPat {
+    NotNull,
+    Range(SolConst, SolConst),
+    Or(Vec<SolTyPat>),
+}
+
+/*
+ * Constant
+ */
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolConst {
+    Param(SolIndex, SolSymbol),
+    Value(SolType, SolValue),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolValue {
+    // primitives
+    Bool(bool),
+    Char(char),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    I128(i128),
+    Isize(isize),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    U128(u128),
+    Usize(usize),
+    F16(String),
+    F32(String),
+    F64(String),
+    F128(String),
 }
 
 /*
@@ -554,6 +680,10 @@ pub(crate) struct SolHash64(pub(crate) u64);
 /// A 128-bit hash
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolHash128(pub(crate) u128);
+
+/// An index
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolIndex(pub(crate) usize);
 
 /// A name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
