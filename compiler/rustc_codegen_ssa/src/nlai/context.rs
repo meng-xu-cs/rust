@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 
 use rustc_abi::ExternAbi;
-use rustc_ast::{AttrStyle, Mutability};
+use rustc_ast::{AttrStyle, FloatTy, IntTy, Mutability, UintTy};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
@@ -11,7 +11,8 @@ use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod, Safety};
 use rustc_middle::thir::{BodyTy, ExprId, Thir};
 use rustc_middle::ty::{
     AdtDef, AdtKind, Const, ConstKind, FnSig, GenericArg, GenericArgKind, GenericArgsRef,
-    ParamConst, ParamTy, Pattern, PatternKind, Ty, TyCtxt, ValTree, VariantDiscr,
+    ParamConst, ParamTy, Pattern, PatternKind, ScalarInt, Ty, TyCtxt, ValTreeKind, Value,
+    VariantDiscr,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
@@ -53,6 +54,7 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
+    /// Record an identifier (with caching)
     fn mk_ident(&mut self, def_id: DefId) -> SolIdent {
         // check cache first
         if let Some((ident, _)) = self.id_cache.get(&def_id) {
@@ -74,6 +76,7 @@ impl<'tcx> Builder<'tcx> {
         ident
     }
 
+    /// Record a span
     fn mk_span(&mut self, span: Span) -> SolSpan {
         let source_map = self.tcx.sess.source_map();
 
@@ -129,6 +132,7 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
+    /// Record the doc comments associated with a hir_id
     fn mk_doc_comments(&self, hir_id: HirId) -> Vec<SolDocComment> {
         let mut doc_comments = Vec::new();
         for attr in self.tcx.hir_attrs(hir_id) {
@@ -153,10 +157,12 @@ impl<'tcx> Builder<'tcx> {
     }
 
     #[allow(dead_code)]
+    /// Record an AST node in the THIR body with its metadata
     fn mk_ast<T: SolIR>(&mut self, span: Span, data: T) -> SolAST<T> {
         SolAST { span: self.mk_span(span), data }
     }
 
+    /// Record a MIR node in the THIR body with its metadata
     fn mk_mir<T: SolIR>(&mut self, hir_id: HirId, span: Span, data: T) -> SolMIR<T> {
         SolMIR {
             ident: self.mk_ident(hir_id.expect_owner().to_def_id()),
@@ -166,6 +172,7 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
+    /// Record a module
     fn mk_module(&mut self, name: Symbol, module: Mod<'tcx>) -> SolModule {
         let Mod { spans, item_ids } = module;
 
@@ -246,6 +253,7 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
+    /// Record a function ABI
     pub(crate) fn mk_abi(
         &mut self,
         abi: ExternAbi,
@@ -273,6 +281,7 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
+    /// Record a generic argument
     pub(crate) fn mk_generic_arg(&mut self, ty_arg: GenericArg<'tcx>) -> SolGenericArg {
         match ty_arg.kind() {
             GenericArgKind::Type(ty) => SolGenericArg::Type(self.mk_type(ty)),
@@ -286,6 +295,7 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
+    /// Record a pattern type
     pub(crate) fn mk_ty_pat(&mut self, pat: Pattern<'tcx>) -> SolTyPat {
         match *pat {
             PatternKind::NotNull => SolTyPat::NotNull,
@@ -298,6 +308,7 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
+    /// Record the definition of an ADT
     pub(crate) fn mk_adt(
         &mut self,
         adt_def: AdtDef<'tcx>,
@@ -403,6 +414,7 @@ impl<'tcx> Builder<'tcx> {
         (ident, generic_args)
     }
 
+    /// Record a type in MIR/THIR context
     pub(crate) fn mk_type(&mut self, ty: Ty<'tcx>) -> SolType {
         match ty.kind() {
             // baseline
@@ -494,14 +506,13 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
+    /// Record a constant in MIR/THIR context
     pub(crate) fn mk_const(&mut self, cval: Const<'tcx>) -> SolConst {
         match cval.kind() {
             ConstKind::Param(ParamConst { index, name }) => {
                 SolConst::Param(SolParamIndex(index as usize), SolParamName(name.to_ident_string()))
             }
-            ConstKind::Value(val) => {
-                SolConst::Value(self.mk_type(val.ty), self.mk_value(val.ty, val.valtree))
-            }
+            ConstKind::Value(val) => SolConst::Value(self.mk_value(val)),
 
             // unsupported
             ConstKind::Expr(..) => {
@@ -519,10 +530,72 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
-    pub(crate) fn mk_value(&mut self, _ty: Ty<'tcx>, _valtree: ValTree<'tcx>) -> SolValue {
-        todo!()
+    /// Record a (constant) value in MIR/THIR context
+    pub(crate) fn mk_value(&mut self, val: Value<'tcx>) -> SolValue {
+        let Value { ty, valtree } = val;
+
+        match *valtree {
+            ValTreeKind::Leaf(leaf) => self.mk_value_from_scalar(val.ty, *leaf),
+            ValTreeKind::Branch(box []) => self.mk_value_from_zst(ty),
+            ValTreeKind::Branch(box _) => {
+                todo!("[todo] multi-branch constant {val} for type {ty}")
+            }
+        }
     }
 
+    /// Record a (constant) value based on a scalar integer
+    pub(crate) fn mk_value_from_scalar(&mut self, ty: Ty<'tcx>, scalar: ScalarInt) -> SolValue {
+        match ty.kind() {
+            // primitives
+            ty::Bool => SolValue::Bool(scalar.try_to_bool().unwrap()),
+            ty::Char => SolValue::Char(scalar.try_into().unwrap()),
+            ty::Int(IntTy::I8) => SolValue::I8(scalar.to_i8()),
+            ty::Int(IntTy::I16) => SolValue::I16(scalar.to_i16()),
+            ty::Int(IntTy::I32) => SolValue::I32(scalar.to_i32()),
+            ty::Int(IntTy::I64) => SolValue::I64(scalar.to_i64()),
+            ty::Int(IntTy::I128) => SolValue::I128(scalar.to_i128()),
+            ty::Int(IntTy::Isize) => SolValue::Isize(scalar.to_target_isize(self.tcx) as isize),
+            ty::Uint(UintTy::U8) => SolValue::U8(scalar.to_u8()),
+            ty::Uint(UintTy::U16) => SolValue::U16(scalar.to_u16()),
+            ty::Uint(UintTy::U32) => SolValue::U32(scalar.to_u32()),
+            ty::Uint(UintTy::U64) => SolValue::U64(scalar.to_u64()),
+            ty::Uint(UintTy::U128) => SolValue::U128(scalar.to_u128()),
+            ty::Uint(UintTy::Usize) => SolValue::Usize(scalar.to_target_usize(self.tcx) as usize),
+            ty::Float(FloatTy::F16) => SolValue::F16(scalar.to_f16().to_string()),
+            ty::Float(FloatTy::F32) => SolValue::F32(scalar.to_f32().to_string()),
+            ty::Float(FloatTy::F64) => SolValue::F64(scalar.to_f64().to_string()),
+            ty::Float(FloatTy::F128) => SolValue::F128(scalar.to_f128().to_string()),
+            _ => todo!(),
+        }
+    }
+
+    /// Record a (constant) value for a ZST
+    pub(crate) fn mk_value_from_zst(&mut self, ty: Ty<'tcx>) -> SolValue {
+        self.mk_value_when_zst(ty).unwrap_or_else(|| {
+            bug!("[invariant] failed to create a value for ZST type {ty}");
+        })
+    }
+
+    /// Try to record a (constant) value for a ZST or None of the type is not zero-sized
+    fn mk_value_when_zst(&mut self, ty: Ty<'tcx>) -> Option<SolValue> {
+        let zst_val = match ty.kind() {
+            ty::Tuple(elems) => {
+                // a tuple is a ZST if all its elements are ZSTs (including the empty tuple)
+                let mut elem_vals = vec![];
+                for elem_ty in elems.iter() {
+                    let elem_val = self.mk_value_when_zst(elem_ty)?;
+                    elem_vals.push(elem_val);
+                }
+                SolValue::Tuple(elem_vals)
+            }
+
+            // FIXME: handle more ZST types
+            _ => return None,
+        };
+        Some(zst_val)
+    }
+
+    /// Record a executable, i.e., a THIR body (for a function or a constant/static)
     pub(crate) fn mk_exec(&mut self, thir: &Thir<'tcx>, _expr: ExprId) -> SolExec {
         // switch-case on the body type
         match thir.body_type {
@@ -821,7 +894,7 @@ pub(crate) struct SolVariant {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolConst {
     Param(SolParamIndex, SolParamName),
-    Value(SolType, SolValue),
+    Value(SolValue),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -845,6 +918,8 @@ pub(crate) enum SolValue {
     F32(String),
     F64(String),
     F128(String),
+    // composite
+    Tuple(Vec<SolValue>),
 }
 
 /*
