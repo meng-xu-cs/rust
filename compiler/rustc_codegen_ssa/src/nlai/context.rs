@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
 use std::path::PathBuf;
 
@@ -9,12 +10,14 @@ use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod, Safety};
 use rustc_middle::thir::{BodyTy, ExprId, Thir};
 use rustc_middle::ty::{
-    Const, ConstKind, FnSig, ParamConst, ParamTy, Pattern, PatternKind, Ty, TyCtxt, ValTree,
+    AdtDef, AdtKind, Const, ConstKind, FnSig, GenericArg, GenericArgKind, GenericArgsRef,
+    ParamConst, ParamTy, Pattern, PatternKind, Ty, TyCtxt, ValTree, VariantDiscr,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 /// A builder for creating a nlai module
 pub(crate) struct Builder<'tcx> {
@@ -27,14 +30,27 @@ pub(crate) struct Builder<'tcx> {
     /// source cache
     src_cache: FxHashSet<StableSourceFileId>,
 
+    /// collected definitions of datatypes
+    ty_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolAdtDef>>>,
+
     /// a cache of id to identifier mappings
     id_cache: FxHashMap<DefId, (SolIdent, SolPathDesc)>,
+
+    /// log stack
+    log_stack: LogStack,
 }
 
 impl<'tcx> Builder<'tcx> {
     /// Create a new builder
     pub(crate) fn new(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> Self {
-        Self { tcx, src_dir, src_cache: FxHashSet::default(), id_cache: FxHashMap::default() }
+        Self {
+            tcx,
+            src_dir,
+            src_cache: FxHashSet::default(),
+            ty_defs: BTreeMap::new(),
+            id_cache: FxHashMap::default(),
+            log_stack: LogStack::new(),
+        }
     }
 
     fn mk_ident(&mut self, def_id: DefId) -> SolIdent {
@@ -224,7 +240,7 @@ impl<'tcx> Builder<'tcx> {
 
         // construct the module
         SolModule {
-            name: SolSymbol(name.to_ident_string()),
+            name: SolModuleName(name.to_ident_string()),
             scope: self.mk_span(spans.inner_span),
             items,
         }
@@ -257,6 +273,19 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
+    pub(crate) fn mk_generic_arg(&mut self, ty_arg: GenericArg<'tcx>) -> SolGenericArg {
+        match ty_arg.kind() {
+            GenericArgKind::Type(ty) => SolGenericArg::Type(self.mk_type(ty)),
+            GenericArgKind::Const(val) => SolGenericArg::Const(self.mk_const(val)),
+            GenericArgKind::Lifetime(region) => {
+                if !region.is_erased() {
+                    bug!("[invariant] regions not erased in THIR: {region}");
+                }
+                SolGenericArg::Lifetime
+            }
+        }
+    }
+
     pub(crate) fn mk_ty_pat(&mut self, pat: Pattern<'tcx>) -> SolTyPat {
         match *pat {
             PatternKind::NotNull => SolTyPat::NotNull,
@@ -264,13 +293,114 @@ impl<'tcx> Builder<'tcx> {
                 SolTyPat::Range(self.mk_const(start), self.mk_const(end))
             }
             PatternKind::Or(patterns) => {
-                let mut sub_pats = vec![];
-                for sub_pat in patterns.iter() {
-                    sub_pats.push(self.mk_ty_pat(sub_pat));
-                }
-                SolTyPat::Or(sub_pats)
+                SolTyPat::Or(patterns.iter().map(|sub_pat| self.mk_ty_pat(sub_pat)).collect())
             }
         }
+    }
+
+    pub(crate) fn mk_adt(
+        &mut self,
+        adt_def: AdtDef<'tcx>,
+        ty_args: GenericArgsRef<'tcx>,
+    ) -> (SolIdent, Vec<SolGenericArg>) {
+        let def_id = adt_def.did();
+
+        // locate the key of the definition
+        let ident = self.mk_ident(def_id);
+        let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+
+        // if already defined or is being defined, return the key
+        if self.ty_defs.get(&ident).map_or(false, |inner| inner.contains_key(&generic_args)) {
+            return (ident, generic_args);
+        }
+
+        // mark start
+        let def_desc = Self::debug_symbol(self.tcx, def_id, ty_args);
+        self.log_stack.push("|ADT|", def_desc.clone());
+
+        // first update the entry to mark that type definition in progress
+        self.ty_defs.entry(ident.clone()).or_default().insert(generic_args.clone(), None);
+
+        // now create the type definition
+        let ty_def = match adt_def.adt_kind() {
+            AdtKind::Struct => {
+                if adt_def.variants().len() != 1 {
+                    bug!("[invariant] struct {def_desc} has multiple variants");
+                }
+                let fields = adt_def
+                    .non_enum_variant()
+                    .fields
+                    .iter_enumerated()
+                    .map(|(field_idx, field_def)| SolField {
+                        index: SolFieldIndex(field_idx.index()),
+                        name: SolFieldName(field_def.name.to_ident_string()),
+                        ty: self.mk_type(field_def.ty(self.tcx, ty_args)),
+                    })
+                    .collect();
+                SolAdtDef::Struct { fields }
+            }
+            AdtKind::Union => {
+                if adt_def.variants().len() != 1 {
+                    bug!("[invariant] union {def_desc} has multiple variants");
+                }
+                let fields = adt_def
+                    .non_enum_variant()
+                    .fields
+                    .iter_enumerated()
+                    .map(|(field_idx, field_def)| SolField {
+                        index: SolFieldIndex(field_idx.index()),
+                        name: SolFieldName(field_def.name.to_ident_string()),
+                        ty: self.mk_type(field_def.ty(self.tcx, ty_args)),
+                    })
+                    .collect();
+                SolAdtDef::Union { fields }
+            }
+            AdtKind::Enum => {
+                let mut variants = vec![];
+                let mut last_discr_value = 0;
+                for (variant_idx, variant_def) in adt_def.variants().iter_enumerated() {
+                    let variant_index = SolVariantIndex(variant_idx.index());
+                    let variant_name = SolVariantName(variant_def.name.to_ident_string());
+                    let variant_descr = match variant_def.discr {
+                        VariantDiscr::Relative(pos) => {
+                            SolVariantDiscr(last_discr_value + pos as u128)
+                        }
+                        VariantDiscr::Explicit(did) => {
+                            let discr = adt_def.eval_explicit_discr(self.tcx, did).unwrap_or_else(|_| {
+                                    bug!("[invariant] failed to evaluate discriminant for enum {def_desc}")
+                                });
+                            last_discr_value = discr.val;
+                            SolVariantDiscr(discr.val)
+                        }
+                    };
+                    let fields = variant_def
+                        .fields
+                        .iter_enumerated()
+                        .map(|(field_idx, field_def)| SolField {
+                            index: SolFieldIndex(field_idx.index()),
+                            name: SolFieldName(field_def.name.to_ident_string()),
+                            ty: self.mk_type(field_def.ty(self.tcx, ty_args)),
+                        })
+                        .collect();
+                    variants.push(SolVariant {
+                        index: variant_index,
+                        name: variant_name,
+                        discr: variant_descr,
+                        fields,
+                    });
+                }
+                SolAdtDef::Enum { variants }
+            }
+        };
+
+        // update the type definition
+        self.ty_defs.entry(ident.clone()).or_default().insert(generic_args.clone(), Some(ty_def));
+
+        // mark end
+        self.log_stack.pop();
+
+        // return the result
+        (ident, generic_args)
     }
 
     pub(crate) fn mk_type(&mut self, ty: Ty<'tcx>) -> SolType {
@@ -310,6 +440,13 @@ impl<'tcx> Builder<'tcx> {
                 SolType::Pat(Box::new(self.mk_type(*base_ty)), Box::new(self.mk_ty_pat(*pattern)))
             }
 
+            // dependencies
+            ty::Foreign(def_id) => SolType::Foreign(self.mk_ident(*def_id)),
+            ty::Adt(adt_def, ty_args) => {
+                let (ident, generic_args) = self.mk_adt(*adt_def, ty_args);
+                SolType::Adt(ident, generic_args)
+            }
+
             // reference types
             ty::RawPtr(pointee_ty, mutability) => {
                 let sub_ty = self.mk_type(*pointee_ty);
@@ -331,16 +468,12 @@ impl<'tcx> Builder<'tcx> {
 
             // type parameter
             ty::Param(ParamTy { index, name }) => {
-                SolType::Param(SolIndex(*index as usize), SolSymbol(name.to_ident_string()))
+                SolType::Param(SolParamIndex(*index as usize), SolParamName(name.to_ident_string()))
             }
 
             // compound types
             ty::Tuple(sub_tys) => {
-                let mut elems = vec![];
-                for sub_ty in sub_tys.iter() {
-                    elems.push(self.mk_type(sub_ty));
-                }
-                SolType::Tuple(elems)
+                SolType::Tuple(sub_tys.iter().map(|sub_ty| self.mk_type(sub_ty)).collect())
             }
             ty::Slice(elem_ty) => SolType::Slice(Box::new(self.mk_type(*elem_ty))),
             ty::Array(elem_ty, size) => {
@@ -353,7 +486,7 @@ impl<'tcx> Builder<'tcx> {
             }
 
             // unexpected
-            ty::Infer(..) | ty::Placeholder(..) | ty::Error(..) => {
+            ty::Infer(..) | ty::Bound(..) | ty::Placeholder(..) | ty::Error(..) => {
                 bug!("[invaraint] unexpected type {ty}")
             }
 
@@ -364,7 +497,7 @@ impl<'tcx> Builder<'tcx> {
     pub(crate) fn mk_const(&mut self, cval: Const<'tcx>) -> SolConst {
         match cval.kind() {
             ConstKind::Param(ParamConst { index, name }) => {
-                SolConst::Param(SolIndex(index as usize), SolSymbol(name.to_ident_string()))
+                SolConst::Param(SolParamIndex(index as usize), SolParamName(name.to_ident_string()))
             }
             ConstKind::Value(val) => {
                 SolConst::Value(self.mk_type(val.ty), self.mk_value(val.ty, val.valtree))
@@ -399,10 +532,8 @@ impl<'tcx> Builder<'tcx> {
                 // parse function signature
                 let parsed_abi = self.mk_abi(abi, c_variadic, safety);
                 let ret_ty = self.mk_type(sig.output());
-                let mut params = vec![];
-                for input_ty in sig.inputs() {
-                    params.push(self.mk_type(*input_ty));
-                }
+                let params: Vec<_> =
+                    sig.inputs().iter().map(|input_ty| self.mk_type(*input_ty)).collect();
 
                 // parse parameters
                 if thir.params.len() != params.len() {
@@ -457,7 +588,23 @@ impl<'tcx> Builder<'tcx> {
         }
 
         // unpack the builder
-        let Self { tcx: _, src_dir: _, src_cache: _, id_cache } = self;
+        let Self { tcx: _, src_dir: _, src_cache: _, ty_defs, id_cache, log_stack } = self;
+
+        // sanity check
+        if !log_stack.is_empty() {
+            bug!("[invariant] log stack is not empty");
+        }
+
+        // collect the datatype definitions
+        let mut flat_ty_defs = vec![];
+        for (ident, l1) in ty_defs.into_iter() {
+            for (mono, def) in l1.into_iter() {
+                match def {
+                    None => bug!("[invariant] missing type definition"),
+                    Some(val) => flat_ty_defs.push((ident.clone(), mono, val)),
+                }
+            }
+        }
 
         // collect the id to description mappings
         let mut id_desc = vec![];
@@ -469,7 +616,19 @@ impl<'tcx> Builder<'tcx> {
         }
 
         // construct the crate
-        SolCrate { root: module_mir, execs: executables, id_desc }
+        SolCrate { root: module_mir, execs: executables, ty_defs: flat_ty_defs, id_desc }
+    }
+
+    /// Create a fully qualified path string with crate name
+    #[inline]
+    fn debug_symbol(tcx: TyCtxt<'tcx>, def_id: DefId, ty_args: GenericArgsRef<'tcx>) -> String {
+        let path_str = tcx.def_path_str_with_args(def_id, ty_args);
+        if def_id.is_local() {
+            let krate = tcx.crate_name(LOCAL_CRATE).to_ident_string();
+            format!("{krate}::{path_str}")
+        } else {
+            path_str
+        }
     }
 }
 
@@ -510,6 +669,7 @@ pub(crate) struct SolMIR<T: SolIR> {
 pub(crate) struct SolCrate {
     pub(crate) root: SolMIR<SolModule>,
     pub(crate) execs: Vec<SolMIR<SolExec>>,
+    pub(crate) ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolAdtDef)>,
     pub(crate) id_desc: Vec<(SolIdent, SolPathDesc)>,
 }
 
@@ -520,7 +680,7 @@ pub(crate) struct SolCrate {
 /// A module
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolModule {
-    pub(crate) name: SolSymbol,
+    pub(crate) name: SolModuleName,
     pub(crate) scope: SolSpan,
     pub(crate) items: Vec<SolMIR<SolItem>>,
 }
@@ -598,13 +758,16 @@ pub(crate) enum SolType {
     Str,
     // pattern types
     Pat(Box<SolType>, Box<SolTyPat>),
+    // dependencies
+    Foreign(SolIdent),
+    Adt(SolIdent, Vec<SolGenericArg>),
     // reference types
     ImmPtr(Box<SolType>),
     MutPtr(Box<SolType>),
     ImmRef(Box<SolType>),
     MutRef(Box<SolType>),
     // type parameter
-    Param(SolIndex, SolSymbol),
+    Param(SolParamIndex, SolParamName),
     // compound types
     Tuple(Vec<SolType>),
     Slice(Box<SolType>),
@@ -618,13 +781,46 @@ pub(crate) enum SolTyPat {
     Or(Vec<SolTyPat>),
 }
 
+/// A generic argument
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolGenericArg {
+    Type(SolType),
+    Const(SolConst),
+    Lifetime,
+}
+
+/// User-defined type, i.e., an algebraic data type (ADT)
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolAdtDef {
+    Struct { fields: Vec<SolField> },
+    Union { fields: Vec<SolField> },
+    Enum { variants: Vec<SolVariant> },
+}
+
+/// A field definition in an ADT
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolField {
+    pub(crate) index: SolFieldIndex,
+    pub(crate) name: SolFieldName,
+    pub(crate) ty: SolType,
+}
+
+/// A field definition in an ADT
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolVariant {
+    pub(crate) index: SolVariantIndex,
+    pub(crate) name: SolVariantName,
+    pub(crate) discr: SolVariantDiscr,
+    pub(crate) fields: Vec<SolField>,
+}
+
 /*
  * Constant
  */
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolConst {
-    Param(SolIndex, SolSymbol),
+    Param(SolParamIndex, SolParamName),
     Value(SolType, SolValue),
 }
 
@@ -681,13 +877,37 @@ pub(crate) struct SolHash64(pub(crate) u64);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolHash128(pub(crate) u128);
 
-/// An index
+/// A parameter name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolIndex(pub(crate) usize);
+pub(crate) struct SolModuleName(pub(crate) String);
 
-/// A name
+/// A parameter name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolSymbol(pub(crate) String);
+pub(crate) struct SolParamName(pub(crate) String);
+
+/// A parameter index
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolParamIndex(pub(crate) usize);
+
+/// A field name
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolFieldName(pub(crate) String);
+
+/// A field index
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolFieldIndex(pub(crate) usize);
+
+/// A variant name
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolVariantName(pub(crate) String);
+
+/// A variant index
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolVariantIndex(pub(crate) usize);
+
+/// A variant discrimanant
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolVariantDiscr(pub(crate) u128);
 
 /// A description of a definition path
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -704,3 +924,38 @@ pub(crate) struct SolSpan {
 }
 
 /* --- END OF SYNC --- */
+
+/*
+ * Utilities
+ */
+
+/// A stack for context logging
+struct LogStack {
+    stack: VecDeque<(&'static str, String)>,
+}
+
+impl LogStack {
+    /// Create a new log stack
+    fn new() -> Self {
+        Self { stack: VecDeque::new() }
+    }
+
+    /// Increment the depth context
+    fn push(&mut self, tag: &'static str, msg: String) {
+        let indent = "  ".repeat(self.stack.len());
+        info!("{indent}-> |{tag}| {msg}");
+        self.stack.push_back((tag, msg.to_string()));
+    }
+
+    /// Decrement the depth context
+    fn pop(&mut self) {
+        let (tag, msg) = self.stack.pop_back().expect("[invariant] context stack underflows");
+        let indent = "  ".repeat(self.stack.len());
+        info!("{indent}<- |{tag}| {msg}");
+    }
+
+    /// Check if the stack is empty
+    fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
+}
