@@ -10,9 +10,10 @@ use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod, Safety};
 use rustc_middle::thir::{BodyTy, ExprId, Thir};
 use rustc_middle::ty::{
-    AdtDef, AdtKind, Const, ConstKind, FnSig, GenericArg, GenericArgKind, GenericArgsRef,
-    ParamConst, ParamTy, Pattern, PatternKind, ScalarInt, Ty, TyCtxt, ValTreeKind, Value,
-    VariantDiscr,
+    AdtDef, AdtKind, Clause, ClauseKind, Const, ConstKind, ExistentialPredicate, FnHeader, FnSig,
+    GenericArg, GenericArgKind, GenericArgsRef, InstantiatedPredicates, ParamConst, ParamTy,
+    Pattern, PatternKind, PredicatePolarity, ScalarInt, Term, TermKind, TraitDef, TraitPredicate,
+    Ty, TyCtxt, ValTreeKind, Value, VariantDiscr,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
@@ -32,7 +33,10 @@ pub(crate) struct Builder<'tcx> {
     src_cache: FxHashSet<StableSourceFileId>,
 
     /// collected definitions of datatypes
-    ty_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolAdtDef>>>,
+    adt_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolAdtDef>>>,
+
+    /// collected definitions of traits
+    trait_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolTraitDef>>>,
 
     /// a cache of id to identifier mappings
     id_cache: FxHashMap<DefId, (SolIdent, SolPathDesc)>,
@@ -48,7 +52,8 @@ impl<'tcx> Builder<'tcx> {
             tcx,
             src_dir,
             src_cache: FxHashSet::default(),
-            ty_defs: BTreeMap::new(),
+            adt_defs: BTreeMap::new(),
+            trait_defs: BTreeMap::new(),
             id_cache: FxHashMap::default(),
             log_stack: LogStack::new(),
         }
@@ -295,6 +300,14 @@ impl<'tcx> Builder<'tcx> {
         }
     }
 
+    /// Record a projection term in the type system
+    pub(crate) fn mk_projection_term(&mut self, term: Term<'tcx>) -> SolProjTerm {
+        match term.kind() {
+            TermKind::Ty(ty) => SolProjTerm::Type(self.mk_type(ty)),
+            TermKind::Const(cval) => SolProjTerm::Const(self.mk_const(cval)),
+        }
+    }
+
     /// Record a pattern type
     pub(crate) fn mk_ty_pat(&mut self, pat: Pattern<'tcx>) -> SolTyPat {
         match *pat {
@@ -321,7 +334,7 @@ impl<'tcx> Builder<'tcx> {
         let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
 
         // if already defined or is being defined, return the key
-        if self.ty_defs.get(&ident).map_or(false, |inner| inner.contains_key(&generic_args)) {
+        if self.adt_defs.get(&ident).map_or(false, |inner| inner.contains_key(&generic_args)) {
             return (ident, generic_args);
         }
 
@@ -330,10 +343,10 @@ impl<'tcx> Builder<'tcx> {
         self.log_stack.push("|ADT|", def_desc.clone());
 
         // first update the entry to mark that type definition in progress
-        self.ty_defs.entry(ident.clone()).or_default().insert(generic_args.clone(), None);
+        self.adt_defs.entry(ident.clone()).or_default().insert(generic_args.clone(), None);
 
         // now create the type definition
-        let ty_def = match adt_def.adt_kind() {
+        let parsed_def = match adt_def.adt_kind() {
             AdtKind::Struct => {
                 if adt_def.variants().len() != 1 {
                     bug!("[invariant] struct {def_desc} has multiple variants");
@@ -380,6 +393,9 @@ impl<'tcx> Builder<'tcx> {
                             let discr = adt_def.eval_explicit_discr(self.tcx, did).unwrap_or_else(|_| {
                                     bug!("[invariant] failed to evaluate discriminant for enum {def_desc}")
                                 });
+                            if !matches!(discr.ty.kind(), ty::Int(_) | ty::Uint(_)) {
+                                bug!("[invariant] non-integral discriminant for enum {def_desc}");
+                            }
                             last_discr_value = discr.val;
                             SolVariantDiscr(discr.val)
                         }
@@ -405,13 +421,110 @@ impl<'tcx> Builder<'tcx> {
         };
 
         // update the type definition
-        self.ty_defs.entry(ident.clone()).or_default().insert(generic_args.clone(), Some(ty_def));
+        self.adt_defs
+            .entry(ident.clone())
+            .or_default()
+            .insert(generic_args.clone(), Some(parsed_def));
 
         // mark end
         self.log_stack.pop();
 
         // return the result
         (ident, generic_args)
+    }
+
+    /// Record the definition of a trait
+    pub(crate) fn mk_trait(
+        &mut self,
+        trait_def: &TraitDef,
+        ty_args: GenericArgsRef<'tcx>,
+    ) -> (SolIdent, Vec<SolGenericArg>) {
+        let def_id = trait_def.def_id;
+
+        // locate the key of the definition
+        let ident = self.mk_ident(def_id);
+        let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+
+        // if already defined or is being defined, return the key
+        if self.trait_defs.get(&ident).map_or(false, |inner| inner.contains_key(&generic_args)) {
+            return (ident, generic_args);
+        }
+
+        // mark start
+        let def_desc = Self::debug_symbol(self.tcx, def_id, ty_args);
+        self.log_stack.push("|Trait|", def_desc.clone());
+
+        // first update the entry to mark that type definition in progress
+        self.trait_defs.entry(ident.clone()).or_default().insert(generic_args.clone(), None);
+
+        // collect the predicates of the trait
+        let mut parsed_clauses = vec![];
+
+        let InstantiatedPredicates { predicates, spans: _ } =
+            self.tcx.explicit_predicates_of(def_id).instantiate(self.tcx, ty_args);
+        for clause in predicates {
+            parsed_clauses.push(self.mk_clause(clause));
+        }
+
+        for (clause, _span) in
+            self.tcx.explicit_item_bounds(def_id).iter_instantiated_copied(self.tcx, ty_args)
+        {
+            parsed_clauses.push(self.mk_clause(clause));
+        }
+
+        // update the type definition
+        self.trait_defs
+            .entry(ident.clone())
+            .or_default()
+            .insert(generic_args.clone(), Some(SolTraitDef { clauses: parsed_clauses }));
+
+        // mark end
+        self.log_stack.pop();
+
+        // return the result
+        (ident, generic_args)
+    }
+
+    /// Record a clause in a predicate
+    pub(crate) fn mk_clause(&mut self, clause: Clause<'tcx>) -> SolClause {
+        match clause
+            .kind()
+            .no_bound_vars()
+            .unwrap_or_else(|| bug!("[unsupported] higher-ranked clause {clause}"))
+        {
+            ClauseKind::Trait(TraitPredicate { trait_ref, polarity }) => {
+                let (trait_ident, trait_ty_args) =
+                    self.mk_trait(self.tcx.trait_def(trait_ref.def_id), trait_ref.args);
+                match polarity {
+                    PredicatePolarity::Positive => SolClause::TraitImpl(trait_ident, trait_ty_args),
+                    PredicatePolarity::Negative => {
+                        SolClause::TraitNotImpl(trait_ident, trait_ty_args)
+                    }
+                }
+            }
+            ClauseKind::WellFormed(term) => SolClause::WellFormed(self.mk_projection_term(term)),
+
+            // might be supported later, together with alias type
+            ClauseKind::Projection(..) => {
+                // FIXME: support alias projection
+                bug!("[unsupported] alias projection {clause}")
+            }
+
+            // unsupported
+            ClauseKind::ConstArgHasType(..)
+            | ClauseKind::ConstEvaluatable(..)
+            | ClauseKind::HostEffect(..) => {
+                bug!("[unsupported] clause {clause} in THIR");
+            }
+
+            // unexpected
+            ClauseKind::RegionOutlives(..) | ClauseKind::TypeOutlives(..) => {
+                bug!("[invariant] unexpected outlives clause {clause} in THIR");
+            }
+            ClauseKind::UnstableFeature(..) => {
+                bug!("[invariant] unexpected unstable feature clause {clause} in THIR");
+            }
+        }
     }
 
     /// Record a type in MIR/THIR context
@@ -492,17 +605,80 @@ impl<'tcx> Builder<'tcx> {
                 SolType::Array(Box::new(self.mk_type(*elem_ty)), Box::new(self.mk_const(*size)))
             }
 
+            // function pointer
+            ty::FnDef(def_id, ty_args) => {
+                let ident = self.mk_ident(*def_id);
+                let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+                SolType::Function(ident, generic_args)
+            }
+            ty::Closure(def_id, ty_args) => {
+                let ident = self.mk_ident(*def_id);
+                let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+                SolType::Closure(ident, generic_args)
+            }
+            ty::FnPtr(sig_binder, FnHeader { c_variadic, abi, safety }) => {
+                let sig = sig_binder
+                    .no_bound_vars()
+                    .unwrap_or_else(|| bug!("[unsupported] higher-ranked fn ptr type {ty}"));
+                let abi = self.mk_abi(*abi, *c_variadic, *safety);
+
+                let ret_ty = self.mk_type(sig.output());
+                let params: Vec<_> =
+                    sig.inputs().iter().map(|input_ty| self.mk_type(*input_ty)).collect();
+                SolType::FnPtr(abi, params, Box::new(ret_ty))
+            }
+
+            // dynamic
+            ty::Dynamic(predicates, region) => {
+                if !region.is_erased() {
+                    bug!("[invariant] regions not erased in THIR: {region}");
+                }
+
+                let mut trait_refs = vec![];
+                for pred_binder in predicates.iter() {
+                    let pred = pred_binder
+                        .no_bound_vars()
+                        .unwrap_or_else(|| bug!("[unsupported] higher-ranked dyn type {ty}"));
+                    match pred {
+                        ExistentialPredicate::Trait(trait_ref) => {
+                            let (trait_ident, trait_ty_args) =
+                                self.mk_trait(self.tcx.trait_def(trait_ref.def_id), trait_ref.args);
+                            trait_refs.push((trait_ident, trait_ty_args, None));
+                        }
+                        ExistentialPredicate::AutoTrait(def_id) => {
+                            let trait_ident = self.mk_ident(def_id);
+                            trait_refs.push((trait_ident, vec![], None));
+                        }
+                        ExistentialPredicate::Projection(proj) => {
+                            let (trait_ident, trait_ty_args) =
+                                self.mk_trait(self.tcx.trait_def(proj.def_id), proj.args);
+                            let trait_term = self.mk_projection_term(proj.term);
+                            trait_refs.push((trait_ident, trait_ty_args, Some(trait_term)));
+                        }
+                    }
+                }
+                SolType::Dynamic(trait_refs)
+            }
+
+            // alias
+            ty::Alias(..) => {
+                // FIXME: support alias types
+                bug!("[unsupported] alias type {ty}")
+            }
+
             // unsupported
             ty::Coroutine(..) | ty::CoroutineClosure(..) | ty::CoroutineWitness(..) => {
                 bug!("[unsupported] coroutine type {ty}")
             }
 
             // unexpected
-            ty::Infer(..) | ty::Bound(..) | ty::Placeholder(..) | ty::Error(..) => {
-                bug!("[invaraint] unexpected type {ty}")
+            ty::Infer(..)
+            | ty::Bound(..)
+            | ty::UnsafeBinder(..)
+            | ty::Placeholder(..)
+            | ty::Error(..) => {
+                bug!("[invariant] unexpected type {ty}")
             }
-
-            _ => todo!("[todo] unhandled type {ty}"),
         }
     }
 
@@ -525,7 +701,7 @@ impl<'tcx> Builder<'tcx> {
             | ConstKind::Unevaluated(..)
             | ConstKind::Placeholder(..)
             | ConstKind::Error(..) => {
-                bug!("[invaraint] unexpected const {cval}")
+                bug!("[invariant] unexpected const {cval}")
             }
         }
     }
@@ -661,7 +837,8 @@ impl<'tcx> Builder<'tcx> {
         }
 
         // unpack the builder
-        let Self { tcx: _, src_dir: _, src_cache: _, ty_defs, id_cache, log_stack } = self;
+        let Self { tcx: _, src_dir: _, src_cache: _, adt_defs, trait_defs, id_cache, log_stack } =
+            self;
 
         // sanity check
         if !log_stack.is_empty() {
@@ -669,12 +846,23 @@ impl<'tcx> Builder<'tcx> {
         }
 
         // collect the datatype definitions
-        let mut flat_ty_defs = vec![];
-        for (ident, l1) in ty_defs.into_iter() {
+        let mut flat_adt_defs = vec![];
+        for (ident, l1) in adt_defs.into_iter() {
             for (mono, def) in l1.into_iter() {
                 match def {
                     None => bug!("[invariant] missing type definition"),
-                    Some(val) => flat_ty_defs.push((ident.clone(), mono, val)),
+                    Some(val) => flat_adt_defs.push((ident.clone(), mono, val)),
+                }
+            }
+        }
+
+        // collect the trait definitions
+        let mut flat_trait_defs = vec![];
+        for (ident, l1) in trait_defs.into_iter() {
+            for (mono, def) in l1.into_iter() {
+                match def {
+                    None => bug!("[invariant] missing trait definition"),
+                    Some(val) => flat_trait_defs.push((ident.clone(), mono, val)),
                 }
             }
         }
@@ -689,7 +877,13 @@ impl<'tcx> Builder<'tcx> {
         }
 
         // construct the crate
-        SolCrate { root: module_mir, execs: executables, ty_defs: flat_ty_defs, id_desc }
+        SolCrate {
+            root: module_mir,
+            execs: executables,
+            adt_defs: flat_adt_defs,
+            trait_defs: flat_trait_defs,
+            id_desc,
+        }
     }
 
     /// Create a fully qualified path string with crate name
@@ -742,7 +936,8 @@ pub(crate) struct SolMIR<T: SolIR> {
 pub(crate) struct SolCrate {
     pub(crate) root: SolMIR<SolModule>,
     pub(crate) execs: Vec<SolMIR<SolExec>>,
-    pub(crate) ty_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolAdtDef)>,
+    pub(crate) adt_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolAdtDef)>,
+    pub(crate) trait_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTraitDef)>,
     pub(crate) id_desc: Vec<(SolIdent, SolPathDesc)>,
 }
 
@@ -845,6 +1040,12 @@ pub(crate) enum SolType {
     Tuple(Vec<SolType>),
     Slice(Box<SolType>),
     Array(Box<SolType>, Box<SolConst>),
+    // function pointer
+    Function(SolIdent, Vec<SolGenericArg>),
+    Closure(SolIdent, Vec<SolGenericArg>),
+    FnPtr(SolExternAbi, Vec<SolType>, Box<SolType>),
+    // dynamic types
+    Dynamic(Vec<(SolIdent, Vec<SolGenericArg>, Option<SolProjTerm>)>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -852,6 +1053,12 @@ pub(crate) enum SolTyPat {
     NotNull,
     Range(SolConst, SolConst),
     Or(Vec<SolTyPat>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolProjTerm {
+    Type(SolType),
+    Const(SolConst),
 }
 
 /// A generic argument
@@ -885,6 +1092,20 @@ pub(crate) struct SolVariant {
     pub(crate) name: SolVariantName,
     pub(crate) discr: SolVariantDiscr,
     pub(crate) fields: Vec<SolField>,
+}
+
+/// Trait definition
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolTraitDef {
+    pub(crate) clauses: Vec<SolClause>,
+}
+
+/// A clause in a predicate
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolClause {
+    TraitImpl(SolIdent, Vec<SolGenericArg>),
+    TraitNotImpl(SolIdent, Vec<SolGenericArg>),
+    WellFormed(SolProjTerm),
 }
 
 /*
