@@ -10,10 +10,10 @@ use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod, Safety};
 use rustc_middle::thir::{BodyTy, ExprId, Thir};
 use rustc_middle::ty::{
-    AdtDef, AdtKind, Clause, ClauseKind, Const, ConstKind, ExistentialPredicate, FnHeader, FnSig,
-    GenericArg, GenericArgKind, GenericArgsRef, InstantiatedPredicates, ParamConst, ParamTy,
-    Pattern, PatternKind, PredicatePolarity, ScalarInt, Term, TermKind, TraitDef, TraitPredicate,
-    Ty, TyCtxt, ValTreeKind, Value, VariantDiscr,
+    AdtDef, AdtKind, AliasTyKind, Clause, ClauseKind, Const, ConstKind, ExistentialPredicate,
+    FnHeader, FnSig, GenericArg, GenericArgKind, GenericArgsRef, InstantiatedPredicates,
+    ParamConst, ParamTy, Pattern, PatternKind, PredicatePolarity, ScalarInt, Term, TermKind,
+    TraitDef, TraitPredicate, Ty, TyCtxt, ValTreeKind, Value, VariantDiscr,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
@@ -461,14 +461,13 @@ impl<'tcx> Builder<'tcx> {
         let mut parsed_clauses = vec![];
 
         let InstantiatedPredicates { predicates, spans: _ } =
-            self.tcx.explicit_predicates_of(def_id).instantiate(self.tcx, ty_args);
+            self.tcx.predicates_of(def_id).instantiate(self.tcx, ty_args);
         for clause in predicates {
             parsed_clauses.push(self.mk_clause(clause));
         }
 
-        for (clause, _span) in
-            self.tcx.explicit_item_bounds(def_id).iter_instantiated_copied(self.tcx, ty_args)
-        {
+        let bounds = self.tcx.item_bounds(def_id).instantiate(self.tcx, ty_args);
+        for clause in bounds {
             parsed_clauses.push(self.mk_clause(clause));
         }
 
@@ -661,9 +660,40 @@ impl<'tcx> Builder<'tcx> {
             }
 
             // alias
-            ty::Alias(..) => {
+            ty::Alias(AliasTyKind::Free, _) => {
+                bug!("[invariant] unexpected free alias type {ty}")
+            }
+            ty::Alias(AliasTyKind::Projection, _) => {
                 // FIXME: support alias types
                 bug!("[unsupported] alias type {ty}")
+            }
+            ty::Alias(AliasTyKind::Inherent, _) => {
+                // FIXME: support alias types
+                bug!("[unsupported] alias type {ty}")
+            }
+            ty::Alias(AliasTyKind::Opaque, alias_ty) => {
+                let opaque_ident = self.mk_ident(alias_ty.def_id);
+                let opaque_ty_args =
+                    alias_ty.args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+
+                let opaque_bounds = self
+                    .tcx
+                    .item_bounds(alias_ty.def_id)
+                    .instantiate(self.tcx, alias_ty.args)
+                    .iter()
+                    .map(|clause| self.mk_clause(clause))
+                    .collect();
+
+                let actual_ty = self.mk_type(
+                    self.tcx.type_of(alias_ty.def_id).instantiate(self.tcx, alias_ty.args),
+                );
+
+                SolType::Opaque {
+                    ident: opaque_ident,
+                    ty_args: opaque_ty_args,
+                    bounds: opaque_bounds,
+                    actual_ty: Box::new(actual_ty),
+                }
             }
 
             // unsupported
@@ -1046,6 +1076,13 @@ pub(crate) enum SolType {
     FnPtr(SolExternAbi, Vec<SolType>, Box<SolType>),
     // dynamic types
     Dynamic(Vec<(SolIdent, Vec<SolGenericArg>, Option<SolProjTerm>)>),
+    // alias types
+    Opaque {
+        ident: SolIdent,
+        ty_args: Vec<SolGenericArg>,
+        bounds: Vec<SolClause>,
+        actual_ty: Box<SolType>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
