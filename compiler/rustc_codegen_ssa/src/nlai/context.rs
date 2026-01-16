@@ -10,10 +10,10 @@ use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod, Safety};
 use rustc_middle::thir::{BodyTy, ExprId, Thir};
 use rustc_middle::ty::{
-    AdtDef, AdtKind, Clause, ClauseKind, Const, ConstKind, ExistentialPredicate, FnHeader, FnSig,
-    GenericArg, GenericArgKind, GenericArgsRef, InstantiatedPredicates, ParamConst, ParamTy,
-    Pattern, PatternKind, PredicatePolarity, ScalarInt, Term, TermKind, TraitDef, TraitPredicate,
-    Ty, TyCtxt, ValTreeKind, Value, VariantDiscr,
+    AdtDef, AdtKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig, GenericArg,
+    GenericArgKind, GenericArgsRef, List, ParamConst, ParamTy, Pattern, PatternKind,
+    PredicatePolarity, ScalarInt, Term, TermKind, TraitDef, TraitPredicate, Ty, TyCtxt,
+    ValTreeKind, Value, VariantDiscr,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
@@ -340,7 +340,7 @@ impl<'tcx> Builder<'tcx> {
 
         // mark start
         let def_desc = Self::debug_symbol(self.tcx, def_id, ty_args);
-        self.log_stack.push("|ADT|", def_desc.clone());
+        self.log_stack.push("ADT", def_desc.clone());
 
         // first update the entry to mark that type definition in progress
         self.adt_defs.entry(ident.clone()).or_default().insert(generic_args.clone(), None);
@@ -443,7 +443,8 @@ impl<'tcx> Builder<'tcx> {
 
         // locate the key of the definition
         let ident = self.mk_ident(def_id);
-        let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+        // NOTE: skip the first generic arg which is Self type
+        let generic_args = ty_args.iter().skip(1).map(|arg| self.mk_generic_arg(arg)).collect();
 
         // if already defined or is being defined, return the key
         if self.trait_defs.get(&ident).map_or(false, |inner| inner.contains_key(&generic_args)) {
@@ -452,24 +453,21 @@ impl<'tcx> Builder<'tcx> {
 
         // mark start
         let def_desc = Self::debug_symbol(self.tcx, def_id, ty_args);
-        self.log_stack.push("|Trait|", def_desc.clone());
+        self.log_stack.push("Trait", def_desc.clone());
 
         // first update the entry to mark that trait definition in progress
         self.trait_defs.entry(ident.clone()).or_default().insert(generic_args.clone(), None);
 
-        // collect the predicates of the trait
+        // collect explicit predicates of the trait
         let mut parsed_clauses = vec![];
-
-        let InstantiatedPredicates { predicates, spans: _ } =
-            self.tcx.predicates_of(def_id).instantiate(self.tcx, ty_args);
-        for clause in predicates {
+        for (clause, _) in
+            self.tcx.explicit_predicates_of(def_id).instantiate(self.tcx, ty_args).into_iter()
+        {
             parsed_clauses.push(self.mk_clause(clause));
         }
 
-        let bounds = self.tcx.item_bounds(def_id).instantiate(self.tcx, ty_args);
-        for clause in bounds {
-            parsed_clauses.push(self.mk_clause(clause));
-        }
+        // FIXME: check `TyCtxt::trait_explicit_predicates_and_bounds`,
+        // we might want to collect constraints for associated type bounds as well
 
         // update the trait definition
         self.trait_defs
@@ -632,31 +630,14 @@ impl<'tcx> Builder<'tcx> {
                 if !region.is_erased() {
                     bug!("[invariant] regions not erased in THIR: {region}");
                 }
-
-                let mut trait_refs = vec![];
-                for pred_binder in predicates.iter() {
-                    let pred = pred_binder
-                        .no_bound_vars()
-                        .unwrap_or_else(|| bug!("[unsupported] higher-ranked dyn type {ty}"));
-                    match pred {
-                        ExistentialPredicate::Trait(trait_ref) => {
-                            let (trait_ident, trait_ty_args) =
-                                self.mk_trait(self.tcx.trait_def(trait_ref.def_id), trait_ref.args);
-                            trait_refs.push((trait_ident, trait_ty_args, None));
-                        }
-                        ExistentialPredicate::AutoTrait(def_id) => {
-                            let trait_ident = self.mk_ident(def_id);
-                            trait_refs.push((trait_ident, vec![], None));
-                        }
-                        ExistentialPredicate::Projection(proj) => {
-                            let (trait_ident, trait_ty_args) =
-                                self.mk_trait(self.tcx.trait_def(proj.def_id), proj.args);
-                            let trait_term = self.mk_projection_term(proj.term);
-                            trait_refs.push((trait_ident, trait_ty_args, Some(trait_term)));
-                        }
-                    }
-                }
-                SolType::Dynamic(trait_refs)
+                let clauses = predicates
+                    .iter()
+                    .map(|pred|
+                        // NOTE: we use the dynamic type itself as the self type
+                        // so that we can instantiate the clauses properly
+                        self.mk_clause(pred.with_self_ty(self.tcx, ty)))
+                    .collect();
+                SolType::Dynamic(clauses)
             }
 
             // alias
@@ -831,11 +812,19 @@ impl<'tcx> Builder<'tcx> {
                 )
             });
 
+            // mark start
+            // FIXME: use more informative generic args in the message
+            let def_desc = Self::debug_symbol(self.tcx, owner_id.to_def_id(), &List::empty());
+            self.log_stack.push("THIR", def_desc.clone());
+
             // build the executable body
             let thir_lock = thir_body.borrow();
             let exec = self.mk_exec(&*thir_lock, thir_expr);
             let hir_id = HirId::make_owner(owner_id);
             executables.push(self.mk_mir(hir_id, self.tcx.hir_span_with_body(hir_id), exec));
+
+            // mark end
+            self.log_stack.pop();
         }
 
         // unpack the builder
@@ -1047,7 +1036,7 @@ pub(crate) enum SolType {
     Closure(SolIdent, Vec<SolGenericArg>),
     FnPtr(SolExternAbi, Vec<SolType>, Box<SolType>),
     // dynamic types
-    Dynamic(Vec<(SolIdent, Vec<SolGenericArg>, Option<SolProjTerm>)>),
+    Dynamic(Vec<SolClause>),
     // alias types
     Alias(Box<SolType>),
 }
