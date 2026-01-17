@@ -5,7 +5,7 @@ use rustc_middle::ty::TyCtxt;
 use tracing::warn;
 
 use crate::nlai::common::{COMPONENT_NAME, retrieve_env};
-use crate::nlai::context::Builder;
+use crate::nlai::context::build;
 
 /// Entrypoint for nlai information collection
 pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>) {
@@ -17,7 +17,7 @@ pub(crate) fn entrypoint<'tcx>(tcx: TyCtxt<'tcx>) {
     warn!("{COMPONENT_NAME} context: {env}");
 
     // build the module
-    let krate = Builder::new(tcx, env.prepare_source_directory()).build();
+    let krate = build(tcx, env.prepare_source_directory());
 
     // emit the crate to the output directory
     env.serialize_crate(&krate);
