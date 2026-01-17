@@ -270,18 +270,18 @@ impl<'tcx> ExecBuilder<'tcx> {
         }
     }
 
-    /// Get the generic parameter by index and name
-    fn get_type_param(&self, index: u32, name: Symbol) -> SolIdent {
+    /// Get a generic parameter by index with cross-checking on name and kind
+    fn get_param(&self, index: u32, name: Symbol, kind: SolGenericKind) -> SolIdent {
         // validate the type parameter against the generics declarations
         let param_def = self.generics.get(index as usize).unwrap_or_else(|| {
-            bug!("[invariant] type parameter {name} index out of bounds: {index}",)
+            bug!("[invariant] generic parameter {name} index out of bounds: {index}",)
         });
-        if !matches!(param_def.kind, SolGenericKind::Type) {
-            bug!("[invariant] type parameter {name} at index {index} is not a type kind")
+        if param_def.kind != kind {
+            bug!("[invariant] generic parameter {name} at index {index} is not a {kind:?}")
         }
         if param_def.name.0 != name.to_ident_string() {
             bug!(
-                "[invariant] type parameter name mismatch at index {index}: {} vs {name}",
+                "[invariant] generic parameter name mismatch at index {index}: {} vs {name}",
                 param_def.name.0,
             )
         }
@@ -640,7 +640,7 @@ impl<'tcx> ExecBuilder<'tcx> {
 
             // type parameter
             ty::Param(ParamTy { index, name }) => {
-                SolType::Param(self.get_type_param(*index, *name))
+                SolType::Param(self.get_param(*index, *name, SolGenericKind::Type))
             }
 
             // compound types
@@ -719,7 +719,7 @@ impl<'tcx> ExecBuilder<'tcx> {
     pub(crate) fn mk_const(&mut self, cval: Const<'tcx>) -> SolConst {
         match cval.kind() {
             ConstKind::Param(ParamConst { index, name }) => {
-                SolConst::Param(self.get_type_param(index, name))
+                SolConst::Param(self.get_param(index, name, SolGenericKind::Const))
             }
             ConstKind::Value(val) => SolConst::Value(self.mk_value(val)),
 
