@@ -11,9 +11,9 @@ use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod, Safety};
 use rustc_middle::thir::{BodyTy, ExprId, Thir};
 use rustc_middle::ty::{
     AdtDef, AdtKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig, GenericArg,
-    GenericArgKind, GenericArgsRef, List, ParamConst, ParamTy, Pattern, PatternKind,
-    PredicatePolarity, ScalarInt, Term, TermKind, TraitDef, TraitPredicate, Ty, TyCtxt,
-    ValTreeKind, Value, VariantDiscr,
+    GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, List, ParamConst,
+    ParamTy, Pattern, PatternKind, PredicatePolarity, ScalarInt, Term, TermKind, TraitDef,
+    TraitPredicate, Ty, TyCtxt, ValTreeKind, Value, VariantDiscr,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
@@ -43,6 +43,9 @@ struct ExecBuilder<'tcx> {
 
     /// base builder
     base: BaseBuilder<'tcx>,
+
+    /// generics declarations
+    generics: Vec<SolGenericParam>,
 
     /// collected definitions of datatypes
     adt_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolAdtDef>>>,
@@ -256,14 +259,35 @@ impl<'tcx> BaseBuilder<'tcx> {
 
 impl<'tcx> ExecBuilder<'tcx> {
     /// Create a new builder
-    pub(crate) fn new(base: BaseBuilder<'tcx>) -> Self {
+    pub(crate) fn new(base: BaseBuilder<'tcx>, generics: Vec<SolGenericParam>) -> Self {
         Self {
             tcx: base.tcx,
             base,
+            generics,
             adt_defs: BTreeMap::new(),
             trait_defs: BTreeMap::new(),
             log_stack: LogStack::new(),
         }
+    }
+
+    /// Get the generic parameter by index and name
+    fn get_type_param(&self, index: u32, name: Symbol) -> SolIdent {
+        // validate the type parameter against the generics declarations
+        let param_def = self.generics.get(index as usize).unwrap_or_else(|| {
+            bug!("[invariant] type parameter {name} index out of bounds: {index}",)
+        });
+        if !matches!(param_def.kind, SolGenericKind::Type) {
+            bug!("[invariant] type parameter {name} at index {index} is not a type kind")
+        }
+        if param_def.name.0 != name.to_ident_string() {
+            bug!(
+                "[invariant] type parameter name mismatch at index {index}: {} vs {name}",
+                param_def.name.0,
+            )
+        }
+
+        // done with validation, return the ident
+        param_def.ident.clone()
     }
 
     /// Record an identifier (with caching)
@@ -616,7 +640,7 @@ impl<'tcx> ExecBuilder<'tcx> {
 
             // type parameter
             ty::Param(ParamTy { index, name }) => {
-                SolType::Param(SolParamIndex(*index as usize), SolParamName(name.to_ident_string()))
+                SolType::Param(self.get_type_param(*index, *name))
             }
 
             // compound types
@@ -695,7 +719,7 @@ impl<'tcx> ExecBuilder<'tcx> {
     pub(crate) fn mk_const(&mut self, cval: Const<'tcx>) -> SolConst {
         match cval.kind() {
             ConstKind::Param(ParamConst { index, name }) => {
-                SolConst::Param(SolParamIndex(index as usize), SolParamName(name.to_ident_string()))
+                SolConst::Param(self.get_type_param(index, name))
             }
             ConstKind::Value(val) => SolConst::Value(self.mk_value(val)),
 
@@ -833,20 +857,53 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
     // process all body owners in this crate
     let mut bundles = vec![];
     for owner_id in tcx.hir_body_owners() {
-        let (thir_body, thir_expr) = tcx.thir_body(owner_id).unwrap_or_else(|_| {
-            panic!(
-                "[invariant] failed to retrieve THIR body for {}",
-                tcx.def_path_debug_str(owner_id.to_def_id())
-            )
-        });
+        let def_id = owner_id.to_def_id();
+        let def_desc = util_debug_symbol(tcx, def_id, &List::empty());
+
+        // retrieve the THIR body
+        let (thir_body, thir_expr) = tcx
+            .thir_body(owner_id)
+            .unwrap_or_else(|_| panic!("[invariant] failed to retrieve THIR body for {def_desc}"));
+
+        // collect the generics of the body
+        let mut bundle_generics = vec![];
+        let generics = tcx.generics_of(def_id);
+        for i in 0..generics.count() {
+            let GenericParamDef {
+                name: param_symbol,
+                def_id: param_def_id,
+                index: param_index,
+                pure_wrt_drop: _,
+                kind: param_def_kind,
+            } = generics.param_at(i, tcx);
+            assert_eq!(
+                *param_index as usize, i,
+                "[invariant] generic parameter {param_symbol} index mismatch in {def_desc}"
+            );
+
+            // construct the generic parameter
+            let param_ident = base_builder.mk_ident(*param_def_id);
+            let param_name = SolParamName(param_symbol.to_ident_string());
+            let param_kind = match param_def_kind {
+                GenericParamDefKind::Lifetime => SolGenericKind::Lifetime,
+                GenericParamDefKind::Type { .. } => SolGenericKind::Type,
+                GenericParamDefKind::Const { .. } => SolGenericKind::Const,
+            };
+            bundle_generics.push(SolGenericParam {
+                ident: param_ident,
+                name: param_name,
+                kind: param_kind,
+            });
+
+            // FIXME: collect the explict predicates of each parameter
+            // e.g., tcx.explicit_predicates_of(*param_def_id).instantiate_identity(tcx);
+        }
 
         // create an exec builder
-        let mut exec_builder = ExecBuilder::new(base_builder);
+        let mut exec_builder = ExecBuilder::new(base_builder, bundle_generics);
 
         // mark start
-        // FIXME: use more informative generic args in the message
-        let def_desc = util_debug_symbol(tcx, owner_id.to_def_id(), &List::empty());
-        exec_builder.log_stack.push("THIR", def_desc.clone());
+        exec_builder.log_stack.push("THIR", def_desc);
 
         // build the executable body
         let thir_lock = thir_body.borrow();
@@ -856,7 +913,8 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
         exec_builder.log_stack.pop();
 
         // unpack the exec builder
-        let ExecBuilder { tcx: _, mut base, adt_defs, trait_defs, log_stack } = exec_builder;
+        let ExecBuilder { tcx: _, mut base, generics, adt_defs, trait_defs, log_stack } =
+            exec_builder;
         assert!(log_stack.is_empty(), "[invariant] log stack is not empty");
 
         // collect the datatype definitions
@@ -885,6 +943,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
         let hir_id = HirId::make_owner(owner_id);
         let exec_full = base.mk_mir(hir_id, tcx.hir_span_with_body(hir_id), exec);
         bundles.push(SolBundle {
+            generics,
             adt_defs: flat_adt_defs,
             trait_defs: flat_trait_defs,
             executable: exec_full,
@@ -956,6 +1015,7 @@ pub(crate) struct SolCrate {
 /// A complete execution context
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolBundle {
+    pub(crate) generics: Vec<SolGenericParam>,
     pub(crate) adt_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolAdtDef)>,
     pub(crate) trait_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTraitDef)>,
     pub(crate) executable: SolMIR<SolExec>,
@@ -1055,7 +1115,7 @@ pub(crate) enum SolType {
     ImmRef(Box<SolType>),
     MutRef(Box<SolType>),
     // type parameter
-    Param(SolParamIndex, SolParamName),
+    Param(SolIdent),
     // compound types
     Tuple(Vec<SolType>),
     Slice(Box<SolType>),
@@ -1070,6 +1130,7 @@ pub(crate) enum SolType {
     Alias(Box<SolType>),
 }
 
+/// A pattern type
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolTyPat {
     NotNull,
@@ -1077,10 +1138,26 @@ pub(crate) enum SolTyPat {
     Or(Vec<SolTyPat>),
 }
 
+/// A projection term
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolProjTerm {
     Type(SolType),
     Const(SolConst),
+}
+
+/// Differentiate kinds of generics
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolGenericKind {
+    Lifetime,
+    Const,
+    Type,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolGenericParam {
+    pub(crate) ident: SolIdent,
+    pub(crate) name: SolParamName,
+    pub(crate) kind: SolGenericKind,
 }
 
 /// A generic argument
@@ -1136,7 +1213,7 @@ pub(crate) enum SolClause {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolConst {
-    Param(SolParamIndex, SolParamName),
+    Param(SolIdent),
     Value(SolValue),
 }
 
@@ -1202,10 +1279,6 @@ pub(crate) struct SolModuleName(pub(crate) String);
 /// A parameter name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolParamName(pub(crate) String);
-
-/// A parameter index
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolParamIndex(pub(crate) usize);
 
 /// A field name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
