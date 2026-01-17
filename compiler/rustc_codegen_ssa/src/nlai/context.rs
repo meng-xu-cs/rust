@@ -21,8 +21,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-/// A builder for creating a nlai module
-pub(crate) struct Builder<'tcx> {
+/// A builder for the overall item-level NLAI representation
+struct BaseBuilder<'tcx> {
     /// compiler context
     tcx: TyCtxt<'tcx>,
 
@@ -32,31 +32,32 @@ pub(crate) struct Builder<'tcx> {
     /// source cache
     src_cache: FxHashSet<StableSourceFileId>,
 
+    /// a cache of id to identifier mappings
+    id_cache: FxHashMap<DefId, (SolIdent, SolPathDesc)>,
+}
+
+/// A builder for each executable THIR body
+struct ExecBuilder<'tcx> {
+    /// compiler context
+    tcx: TyCtxt<'tcx>,
+
+    /// base builder
+    base: BaseBuilder<'tcx>,
+
     /// collected definitions of datatypes
     adt_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolAdtDef>>>,
 
     /// collected definitions of traits
     trait_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolTraitDef>>>,
 
-    /// a cache of id to identifier mappings
-    id_cache: FxHashMap<DefId, (SolIdent, SolPathDesc)>,
-
     /// log stack
     log_stack: LogStack,
 }
 
-impl<'tcx> Builder<'tcx> {
+impl<'tcx> BaseBuilder<'tcx> {
     /// Create a new builder
     pub(crate) fn new(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> Self {
-        Self {
-            tcx,
-            src_dir,
-            src_cache: FxHashSet::default(),
-            adt_defs: BTreeMap::new(),
-            trait_defs: BTreeMap::new(),
-            id_cache: FxHashMap::default(),
-            log_stack: LogStack::new(),
-        }
+        Self { tcx, src_dir, src_cache: FxHashSet::default(), id_cache: FxHashMap::default() }
     }
 
     /// Record an identifier (with caching)
@@ -161,12 +162,6 @@ impl<'tcx> Builder<'tcx> {
         doc_comments
     }
 
-    #[allow(dead_code)]
-    /// Record an AST node in the THIR body with its metadata
-    fn mk_ast<T: SolIR>(&mut self, span: Span, data: T) -> SolAST<T> {
-        SolAST { span: self.mk_span(span), data }
-    }
-
     /// Record a MIR node in the THIR body with its metadata
     fn mk_mir<T: SolIR>(&mut self, hir_id: HirId, span: Span, data: T) -> SolMIR<T> {
         SolMIR {
@@ -257,6 +252,37 @@ impl<'tcx> Builder<'tcx> {
             items,
         }
     }
+}
+
+impl<'tcx> ExecBuilder<'tcx> {
+    /// Create a new builder
+    pub(crate) fn new(base: BaseBuilder<'tcx>) -> Self {
+        Self {
+            tcx: base.tcx,
+            base,
+            adt_defs: BTreeMap::new(),
+            trait_defs: BTreeMap::new(),
+            log_stack: LogStack::new(),
+        }
+    }
+
+    /// Record an identifier (with caching)
+    #[inline]
+    fn mk_ident(&mut self, def_id: DefId) -> SolIdent {
+        self.base.mk_ident(def_id)
+    }
+
+    /// Record a span
+    #[inline]
+    fn mk_span(&mut self, span: Span) -> SolSpan {
+        self.base.mk_span(span)
+    }
+
+    #[allow(dead_code)]
+    /// Record an AST node in the THIR body with its metadata
+    fn mk_ast<T: SolIR>(&mut self, span: Span, data: T) -> SolAST<T> {
+        SolAST { span: self.mk_span(span), data }
+    }
 
     /// Record a function ABI
     pub(crate) fn mk_abi(
@@ -339,7 +365,7 @@ impl<'tcx> Builder<'tcx> {
         }
 
         // mark start
-        let def_desc = Self::debug_symbol(self.tcx, def_id, ty_args);
+        let def_desc = util_debug_symbol(self.tcx, def_id, ty_args);
         self.log_stack.push("ADT", def_desc.clone());
 
         // first update the entry to mark that type definition in progress
@@ -452,7 +478,7 @@ impl<'tcx> Builder<'tcx> {
         }
 
         // mark start
-        let def_desc = Self::debug_symbol(self.tcx, def_id, ty_args);
+        let def_desc = util_debug_symbol(self.tcx, def_id, ty_args);
         self.log_stack.push("Trait", def_desc.clone());
 
         // first update the entry to mark that trait definition in progress
@@ -794,47 +820,44 @@ impl<'tcx> Builder<'tcx> {
             BodyTy::GlobalAsm(..) => bug!("[unsupported] global assembly"),
         }
     }
+}
 
-    /// Build the crate
-    pub(crate) fn build(mut self) -> SolCrate {
-        // recursively build the modules starting from the root module
-        let module_data =
-            self.mk_module(self.tcx.crate_name(LOCAL_CRATE), *self.tcx.hir_root_module());
-        let module_mir = self.mk_mir(CRATE_HIR_ID, DUMMY_SP, module_data);
+/// Build the crate
+pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
+    let mut base_builder = BaseBuilder::new(tcx, src_dir);
 
-        // process all body owners in this crate
-        let mut executables = vec![];
-        for owner_id in self.tcx.hir_body_owners() {
-            let (thir_body, thir_expr) = self.tcx.thir_body(owner_id).unwrap_or_else(|_| {
-                panic!(
-                    "[invariant] failed to retrieve THIR body for {}",
-                    self.tcx.def_path_debug_str(owner_id.to_def_id())
-                )
-            });
+    // recursively build the modules starting from the root module
+    let module_data = base_builder.mk_module(tcx.crate_name(LOCAL_CRATE), *tcx.hir_root_module());
+    let module_mir = base_builder.mk_mir(CRATE_HIR_ID, DUMMY_SP, module_data);
 
-            // mark start
-            // FIXME: use more informative generic args in the message
-            let def_desc = Self::debug_symbol(self.tcx, owner_id.to_def_id(), &List::empty());
-            self.log_stack.push("THIR", def_desc.clone());
+    // process all body owners in this crate
+    let mut bundles = vec![];
+    for owner_id in tcx.hir_body_owners() {
+        let (thir_body, thir_expr) = tcx.thir_body(owner_id).unwrap_or_else(|_| {
+            panic!(
+                "[invariant] failed to retrieve THIR body for {}",
+                tcx.def_path_debug_str(owner_id.to_def_id())
+            )
+        });
 
-            // build the executable body
-            let thir_lock = thir_body.borrow();
-            let exec = self.mk_exec(&*thir_lock, thir_expr);
-            let hir_id = HirId::make_owner(owner_id);
-            executables.push(self.mk_mir(hir_id, self.tcx.hir_span_with_body(hir_id), exec));
+        // create an exec builder
+        let mut exec_builder = ExecBuilder::new(base_builder);
 
-            // mark end
-            self.log_stack.pop();
-        }
+        // mark start
+        // FIXME: use more informative generic args in the message
+        let def_desc = util_debug_symbol(tcx, owner_id.to_def_id(), &List::empty());
+        exec_builder.log_stack.push("THIR", def_desc.clone());
 
-        // unpack the builder
-        let Self { tcx: _, src_dir: _, src_cache: _, adt_defs, trait_defs, id_cache, log_stack } =
-            self;
+        // build the executable body
+        let thir_lock = thir_body.borrow();
+        let exec = exec_builder.mk_exec(&*thir_lock, thir_expr);
 
-        // sanity check
-        if !log_stack.is_empty() {
-            bug!("[invariant] log stack is not empty");
-        }
+        // mark end
+        exec_builder.log_stack.pop();
+
+        // unpack the exec builder
+        let ExecBuilder { tcx: _, mut base, adt_defs, trait_defs, log_stack } = exec_builder;
+        assert!(log_stack.is_empty(), "[invariant] log stack is not empty");
 
         // collect the datatype definitions
         let mut flat_adt_defs = vec![];
@@ -858,36 +881,36 @@ impl<'tcx> Builder<'tcx> {
             }
         }
 
-        // collect the id to description mappings
-        let mut id_desc = vec![];
-
-        // we don't care about the ordering of the values
-        #[allow(rustc::potential_query_instability)]
-        for (ident, desc) in id_cache.into_values() {
-            id_desc.push((ident, desc));
-        }
-
-        // construct the crate
-        SolCrate {
-            root: module_mir,
-            execs: executables,
+        // complete the bundle construction
+        let hir_id = HirId::make_owner(owner_id);
+        let exec_full = base.mk_mir(hir_id, tcx.hir_span_with_body(hir_id), exec);
+        bundles.push(SolBundle {
             adt_defs: flat_adt_defs,
             trait_defs: flat_trait_defs,
-            id_desc,
-        }
+            executable: exec_full,
+        });
+
+        // re-assign the base builder for next iteration
+        base_builder = base;
     }
 
-    /// Create a fully qualified path string with crate name
-    #[inline]
-    fn debug_symbol(tcx: TyCtxt<'tcx>, def_id: DefId, ty_args: GenericArgsRef<'tcx>) -> String {
-        let path_str = tcx.def_path_str_with_args(def_id, ty_args);
-        if def_id.is_local() {
-            let krate = tcx.crate_name(LOCAL_CRATE).to_ident_string();
-            format!("{krate}::{path_str}")
-        } else {
-            path_str
-        }
+    // unpack the builder
+    let BaseBuilder { tcx: _, src_dir: _, src_cache: _, id_cache } = base_builder;
+
+    // collect the id to description mappings
+    let mut id_desc = vec![];
+
+    // we sort the values alphabetically by description first, then by id, but after collection
+    #[allow(rustc::potential_query_instability)]
+    for (ident, desc) in id_cache.into_values() {
+        id_desc.push((ident, desc));
     }
+    id_desc.sort_by(|(ident_a, desc_a), (ident_b, desc_b)| {
+        desc_a.cmp(desc_b).then_with(|| ident_a.cmp(ident_b))
+    });
+
+    // construct the crate
+    SolCrate { root: module_mir, bundles, id_desc }
 }
 
 /* --- BEGIN OF SYNC --- */
@@ -926,10 +949,16 @@ pub(crate) struct SolMIR<T: SolIR> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolCrate {
     pub(crate) root: SolMIR<SolModule>,
-    pub(crate) execs: Vec<SolMIR<SolExec>>,
+    pub(crate) bundles: Vec<SolBundle>,
+    pub(crate) id_desc: Vec<(SolIdent, SolPathDesc)>,
+}
+
+/// A complete execution context
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolBundle {
     pub(crate) adt_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolAdtDef)>,
     pub(crate) trait_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTraitDef)>,
-    pub(crate) id_desc: Vec<(SolIdent, SolPathDesc)>,
+    pub(crate) executable: SolMIR<SolExec>,
 }
 
 /*
@@ -1246,5 +1275,21 @@ impl LogStack {
     /// Check if the stack is empty
     fn is_empty(&self) -> bool {
         self.stack.is_empty()
+    }
+}
+
+/// Create a fully qualified path string with crate name
+#[inline]
+fn util_debug_symbol<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    ty_args: GenericArgsRef<'tcx>,
+) -> String {
+    let path_str = tcx.def_path_str_with_args(def_id, ty_args);
+    if def_id.is_local() {
+        let krate = tcx.crate_name(LOCAL_CRATE).to_ident_string();
+        format!("{krate}::{path_str}")
+    } else {
+        path_str
     }
 }
