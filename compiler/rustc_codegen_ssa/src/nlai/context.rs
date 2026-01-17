@@ -8,7 +8,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod, OwnerId, Safety};
-use rustc_middle::thir::{BodyTy, Expr, ExprId, ExprKind, Thir};
+use rustc_middle::thir::{BodyTy, Expr, ExprId, ExprKind, Pat, PatKind, Thir};
 use rustc_middle::ty::{
     AdtDef, AdtKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig, GenericArg,
     GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, List, ParamConst,
@@ -733,6 +733,32 @@ impl<'tcx> ExecBuilder<'tcx> {
         }
     }
 
+    /// Record a pattern in the THIR context
+    pub(crate) fn mk_pat(&mut self, pat: &Pat<'tcx>) -> SolPattern {
+        let Pat { ty, span, extra, kind } = pat;
+
+        // parse the basics
+        if extra.is_some() {
+            bug!("[unsupported] extra pattern info");
+        }
+        let pat_ty = self.mk_type(*ty);
+        let pat_span = self.mk_span(*span);
+
+        // parse the pattern kind
+        let pat_rule = match kind {
+            PatKind::Missing => SolPatRule::Missing,
+            PatKind::Wild => SolPatRule::Wild,
+            PatKind::Never => SolPatRule::Never,
+
+            // unreachable
+            PatKind::Error(..) => bug!("[invariant] unreachable pattern {kind:?}"),
+            _ => todo!(),
+        };
+
+        // construct the final pattern
+        SolPattern { ty: pat_ty, rule: pat_rule, span: pat_span }
+    }
+
     /// Record a constant in MIR/THIR context
     pub(crate) fn mk_const(&mut self, cval: Const<'tcx>) -> SolConst {
         match cval.kind() {
@@ -880,10 +906,49 @@ impl<'tcx> ExecBuilder<'tcx> {
 
         // switch-case on expression kind
         let expr_op = match kind {
+            // markers
             ExprKind::Scope { region_scope: _, hir_id, value } => {
                 let inner_expr = self.mk_expr(thir, *value);
                 SolOp::Scope(self.mk_hir(*hir_id, inner_expr))
             }
+
+            // intrinsics
+            ExprKind::Use { source } => SolOp::Use(self.mk_expr(thir, *source)),
+            ExprKind::Box { value } => SolOp::Box(self.mk_expr(thir, *value)),
+            ExprKind::Deref { arg } => SolOp::Deref(self.mk_expr(thir, *arg)),
+            ExprKind::Binary { .. } => todo!(),
+            ExprKind::LogicalOp { .. } => todo!(),
+            ExprKind::Unary { .. } => todo!(),
+
+            // casts
+            ExprKind::Cast { source } => SolOp::Cast(self.mk_expr(thir, *source)),
+            ExprKind::NeverToAny { source } => SolOp::NeverToAny(self.mk_expr(thir, *source)),
+            ExprKind::PointerCoercion { .. } => todo!(),
+
+            // control-folow
+            ExprKind::If { if_then_scope: _, cond, then, else_opt } => SolOp::If {
+                cond: self.mk_expr(thir, *cond),
+                then: self.mk_expr(thir, *then),
+                else_opt: else_opt.map(|e| self.mk_expr(thir, e)),
+            },
+            ExprKind::Loop { body } => SolOp::Loop(self.mk_expr(thir, *body)),
+
+            // function call
+            ExprKind::Call { ty, fun, args, from_hir_call: _, fn_span: _ } => SolOp::Call {
+                target: self.mk_type(*ty),
+                callee: self.mk_expr(thir, *fun),
+                args: args.iter().map(|arg| self.mk_expr(thir, *arg)).collect(),
+            },
+
+            // pattern
+            ExprKind::Let { expr, pat } => SolOp::Let(self.mk_expr(thir, *expr), self.mk_pat(pat)),
+
+            // unsupported
+            ExprKind::ByUse { .. } => bug!("[unsupported] by-use"),
+            ExprKind::LoopMatch { .. } => bug!("[unsupported] loop-match"),
+            ExprKind::InlineAsm { .. } => bug!("[unsupported] inline assembly"),
+            ExprKind::Yield { .. } => bug!("[unsupported] yield"),
+
             _ => todo!(),
         };
 
@@ -1315,7 +1380,38 @@ pub(crate) struct SolExpr {
 /// Details of the operation in an expression
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolOp {
+    // markers
     Scope(SolHIR<SolExpr>),
+    // intrisics
+    Use(SolExpr),
+    Box(SolExpr),
+    Deref(SolExpr),
+    // casts
+    Cast(SolExpr),
+    NeverToAny(SolExpr),
+    // control-flow
+    If { cond: SolExpr, then: SolExpr, else_opt: Option<SolExpr> },
+    Loop(SolExpr),
+    // function calls
+    Call { target: SolType, callee: SolExpr, args: Vec<SolExpr> },
+    // pattern
+    Let(SolExpr, SolPattern),
+}
+
+/// A pattern matcher in THIR
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolPattern {
+    pub(crate) ty: SolType,
+    pub(crate) rule: SolPatRule,
+    pub(crate) span: SolSpan,
+}
+
+/// A pattern matching rule in THIR
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolPatRule {
+    Missing,
+    Wild,
+    Never,
 }
 
 /*
