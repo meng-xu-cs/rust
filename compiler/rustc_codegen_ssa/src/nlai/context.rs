@@ -7,8 +7,8 @@ use rustc_ast::{AttrStyle, FloatTy, IntTy, Mutability, UintTy};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
-use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod, Safety};
-use rustc_middle::thir::{BodyTy, ExprId, Thir};
+use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod, OwnerId, Safety};
+use rustc_middle::thir::{BodyTy, Expr, ExprId, ExprKind, Thir};
 use rustc_middle::ty::{
     AdtDef, AdtKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig, GenericArg,
     GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, List, ParamConst,
@@ -43,6 +43,9 @@ struct ExecBuilder<'tcx> {
 
     /// base builder
     base: BaseBuilder<'tcx>,
+
+    /// owner id
+    owner_id: OwnerId,
 
     /// generics declarations
     generics: Vec<SolGenericParam>,
@@ -259,10 +262,15 @@ impl<'tcx> BaseBuilder<'tcx> {
 
 impl<'tcx> ExecBuilder<'tcx> {
     /// Create a new builder
-    pub(crate) fn new(base: BaseBuilder<'tcx>, generics: Vec<SolGenericParam>) -> Self {
+    pub(crate) fn new(
+        base: BaseBuilder<'tcx>,
+        owner_id: OwnerId,
+        generics: Vec<SolGenericParam>,
+    ) -> Self {
         Self {
             tcx: base.tcx,
             base,
+            owner_id,
             generics,
             adt_defs: BTreeMap::new(),
             trait_defs: BTreeMap::new(),
@@ -302,10 +310,20 @@ impl<'tcx> ExecBuilder<'tcx> {
         self.base.mk_span(span)
     }
 
-    #[allow(dead_code)]
-    /// Record an AST node in the THIR body with its metadata
-    fn mk_ast<T: SolIR>(&mut self, span: Span, data: T) -> SolAST<T> {
-        SolAST { span: self.mk_span(span), data }
+    /// Record the doc comments associated with a hir_id
+    fn mk_doc_comments(&self, hir_id: HirId) -> Vec<SolDocComment> {
+        self.base.mk_doc_comments(hir_id)
+    }
+
+    /// Record a HIR node in the THIR body with its metadata
+    fn mk_hir<T: SolIR>(&mut self, hir_id: HirId, data: T) -> SolHIR<T> {
+        if hir_id.is_owner() {
+            bug!("[invariant] expected non-owner HirId, found owner: {:?}", hir_id);
+        }
+        if hir_id.owner != self.owner_id {
+            bug!("[invariant] owner id mismatch: {:?} vs {:?}", self.owner_id, hir_id.owner);
+        }
+        SolHIR { doc_comments: self.mk_doc_comments(hir_id), data }
     }
 
     /// Record a function ABI
@@ -805,7 +823,7 @@ impl<'tcx> ExecBuilder<'tcx> {
     }
 
     /// Record a executable, i.e., a THIR body (for a function or a constant/static)
-    pub(crate) fn mk_exec(&mut self, thir: &Thir<'tcx>, _expr: ExprId) -> SolExec {
+    pub(crate) fn mk_exec(&mut self, thir: &Thir<'tcx>, expr: ExprId) -> SolExec {
         // switch-case on the body type
         match thir.body_type {
             BodyTy::Fn(sig) => {
@@ -825,9 +843,13 @@ impl<'tcx> ExecBuilder<'tcx> {
                         params.len()
                     );
                 }
+                // FIXME: record parameter patterns as well
+
+                // parse the body expression
+                let body = self.mk_expr(thir, expr);
 
                 // pack the information
-                SolExec::Function(SolFnDef { abi: parsed_abi, ret_ty, params })
+                SolExec::Function(SolFnDef { abi: parsed_abi, ret_ty, params, body })
             }
             BodyTy::Const(ty) => {
                 // sanity checks
@@ -838,11 +860,35 @@ impl<'tcx> ExecBuilder<'tcx> {
                 // parse type
                 let const_ty = self.mk_type(ty);
 
+                // parse the body expression
+                let body = self.mk_expr(thir, expr);
+
                 // pack the information
-                SolExec::Constant(SolCEval { ty: const_ty })
+                SolExec::Constant(SolCEval { ty: const_ty, body })
             }
             BodyTy::GlobalAsm(..) => bug!("[unsupported] global assembly"),
         }
+    }
+
+    /// Record a THIR expression
+    pub(crate) fn mk_expr(&mut self, thir: &Thir<'tcx>, expr_id: ExprId) -> SolExpr {
+        let Expr { kind, ty, temp_scope_id: _, span } = &thir.exprs[expr_id];
+
+        // record type and span
+        let expr_ty = self.mk_type(*ty);
+        let expr_span = self.mk_span(*span);
+
+        // switch-case on expression kind
+        let expr_op = match kind {
+            ExprKind::Scope { region_scope: _, hir_id, value } => {
+                let inner_expr = self.mk_expr(thir, *value);
+                SolOp::Scope(self.mk_hir(*hir_id, inner_expr))
+            }
+            _ => todo!(),
+        };
+
+        // pack the expression
+        SolExpr { ty: expr_ty, span: expr_span, op: Box::new(expr_op) }
     }
 }
 
@@ -900,7 +946,8 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
         }
 
         // create an exec builder
-        let mut exec_builder = ExecBuilder::new(base_builder, bundle_generics);
+        let mut exec_builder =
+            ExecBuilder::new(base_builder, OwnerId { def_id: owner_id }, bundle_generics);
 
         // mark start
         exec_builder.log_stack.push("THIR", def_desc);
@@ -913,8 +960,15 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
         exec_builder.log_stack.pop();
 
         // unpack the exec builder
-        let ExecBuilder { tcx: _, mut base, generics, adt_defs, trait_defs, log_stack } =
-            exec_builder;
+        let ExecBuilder {
+            tcx: _,
+            mut base,
+            owner_id: _,
+            generics,
+            adt_defs,
+            trait_defs,
+            log_stack,
+        } = exec_builder;
         assert!(log_stack.is_empty(), "[invariant] log stack is not empty");
 
         // collect the datatype definitions
@@ -982,15 +1036,15 @@ pub(crate) trait SolIR =
 * Common
  */
 
-/// Anything that has a span but does not have an hir_id
+/// The base information associated with anything that has an hir_id, span, but no def_id
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(bound = "T: Serialize + DeserializeOwned")]
-pub(crate) struct SolAST<T: SolIR> {
-    pub(crate) span: SolSpan,
+pub(crate) struct SolHIR<T: SolIR> {
+    pub(crate) doc_comments: Vec<SolDocComment>,
     pub(crate) data: T,
 }
 
-/// The base information associated with anything that has an hir_id (and span)
+/// The base information associated with anything that has a def_id, span, and maybe hir_id
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(bound = "T: Serialize + DeserializeOwned")]
 pub(crate) struct SolMIR<T: SolIR> {
@@ -1060,12 +1114,14 @@ pub(crate) struct SolFnDef {
     pub(crate) abi: SolExternAbi,
     pub(crate) ret_ty: SolType,
     pub(crate) params: Vec<SolType>,
+    pub(crate) body: SolExpr,
 }
 
 /// THIR of a constant evaluation
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolCEval {
     pub(crate) ty: SolType,
+    pub(crate) body: SolExpr,
 }
 
 /// External ABI of a function
@@ -1211,12 +1267,14 @@ pub(crate) enum SolClause {
  * Constant
  */
 
+/// A compile-time constant
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolConst {
     Param(SolIdent),
     Value(SolValue),
 }
 
+/// A constant with concrete value and type
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolValue {
     // primitives
@@ -1240,6 +1298,24 @@ pub(crate) enum SolValue {
     F128(String),
     // composite
     Tuple(Vec<SolValue>),
+}
+
+/*
+ * Expression
+ */
+
+/// An expression in THIR
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolExpr {
+    pub(crate) ty: SolType,
+    pub(crate) op: Box<SolOp>,
+    pub(crate) span: SolSpan,
+}
+
+/// Details of the operation in an expression
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolOp {
+    Scope(SolHIR<SolExpr>),
 }
 
 /*
