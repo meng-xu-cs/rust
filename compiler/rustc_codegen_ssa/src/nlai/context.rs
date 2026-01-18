@@ -10,9 +10,10 @@ use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::{
     Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, MatchSource, Mod, OwnerId, Safety,
 };
+use rustc_middle::mir::BorrowKind;
 use rustc_middle::thir::{
-    Arm, Block, BlockId, BlockSafety, BodyTy, Expr, ExprId, ExprKind, Pat, PatKind, Stmt, StmtId,
-    StmtKind, Thir,
+    Arm, Block, BlockId, BlockSafety, BodyTy, Expr, ExprId, ExprKind, LocalVarId, Pat, PatKind,
+    Stmt, StmtId, StmtKind, Thir,
 };
 use rustc_middle::ty::{
     AdtDef, AdtKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig, GenericArg,
@@ -917,8 +918,38 @@ impl<'tcx> ExecBuilder<'tcx> {
                 SolOp::Scope(self.mk_hir(*hir_id, inner_expr))
             }
 
-            // intrinsics
+            // use
             ExprKind::Use { source } => SolOp::Use(self.mk_expr(thir, *source)),
+            ExprKind::VarRef { id: LocalVarId(var_id) } => {
+                assert_eq!(var_id.owner, self.owner_id, "[invariant] local var owner mismatch");
+                SolOp::VarRef(SolLocalVarIndex(var_id.local_id.index()))
+            }
+            ExprKind::UpvarRef { closure_def_id, var_hir_id: LocalVarId(var_id) } => {
+                assert_eq!(var_id.owner, self.owner_id, "[invariant] local var owner mismatch");
+                SolOp::UpVarRef(
+                    self.mk_ident(*closure_def_id),
+                    SolLocalVarIndex(var_id.local_id.index()),
+                )
+            }
+            ExprKind::ConstParam { param: ParamConst { index, name }, def_id } => {
+                let param_ident = self.get_param(*index, *name, SolGenericKind::Const);
+                let const_ident = self.mk_ident(*def_id);
+                if param_ident != const_ident {
+                    bug!("[invariant] const param ident mismatch");
+                }
+                SolOp::ConstParam(param_ident)
+            }
+            ExprKind::NamedConst { def_id, args, user_ty } => {
+                if user_ty.is_some() {
+                    bug!("[unsupported] named const with user type");
+                }
+                let const_ident = self.mk_ident(*def_id);
+                let generic_args = args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+                SolOp::ConstValue(const_ident, generic_args)
+            }
+            ExprKind::StaticRef { .. } => todo!(),
+
+            // intrinsics
             ExprKind::Box { value } => SolOp::Box(self.mk_expr(thir, *value)),
             ExprKind::Deref { arg } => SolOp::Deref(self.mk_expr(thir, *arg)),
 
@@ -938,6 +969,18 @@ impl<'tcx> ExecBuilder<'tcx> {
             ExprKind::NeverToAny { source } => SolOp::NeverToAny(self.mk_expr(thir, *source)),
             ExprKind::PointerCoercion { .. } => todo!(),
 
+            // packing
+            ExprKind::Repeat { value, count } => {
+                SolOp::Repeat(self.mk_expr(thir, *value), self.mk_const(*count))
+            }
+            ExprKind::Array { fields } => {
+                SolOp::Array(fields.iter().map(|e| self.mk_expr(thir, *e)).collect())
+            }
+            ExprKind::Tuple { fields } => {
+                SolOp::Tuple(fields.iter().map(|e| self.mk_expr(thir, *e)).collect())
+            }
+            ExprKind::Adt(..) => todo!(),
+
             // access
             ExprKind::Field { lhs, variant_index, name } => SolOp::Field {
                 base: self.mk_expr(thir, *lhs),
@@ -955,6 +998,32 @@ impl<'tcx> ExecBuilder<'tcx> {
                 else_opt: else_opt.map(|e| self.mk_expr(thir, e)),
             },
             ExprKind::Loop { body } => SolOp::Loop(self.mk_expr(thir, *body)),
+            ExprKind::Break { label: _, value } => {
+                // FIXME: handle scope (must be done)
+                SolOp::Break(value.map(|e| self.mk_expr(thir, e)))
+            }
+            ExprKind::Continue { label: _ } => {
+                // FIXME: handle scope (must be done)
+                SolOp::Continue
+            }
+            ExprKind::Return { value } => SolOp::Return(value.map(|e| self.mk_expr(thir, e))),
+
+            // borrow
+            ExprKind::Borrow { borrow_kind, arg } => {
+                let borrowed = self.mk_expr(thir, *arg);
+                match borrow_kind {
+                    BorrowKind::Shared => SolOp::ImmBorrow(borrowed),
+                    BorrowKind::Mut { kind: _ } => SolOp::MutBorrow(borrowed),
+                    BorrowKind::Fake(..) => bug!("[unsupported] fake borrow in THIR"),
+                }
+            }
+            ExprKind::RawBorrow { mutability, arg } => {
+                let borrowed = self.mk_expr(thir, *arg);
+                match mutability {
+                    Mutability::Not => SolOp::ImmRawPtr(borrowed),
+                    Mutability::Mut => SolOp::MutRawPtr(borrowed),
+                }
+            }
 
             // function call
             ExprKind::Call { ty, fun, args, from_hir_call: _, fn_span: _ } => SolOp::Call {
@@ -962,6 +1031,10 @@ impl<'tcx> ExecBuilder<'tcx> {
                 callee: self.mk_expr(thir, *fun),
                 args: args.iter().map(|arg| self.mk_expr(thir, *arg)).collect(),
             },
+            ExprKind::ConstBlock { did, args } => SolOp::ConstBlock(
+                self.mk_ident(*did),
+                args.iter().map(|arg| self.mk_generic_arg(arg)).collect(),
+            ),
 
             // pattern
             ExprKind::Let { expr, pat } => SolOp::Let(self.mk_expr(thir, *expr), self.mk_pat(pat)),
@@ -998,13 +1071,32 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
             ExprKind::Block { block } => SolOp::Block(self.mk_block(thir, *block)),
 
+            // literals
+            ExprKind::Literal { .. } => todo!(),
+            ExprKind::NonHirLiteral { .. } => todo!(),
+            ExprKind::ZstLiteral { .. } => todo!(),
+
+            // closure
+            ExprKind::Closure { .. } => todo!(),
+
             // unsupported
             ExprKind::ByUse { .. } => bug!("[unsupported] by-use"),
             ExprKind::LoopMatch { .. } => bug!("[unsupported] loop-match"),
+            ExprKind::ConstContinue { .. } => bug!("[unsupported] const-continue"),
             ExprKind::InlineAsm { .. } => bug!("[unsupported] inline assembly"),
             ExprKind::Yield { .. } => bug!("[unsupported] yield"),
+            ExprKind::ThreadLocalRef(..) => bug!("[unsupported] thread-local reference"),
+            ExprKind::Become { .. } => bug!("[unsupported] become"),
 
-            _ => todo!(),
+            ExprKind::PlaceTypeAscription { .. } => bug!("[unsupported] place type ascription"),
+            ExprKind::ValueTypeAscription { .. } => bug!("[unsupported] value type ascription"),
+            ExprKind::WrapUnsafeBinder { .. } => bug!("[unsupported] wrap unsafe binder"),
+            ExprKind::PlaceUnwrapUnsafeBinder { .. } => {
+                bug!("[unsupported] place unwrap unsafe binder")
+            }
+            ExprKind::ValueUnwrapUnsafeBinder { .. } => {
+                bug!("[unsupported] value unwrap unsafe binder")
+            }
         };
 
         // pack the expression
@@ -1489,8 +1581,13 @@ pub(crate) struct SolExpr {
 pub(crate) enum SolOp {
     // markers
     Scope(SolHIR<SolExpr>),
-    // intrisics
+    // use
     Use(SolExpr),
+    VarRef(SolLocalVarIndex),
+    UpVarRef(SolIdent, SolLocalVarIndex),
+    ConstParam(SolIdent),
+    ConstValue(SolIdent, Vec<SolGenericArg>),
+    // intrisics
     Box(SolExpr),
     Deref(SolExpr),
     // assignments
@@ -1501,16 +1598,31 @@ pub(crate) enum SolOp {
     // access
     Field { base: SolExpr, variant: SolVariantIndex, field: SolFieldIndex },
     Index { base: SolExpr, index: SolExpr },
+    // packing
+    Repeat(SolExpr, SolConst),
+    Array(Vec<SolExpr>),
+    Tuple(Vec<SolExpr>),
+    // borrow
+    ImmBorrow(SolExpr),
+    MutBorrow(SolExpr),
+    ImmRawPtr(SolExpr),
+    MutRawPtr(SolExpr),
     // control-flow
     If { cond: SolExpr, then: SolExpr, else_opt: Option<SolExpr> },
     Loop(SolExpr),
+    Break(Option<SolExpr>),
+    Continue,
+    Return(Option<SolExpr>),
     // function calls
     Call { target: SolType, callee: SolExpr, args: Vec<SolExpr> },
+    ConstBlock(SolIdent, Vec<SolGenericArg>),
     // pattern
     Let(SolExpr, SolPattern),
     Match(SolExpr, Vec<SolHIR<SolMatchArm>>),
     // compound
     Block(SolBlock),
+    // literals
+    // closure
 }
 
 /// A pattern matcher in THIR
@@ -1599,6 +1711,10 @@ pub(crate) struct SolModuleName(pub(crate) String);
 /// A parameter name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolParamName(pub(crate) String);
+
+/// A index to a local variable
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolLocalVarIndex(pub(crate) usize);
 
 /// A field name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
