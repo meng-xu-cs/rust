@@ -7,8 +7,13 @@ use rustc_ast::{AttrStyle, FloatTy, IntTy, Mutability, UintTy};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
-use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, Mod, OwnerId, Safety};
-use rustc_middle::thir::{BodyTy, Expr, ExprId, ExprKind, Pat, PatKind, Thir};
+use rustc_hir::{
+    Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, MatchSource, Mod, OwnerId, Safety,
+};
+use rustc_middle::thir::{
+    Arm, Block, BlockId, BlockSafety, BodyTy, Expr, ExprId, ExprKind, Pat, PatKind, Stmt, StmtId,
+    StmtKind, Thir,
+};
 use rustc_middle::ty::{
     AdtDef, AdtKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig, GenericArg,
     GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, List, ParamConst,
@@ -916,14 +921,32 @@ impl<'tcx> ExecBuilder<'tcx> {
             ExprKind::Use { source } => SolOp::Use(self.mk_expr(thir, *source)),
             ExprKind::Box { value } => SolOp::Box(self.mk_expr(thir, *value)),
             ExprKind::Deref { arg } => SolOp::Deref(self.mk_expr(thir, *arg)),
+
+            // operators
             ExprKind::Binary { .. } => todo!(),
             ExprKind::LogicalOp { .. } => todo!(),
             ExprKind::Unary { .. } => todo!(),
+
+            // assignment
+            ExprKind::Assign { lhs, rhs } => {
+                SolOp::Assign { lhs: self.mk_expr(thir, *lhs), rhs: self.mk_expr(thir, *rhs) }
+            }
+            ExprKind::AssignOp { .. } => todo!(),
 
             // casts
             ExprKind::Cast { source } => SolOp::Cast(self.mk_expr(thir, *source)),
             ExprKind::NeverToAny { source } => SolOp::NeverToAny(self.mk_expr(thir, *source)),
             ExprKind::PointerCoercion { .. } => todo!(),
+
+            // access
+            ExprKind::Field { lhs, variant_index, name } => SolOp::Field {
+                base: self.mk_expr(thir, *lhs),
+                variant: SolVariantIndex(variant_index.index()),
+                field: SolFieldIndex(name.index()),
+            },
+            ExprKind::Index { lhs, index } => {
+                SolOp::Index { base: self.mk_expr(thir, *lhs), index: self.mk_expr(thir, *index) }
+            }
 
             // control-folow
             ExprKind::If { if_then_scope: _, cond, then, else_opt } => SolOp::If {
@@ -942,6 +965,38 @@ impl<'tcx> ExecBuilder<'tcx> {
 
             // pattern
             ExprKind::Let { expr, pat } => SolOp::Let(self.mk_expr(thir, *expr), self.mk_pat(pat)),
+            ExprKind::Match { scrutinee, arms, match_source } => {
+                if matches!(match_source, MatchSource::AwaitDesugar) {
+                    bug!("[unsupported] match from await desugar");
+                }
+
+                // parse scrutinee
+                let scrutinee_expr = self.mk_expr(thir, *scrutinee);
+
+                // parse arms
+                let mut parsed_arms = vec![];
+                for arm in arms.iter() {
+                    let Arm { pattern, guard, body, hir_id, scope: _, span } = &thir.arms[*arm];
+                    let arm_pattern = self.mk_pat(pattern);
+                    let arm_guard = guard.map(|e| self.mk_expr(thir, e));
+                    let arm_body = self.mk_expr(thir, *body);
+                    let arm_span = self.mk_span(*span);
+                    let arm_hir = self.mk_hir(
+                        *hir_id,
+                        SolMatchArm {
+                            pat: arm_pattern,
+                            guard: arm_guard,
+                            body: arm_body,
+                            span: arm_span,
+                        },
+                    );
+                    parsed_arms.push(arm_hir);
+                }
+
+                // pack the match expression
+                SolOp::Match(scrutinee_expr, parsed_arms)
+            }
+            ExprKind::Block { block } => SolOp::Block(self.mk_block(thir, *block)),
 
             // unsupported
             ExprKind::ByUse { .. } => bug!("[unsupported] by-use"),
@@ -954,6 +1009,58 @@ impl<'tcx> ExecBuilder<'tcx> {
 
         // pack the expression
         SolExpr { ty: expr_ty, span: expr_span, op: Box::new(expr_op) }
+    }
+
+    /// Record a THIR statement
+    pub(crate) fn mk_stmt(&mut self, thir: &Thir<'tcx>, stmt_id: StmtId) -> SolStmt {
+        let Stmt { kind } = &thir.stmts[stmt_id];
+        match kind {
+            StmtKind::Expr { scope: _, expr } => SolStmt::Expr(self.mk_expr(thir, *expr)),
+            StmtKind::Let {
+                remainder_scope: _,
+                init_scope: _,
+                pattern,
+                initializer,
+                else_block,
+                hir_id,
+                span,
+            } => {
+                let let_pattern = self.mk_pat(pattern);
+                let let_init = match (initializer, else_block) {
+                    (None, None) => None,
+                    (Some(init), None) => Some((self.mk_expr(thir, *init), None)),
+                    (Some(init), Some(else_blk)) => {
+                        Some((self.mk_expr(thir, *init), Some(self.mk_block(thir, *else_blk))))
+                    }
+                    (None, Some(_)) => {
+                        bug!("[invariant] let statement with else block must have an initializer");
+                    }
+                };
+                let let_span = self.mk_span(*span);
+
+                // pack the let statement
+                SolStmt::Bind(self.mk_hir(
+                    *hir_id,
+                    SolLetBinding { pat: let_pattern, init: let_init, span: let_span },
+                ))
+            }
+        }
+    }
+
+    /// Record a THIR block
+    pub(crate) fn mk_block(&mut self, thir: &Thir<'tcx>, block_id: BlockId) -> SolBlock {
+        let Block { targeted_by_break: _, region_scope: _, span, stmts, expr, safety_mode } =
+            &thir.blocks[block_id];
+
+        let block_safety = match safety_mode {
+            BlockSafety::Safe => true,
+            BlockSafety::BuiltinUnsafe | BlockSafety::ExplicitUnsafe(..) => false,
+        };
+        let block_span = self.mk_span(*span);
+        let block_stmts = stmts.iter().map(|stmt| self.mk_stmt(thir, *stmt)).collect();
+        let block_expr = expr.map(|e| self.mk_expr(thir, e));
+
+        SolBlock { safety: block_safety, stmts: block_stmts, expr: block_expr, span: block_span }
     }
 }
 
@@ -1386,9 +1493,14 @@ pub(crate) enum SolOp {
     Use(SolExpr),
     Box(SolExpr),
     Deref(SolExpr),
+    // assignments
+    Assign { lhs: SolExpr, rhs: SolExpr },
     // casts
     Cast(SolExpr),
     NeverToAny(SolExpr),
+    // access
+    Field { base: SolExpr, variant: SolVariantIndex, field: SolFieldIndex },
+    Index { base: SolExpr, index: SolExpr },
     // control-flow
     If { cond: SolExpr, then: SolExpr, else_opt: Option<SolExpr> },
     Loop(SolExpr),
@@ -1396,6 +1508,9 @@ pub(crate) enum SolOp {
     Call { target: SolType, callee: SolExpr, args: Vec<SolExpr> },
     // pattern
     Let(SolExpr, SolPattern),
+    Match(SolExpr, Vec<SolHIR<SolMatchArm>>),
+    // compound
+    Block(SolBlock),
 }
 
 /// A pattern matcher in THIR
@@ -1412,6 +1527,39 @@ pub(crate) enum SolPatRule {
     Missing,
     Wild,
     Never,
+}
+
+/// A match arm in THIR
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolMatchArm {
+    pub(crate) pat: SolPattern,
+    pub(crate) guard: Option<SolExpr>,
+    pub(crate) body: SolExpr,
+    pub(crate) span: SolSpan,
+}
+
+/// A block of expressiosn in THIR
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolBlock {
+    pub(crate) safety: bool,
+    pub(crate) stmts: Vec<SolStmt>,
+    pub(crate) expr: Option<SolExpr>,
+    pub(crate) span: SolSpan,
+}
+
+/// A statement in THIR
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolStmt {
+    Expr(SolExpr),
+    Bind(SolHIR<SolLetBinding>),
+}
+
+/// Let binding in a statement in THIR
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolLetBinding {
+    pat: SolPattern,
+    init: Option<(SolExpr, Option<SolBlock>)>,
+    span: SolSpan,
 }
 
 /*
