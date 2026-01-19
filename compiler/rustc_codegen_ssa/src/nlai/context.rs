@@ -12,15 +12,16 @@ use rustc_hir::{
 };
 use rustc_middle::mir::{AssignOp, BinOp, BorrowKind, UnOp};
 use rustc_middle::thir::{
-    AdtExpr, AdtExprBase, Arm, Block, BlockId, BlockSafety, BodyTy, Expr, ExprId, ExprKind,
-    FieldExpr, FruInfo, LocalVarId, LogicalOp, Pat, PatKind, Stmt, StmtId, StmtKind, Thir,
+    AdtExpr, AdtExprBase, Arm, Block, BlockId, BlockSafety, BodyTy, ClosureExpr, Expr, ExprId,
+    ExprKind, FieldExpr, FruInfo, LocalVarId, LogicalOp, Pat, PatKind, Stmt, StmtId, StmtKind,
+    Thir,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
     AdtDef, AdtKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig, GenericArg,
     GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, List, ParamConst,
     ParamTy, Pattern, PatternKind, PredicatePolarity, ScalarInt, Term, TermKind, TraitDef,
-    TraitPredicate, Ty, TyCtxt, ValTreeKind, Value, VariantDiscr,
+    TraitPredicate, Ty, TyCtxt, UpvarArgs, ValTreeKind, Value, VariantDiscr,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
@@ -1310,7 +1311,26 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // closure
-            ExprKind::Closure { .. } => todo!(),
+            ExprKind::Closure(box ClosureExpr {
+                closure_id,
+                args,
+                box upvars,
+                movability: _,
+                fake_reads: _,
+            }) => {
+                let closure_ident = self.mk_ident(closure_id.to_def_id());
+                let closure_ty_args = match args {
+                    UpvarArgs::Closure(ty_args) => {
+                        ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect()
+                    }
+                    UpvarArgs::Coroutine(..) | UpvarArgs::CoroutineClosure(..) => {
+                        bug!("[unsupported] coroutine closure");
+                    }
+                };
+                let closure_upvars = upvars.iter().map(|v| self.mk_expr(thir, *v)).collect();
+                // FIXME: maybe we should do something about the movability and fake reads as well?
+                SolOp::Closure(closure_ident, closure_ty_args, closure_upvars)
+            }
 
             // unsupported
             ExprKind::ByUse { .. } => bug!("[unsupported] by-use"),
@@ -1963,6 +1983,7 @@ pub(crate) enum SolOp {
     ScalarLiteral(SolValue),
     ZstLiteral(SolValue),
     // closure
+    Closure(SolIdent, Vec<SolGenericArg>, Vec<SolExpr>),
 }
 
 /// A pattern matcher in THIR
