@@ -10,11 +10,12 @@ use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::{
     Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, MatchSource, Mod, OwnerId, Safety,
 };
-use rustc_middle::mir::BorrowKind;
+use rustc_middle::mir::{AssignOp, BinOp, BorrowKind, UnOp};
 use rustc_middle::thir::{
     AdtExpr, AdtExprBase, Arm, Block, BlockId, BlockSafety, BodyTy, Expr, ExprId, ExprKind,
-    FieldExpr, FruInfo, LocalVarId, Pat, PatKind, Stmt, StmtId, StmtKind, Thir,
+    FieldExpr, FruInfo, LocalVarId, LogicalOp, Pat, PatKind, Stmt, StmtId, StmtKind, Thir,
 };
+use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
     AdtDef, AdtKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig, GenericArg,
     GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, List, ParamConst,
@@ -1052,20 +1053,94 @@ impl<'tcx> ExecBuilder<'tcx> {
             ExprKind::Deref { arg } => SolOp::Deref(self.mk_expr(thir, *arg)),
 
             // operators
-            ExprKind::Binary { .. } => todo!(),
-            ExprKind::LogicalOp { .. } => todo!(),
-            ExprKind::Unary { .. } => todo!(),
+            ExprKind::Binary { op, lhs, rhs } => {
+                let lhs_expr = self.mk_expr(thir, *lhs);
+                let rhs_expr = self.mk_expr(thir, *rhs);
+                match op {
+                    BinOp::Add => SolOp::Add(lhs_expr, rhs_expr),
+                    BinOp::AddUnchecked => SolOp::AddUnchecked(lhs_expr, rhs_expr),
+                    BinOp::AddWithOverflow => SolOp::AddWithOverflow(lhs_expr, rhs_expr),
+                    BinOp::Sub => SolOp::Sub(lhs_expr, rhs_expr),
+                    BinOp::SubUnchecked => SolOp::SubUnchecked(lhs_expr, rhs_expr),
+                    BinOp::SubWithOverflow => SolOp::SubWithOverflow(lhs_expr, rhs_expr),
+                    BinOp::Mul => SolOp::Mul(lhs_expr, rhs_expr),
+                    BinOp::MulUnchecked => SolOp::MulUnchecked(lhs_expr, rhs_expr),
+                    BinOp::MulWithOverflow => SolOp::MulWithOverflow(lhs_expr, rhs_expr),
+                    BinOp::Div => SolOp::Div(lhs_expr, rhs_expr),
+                    BinOp::Rem => SolOp::Rem(lhs_expr, rhs_expr),
+                    BinOp::BitXor => SolOp::BitXor(lhs_expr, rhs_expr),
+                    BinOp::BitAnd => SolOp::BitAnd(lhs_expr, rhs_expr),
+                    BinOp::BitOr => SolOp::BitOr(lhs_expr, rhs_expr),
+                    BinOp::Shl => SolOp::Shl(lhs_expr, rhs_expr),
+                    BinOp::ShlUnchecked => SolOp::ShlUnchecked(lhs_expr, rhs_expr),
+                    BinOp::Shr => SolOp::Shr(lhs_expr, rhs_expr),
+                    BinOp::ShrUnchecked => SolOp::ShrUnchecked(lhs_expr, rhs_expr),
+                    BinOp::Eq => SolOp::Eq(lhs_expr, rhs_expr),
+                    BinOp::Ne => SolOp::Ne(lhs_expr, rhs_expr),
+                    BinOp::Lt => SolOp::Lt(lhs_expr, rhs_expr),
+                    BinOp::Le => SolOp::Le(lhs_expr, rhs_expr),
+                    BinOp::Gt => SolOp::Gt(lhs_expr, rhs_expr),
+                    BinOp::Ge => SolOp::Ge(lhs_expr, rhs_expr),
+                    BinOp::Cmp => SolOp::Cmp(lhs_expr, rhs_expr),
+                    BinOp::Offset => bug!("[unsupported] offset binary op in THIR"),
+                }
+            }
+            ExprKind::LogicalOp { op, lhs, rhs } => {
+                let lhs_expr = self.mk_expr(thir, *lhs);
+                let rhs_expr = self.mk_expr(thir, *rhs);
+                match op {
+                    LogicalOp::And => SolOp::LogicalAnd(lhs_expr, rhs_expr),
+                    LogicalOp::Or => SolOp::LogicalOr(lhs_expr, rhs_expr),
+                }
+            }
+            ExprKind::Unary { op, arg } => {
+                let operand = self.mk_expr(thir, *arg);
+                match op {
+                    UnOp::Not => SolOp::Not(operand),
+                    UnOp::Neg => SolOp::Neg(operand),
+                    UnOp::PtrMetadata => bug!("[invariant] pointer metadata unary in THIR"),
+                }
+            }
 
             // assignment
             ExprKind::Assign { lhs, rhs } => {
                 SolOp::Assign { lhs: self.mk_expr(thir, *lhs), rhs: self.mk_expr(thir, *rhs) }
             }
-            ExprKind::AssignOp { .. } => todo!(),
+            ExprKind::AssignOp { op, lhs, rhs } => {
+                let lhs_expr = self.mk_expr(thir, *lhs);
+                let rhs_expr = self.mk_expr(thir, *rhs);
+                match op {
+                    AssignOp::AddAssign => SolOp::AddAssign { lhs: lhs_expr, rhs: rhs_expr },
+                    AssignOp::SubAssign => SolOp::SubAssign { lhs: lhs_expr, rhs: rhs_expr },
+                    AssignOp::MulAssign => SolOp::MulAssign { lhs: lhs_expr, rhs: rhs_expr },
+                    AssignOp::DivAssign => SolOp::DivAssign { lhs: lhs_expr, rhs: rhs_expr },
+                    AssignOp::RemAssign => SolOp::RemAssign { lhs: lhs_expr, rhs: rhs_expr },
+                    AssignOp::BitXorAssign => SolOp::BitXorAssign { lhs: lhs_expr, rhs: rhs_expr },
+                    AssignOp::BitAndAssign => SolOp::BitAndAssign { lhs: lhs_expr, rhs: rhs_expr },
+                    AssignOp::BitOrAssign => SolOp::BitOrAssign { lhs: lhs_expr, rhs: rhs_expr },
+                    AssignOp::ShlAssign => SolOp::ShlAssign { lhs: lhs_expr, rhs: rhs_expr },
+                    AssignOp::ShrAssign => SolOp::ShrAssign { lhs: lhs_expr, rhs: rhs_expr },
+                }
+            }
 
             // casts
             ExprKind::Cast { source } => SolOp::Cast(self.mk_expr(thir, *source)),
+            ExprKind::PointerCoercion { cast, source, is_from_as_cast: _ } => {
+                let operand = self.mk_expr(thir, *source);
+                match cast {
+                    PointerCoercion::ReifyFnPointer(safety) => {
+                        SolOp::CastReifyFnPtr(operand, matches!(safety, Safety::Safe))
+                    }
+                    PointerCoercion::UnsafeFnPointer => SolOp::CastUnsafeFnPtr(operand),
+                    PointerCoercion::ClosureFnPointer(safety) => {
+                        SolOp::CastClosureFnPtr(operand, matches!(safety, Safety::Safe))
+                    }
+                    PointerCoercion::MutToConstPointer => SolOp::CastMutToConstPtr(operand),
+                    PointerCoercion::ArrayToPointer => SolOp::CastUnsizeAraryPtr(operand),
+                    PointerCoercion::Unsize => bug!("[invariant] unsize pointer coercion in THIR"),
+                }
+            }
             ExprKind::NeverToAny { source } => SolOp::NeverToAny(self.mk_expr(thir, *source)),
-            ExprKind::PointerCoercion { .. } => todo!(),
 
             // packing
             ExprKind::Repeat { value, count } => {
@@ -1752,13 +1827,88 @@ pub(crate) enum SolOp {
     // intrisics
     Box(SolExpr),
     Deref(SolExpr),
+    // operators
+    Not(SolExpr),
+    Neg(SolExpr),
+    Add(SolExpr, SolExpr),
+    AddUnchecked(SolExpr, SolExpr),
+    AddWithOverflow(SolExpr, SolExpr),
+    Sub(SolExpr, SolExpr),
+    SubUnchecked(SolExpr, SolExpr),
+    SubWithOverflow(SolExpr, SolExpr),
+    Mul(SolExpr, SolExpr),
+    MulUnchecked(SolExpr, SolExpr),
+    MulWithOverflow(SolExpr, SolExpr),
+    Div(SolExpr, SolExpr),
+    Rem(SolExpr, SolExpr),
+    BitXor(SolExpr, SolExpr),
+    BitAnd(SolExpr, SolExpr),
+    BitOr(SolExpr, SolExpr),
+    Shl(SolExpr, SolExpr),
+    ShlUnchecked(SolExpr, SolExpr),
+    Shr(SolExpr, SolExpr),
+    ShrUnchecked(SolExpr, SolExpr),
+    Eq(SolExpr, SolExpr),
+    Ne(SolExpr, SolExpr),
+    Lt(SolExpr, SolExpr),
+    Le(SolExpr, SolExpr),
+    Gt(SolExpr, SolExpr),
+    Ge(SolExpr, SolExpr),
+    Cmp(SolExpr, SolExpr),
+    LogicalAnd(SolExpr, SolExpr),
+    LogicalOr(SolExpr, SolExpr),
     // assignments
     Assign {
         lhs: SolExpr,
         rhs: SolExpr,
     },
+    AddAssign {
+        lhs: SolExpr,
+        rhs: SolExpr,
+    },
+    SubAssign {
+        lhs: SolExpr,
+        rhs: SolExpr,
+    },
+    MulAssign {
+        lhs: SolExpr,
+        rhs: SolExpr,
+    },
+    DivAssign {
+        lhs: SolExpr,
+        rhs: SolExpr,
+    },
+    RemAssign {
+        lhs: SolExpr,
+        rhs: SolExpr,
+    },
+    BitXorAssign {
+        lhs: SolExpr,
+        rhs: SolExpr,
+    },
+    BitAndAssign {
+        lhs: SolExpr,
+        rhs: SolExpr,
+    },
+    BitOrAssign {
+        lhs: SolExpr,
+        rhs: SolExpr,
+    },
+    ShlAssign {
+        lhs: SolExpr,
+        rhs: SolExpr,
+    },
+    ShrAssign {
+        lhs: SolExpr,
+        rhs: SolExpr,
+    },
     // casts
     Cast(SolExpr),
+    CastReifyFnPtr(SolExpr, bool),
+    CastUnsafeFnPtr(SolExpr),
+    CastClosureFnPtr(SolExpr, bool),
+    CastMutToConstPtr(SolExpr),
+    CastUnsizeAraryPtr(SolExpr),
     NeverToAny(SolExpr),
     // access
     Field {
