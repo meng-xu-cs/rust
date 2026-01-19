@@ -12,8 +12,8 @@ use rustc_hir::{
 };
 use rustc_middle::mir::BorrowKind;
 use rustc_middle::thir::{
-    Arm, Block, BlockId, BlockSafety, BodyTy, Expr, ExprId, ExprKind, LocalVarId, Pat, PatKind,
-    Stmt, StmtId, StmtKind, Thir,
+    AdtExpr, AdtExprBase, Arm, Block, BlockId, BlockSafety, BodyTy, Expr, ExprId, ExprKind,
+    FieldExpr, FruInfo, LocalVarId, Pat, PatKind, Stmt, StmtId, StmtKind, Thir,
 };
 use rustc_middle::ty::{
     AdtDef, AdtKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig, GenericArg,
@@ -483,6 +483,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                             ty: self.mk_type(field_def.ty(self.tcx, ty_args)),
                         })
                         .collect();
+                    // FIXME: should add default value for FieldDef
                     variants.push(SolVariant {
                         index: variant_index,
                         name: variant_name,
@@ -1076,7 +1077,49 @@ impl<'tcx> ExecBuilder<'tcx> {
             ExprKind::Tuple { fields } => {
                 SolOp::Tuple(fields.iter().map(|e| self.mk_expr(thir, *e)).collect())
             }
-            ExprKind::Adt(..) => todo!(),
+            ExprKind::Adt(box AdtExpr {
+                adt_def,
+                variant_index,
+                args,
+                user_ty,
+                fields,
+                base: base_expr,
+            }) => {
+                if user_ty.is_some() {
+                    bug!("[unsupported] ADT expr with user type");
+                }
+
+                // parse the definition
+                let (adt_ident, adt_args) = self.mk_adt(*adt_def, *args);
+
+                // parse the fields
+                let mut parsed_fields = vec![];
+                for FieldExpr { name: field_idx, expr: field_expr } in fields.iter() {
+                    parsed_fields
+                        .push((SolFieldIndex(field_idx.index()), self.mk_expr(thir, *field_expr)));
+                }
+
+                // parse the base
+                let adt_base = match base_expr {
+                    AdtExprBase::None => SolAdtBase::None,
+                    AdtExprBase::Base(FruInfo { base, box field_types }) => SolAdtBase::Overlay(
+                        self.mk_expr(thir, *base),
+                        field_types.iter().map(|field_ty| self.mk_type(*field_ty)).collect(),
+                    ),
+                    AdtExprBase::DefaultFields(box default_field_tys) => SolAdtBase::Default(
+                        default_field_tys.iter().map(|field_ty| self.mk_type(*field_ty)).collect(),
+                    ),
+                };
+
+                // pack the ADT expression
+                SolOp::Adt {
+                    adt_ident,
+                    adt_args,
+                    variant: SolVariantIndex(variant_index.index()),
+                    fields: parsed_fields,
+                    base: adt_base,
+                }
+            }
 
             // access
             ExprKind::Field { lhs, variant_index, name } => SolOp::Field {
@@ -1710,30 +1753,55 @@ pub(crate) enum SolOp {
     Box(SolExpr),
     Deref(SolExpr),
     // assignments
-    Assign { lhs: SolExpr, rhs: SolExpr },
+    Assign {
+        lhs: SolExpr,
+        rhs: SolExpr,
+    },
     // casts
     Cast(SolExpr),
     NeverToAny(SolExpr),
     // access
-    Field { base: SolExpr, variant: SolVariantIndex, field: SolFieldIndex },
-    Index { base: SolExpr, index: SolExpr },
+    Field {
+        base: SolExpr,
+        variant: SolVariantIndex,
+        field: SolFieldIndex,
+    },
+    Index {
+        base: SolExpr,
+        index: SolExpr,
+    },
     // packing
     Repeat(SolExpr, SolConst),
     Array(Vec<SolExpr>),
     Tuple(Vec<SolExpr>),
+    Adt {
+        adt_ident: SolIdent,
+        adt_args: Vec<SolGenericArg>,
+        variant: SolVariantIndex,
+        fields: Vec<(SolFieldIndex, SolExpr)>,
+        base: SolAdtBase,
+    },
     // borrow
     ImmBorrow(SolExpr),
     MutBorrow(SolExpr),
     ImmRawPtr(SolExpr),
     MutRawPtr(SolExpr),
     // control-flow
-    If { cond: SolExpr, then: SolExpr, else_opt: Option<SolExpr> },
+    If {
+        cond: SolExpr,
+        then: SolExpr,
+        else_opt: Option<SolExpr>,
+    },
     Loop(SolExpr),
     Break(Option<SolExpr>),
     Continue,
     Return(Option<SolExpr>),
     // function calls
-    Call { target: SolType, callee: SolExpr, args: Vec<SolExpr> },
+    Call {
+        target: SolType,
+        callee: SolExpr,
+        args: Vec<SolExpr>,
+    },
     ConstBlock(SolIdent, Vec<SolGenericArg>),
     // pattern
     Let(SolExpr, SolPattern),
@@ -1794,6 +1862,14 @@ pub(crate) struct SolLetBinding {
     pat: SolPattern,
     init: Option<(SolExpr, Option<SolBlock>)>,
     span: SolSpan,
+}
+
+/// Base
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolAdtBase {
+    None,
+    Overlay(SolExpr, Vec<SolType>),
+    Default(Vec<SolType>),
 }
 
 /*
