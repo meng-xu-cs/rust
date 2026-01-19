@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 
 use rustc_abi::ExternAbi;
-use rustc_ast::{AttrStyle, FloatTy, IntTy, Mutability, UintTy};
+use rustc_ast::{AttrStyle, FloatTy, IntTy, LitFloatType, LitIntType, LitKind, Mutability, UintTy};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
@@ -828,6 +828,103 @@ impl<'tcx> ExecBuilder<'tcx> {
         }
     }
 
+    /// Record a (constant) value from a HIR literal
+    pub(crate) fn mk_value_from_lit_and_ty(&mut self, lit: LitKind, ty: Ty<'tcx>) -> SolValue {
+        match (lit, ty.kind()) {
+            // basic
+            (LitKind::Bool(v), ty::Bool) => SolValue::Bool(v),
+            (LitKind::Char(v), ty::Char) => SolValue::Char(v),
+            (LitKind::Byte(v), ty::Uint(UintTy::U8)) => SolValue::U8(v),
+
+            // int
+            (LitKind::Int(v, LitIntType::Signed(lit_ty)), ty::Int(int_ty)) => {
+                match (lit_ty, int_ty) {
+                    (IntTy::I8, IntTy::I8) => SolValue::I8(v.0 as i8),
+                    (IntTy::I16, IntTy::I16) => SolValue::I16(v.0 as i16),
+                    (IntTy::I32, IntTy::I32) => SolValue::I32(v.0 as i32),
+                    (IntTy::I64, IntTy::I64) => SolValue::I64(v.0 as i64),
+                    (IntTy::I128, IntTy::I128) => SolValue::I128(v.0 as i128),
+                    (IntTy::Isize, IntTy::Isize) => SolValue::Isize(v.0 as isize),
+                    _ => bug!("[invariant] int literal type mismatch: {lit_ty:?} vs {int_ty:?}"),
+                }
+            }
+            (LitKind::Int(v, LitIntType::Unsigned(lit_ty)), ty::Uint(int_ty)) => {
+                match (lit_ty, int_ty) {
+                    (UintTy::U8, UintTy::U8) => SolValue::U8(v.0 as u8),
+                    (UintTy::U16, UintTy::U16) => SolValue::U16(v.0 as u16),
+                    (UintTy::U32, UintTy::U32) => SolValue::U32(v.0 as u32),
+                    (UintTy::U64, UintTy::U64) => SolValue::U64(v.0 as u64),
+                    (UintTy::U128, UintTy::U128) => SolValue::U128(v.0 as u128),
+                    (UintTy::Usize, UintTy::Usize) => SolValue::Usize(v.0 as usize),
+                    _ => bug!("[invariant] uint literal type mismatch: {lit_ty:?} vs {int_ty:?}"),
+                }
+            }
+            (LitKind::Int(v, LitIntType::Unsuffixed), ty::Int(int_ty)) => {
+                // unsuffixed integer literal, try to fit into the target type
+                match int_ty {
+                    IntTy::I8 => SolValue::I8(v.0 as i8),
+                    IntTy::I16 => SolValue::I16(v.0 as i16),
+                    IntTy::I32 => SolValue::I32(v.0 as i32),
+                    IntTy::I64 => SolValue::I64(v.0 as i64),
+                    IntTy::I128 => SolValue::I128(v.0 as i128),
+                    IntTy::Isize => SolValue::Isize(v.0 as isize),
+                }
+            }
+            (LitKind::Int(v, LitIntType::Unsuffixed), ty::Uint(int_ty)) => {
+                // unsuffixed integer literal, try to fit into the target type
+                match int_ty {
+                    UintTy::U8 => SolValue::U8(v.0 as u8),
+                    UintTy::U16 => SolValue::U16(v.0 as u16),
+                    UintTy::U32 => SolValue::U32(v.0 as u32),
+                    UintTy::U64 => SolValue::U64(v.0 as u64),
+                    UintTy::U128 => SolValue::U128(v.0 as u128),
+                    UintTy::Usize => SolValue::Usize(v.0 as usize),
+                }
+            }
+
+            // float
+            (LitKind::Float(v, LitFloatType::Suffixed(lit_ty)), ty::Float(float_ty)) => {
+                match (lit_ty, float_ty) {
+                    (FloatTy::F16, FloatTy::F16) => SolValue::F16(v.to_string()),
+                    (FloatTy::F32, FloatTy::F32) => SolValue::F32(v.to_string()),
+                    (FloatTy::F64, FloatTy::F64) => SolValue::F64(v.to_string()),
+                    (FloatTy::F128, FloatTy::F128) => SolValue::F128(v.to_string()),
+                    _ => {
+                        bug!("[invariant] float literal type mismatch: {lit_ty:?} vs {float_ty:?}")
+                    }
+                }
+            }
+            (LitKind::Float(v, LitFloatType::Unsuffixed), ty::Float(float_ty)) => {
+                // unsuffixed float literal, try to fit into the target type
+                match float_ty {
+                    FloatTy::F16 => SolValue::F16(v.to_string()),
+                    FloatTy::F32 => SolValue::F32(v.to_string()),
+                    FloatTy::F64 => SolValue::F64(v.to_string()),
+                    FloatTy::F128 => SolValue::F128(v.to_string()),
+                }
+            }
+
+            // strings
+            (LitKind::Str(v, _), ty::Str) => SolValue::Str(v.to_ident_string()),
+            (LitKind::ByteStr(v, _), ty::Slice(elem_ty))
+                if elem_ty.kind() == &ty::Uint(UintTy::U8) =>
+            {
+                SolValue::Slice(v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect())
+            }
+            (LitKind::CStr(v, _), ty::Slice(elem_ty))
+                if elem_ty.kind() == &ty::Uint(UintTy::U8) =>
+            {
+                SolValue::Slice(v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect())
+            }
+
+            // unexpected
+            (LitKind::Err(_), _) => bug!("[invariant] unexpected literal {lit}"),
+
+            // all other cases are considered type mismatches
+            _ => bug!("[invariant] literal and type mismatch: {lit} vs {ty}"),
+        }
+    }
+
     /// Record a (constant) value for a ZST
     pub(crate) fn mk_value_from_zst(&mut self, ty: Ty<'tcx>) -> SolValue {
         self.mk_value_when_zst(ty).unwrap_or_else(|| {
@@ -1072,9 +1169,27 @@ impl<'tcx> ExecBuilder<'tcx> {
             ExprKind::Block { block } => SolOp::Block(self.mk_block(thir, *block)),
 
             // literals
-            ExprKind::Literal { .. } => todo!(),
-            ExprKind::NonHirLiteral { .. } => todo!(),
-            ExprKind::ZstLiteral { .. } => todo!(),
+            ExprKind::Literal { lit, neg } => {
+                if *neg {
+                    bug!("[unsupported] negated literal");
+                }
+                SolOp::BaseLiteral(
+                    self.mk_value_from_lit_and_ty(lit.node, *ty),
+                    self.mk_span(lit.span),
+                )
+            }
+            ExprKind::NonHirLiteral { lit, user_ty } => {
+                if user_ty.is_some() {
+                    bug!("[unsupported] non-HIR literal with explicit user type");
+                }
+                SolOp::ScalarLiteral(self.mk_value_from_scalar(*ty, *lit))
+            }
+            ExprKind::ZstLiteral { user_ty } => {
+                if user_ty.is_some() {
+                    bug!("[unsupported] ZST literal with explicit user type");
+                }
+                SolOp::ZstLiteral(self.mk_value_from_zst(*ty))
+            }
 
             // closure
             ExprKind::Closure { .. } => todo!(),
@@ -1090,6 +1205,7 @@ impl<'tcx> ExecBuilder<'tcx> {
 
             ExprKind::PlaceTypeAscription { .. } => bug!("[unsupported] place type ascription"),
             ExprKind::ValueTypeAscription { .. } => bug!("[unsupported] value type ascription"),
+
             ExprKind::WrapUnsafeBinder { .. } => bug!("[unsupported] wrap unsafe binder"),
             ExprKind::PlaceUnwrapUnsafeBinder { .. } => {
                 bug!("[unsupported] place unwrap unsafe binder")
@@ -1560,6 +1676,9 @@ pub(crate) enum SolValue {
     F32(String),
     F64(String),
     F128(String),
+    // string
+    Str(String),
+    Slice(Vec<SolValue>),
     // composite
     Tuple(Vec<SolValue>),
 }
@@ -1622,6 +1741,9 @@ pub(crate) enum SolOp {
     // compound
     Block(SolBlock),
     // literals
+    BaseLiteral(SolValue, SolSpan),
+    ScalarLiteral(SolValue),
+    ZstLiteral(SolValue),
     // closure
 }
 
