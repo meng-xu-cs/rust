@@ -20,9 +20,9 @@ use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
     AdtDef, AdtKind, AliasTyKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig,
     GenericArg, GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, List,
-    ParamConst, ParamTy, Pattern, PatternKind, PredicatePolarity, ProjectionPredicate, ScalarInt,
-    Term, TermKind, TraitDef, TraitPredicate, Ty, TyCtxt, TypingEnv, UpvarArgs, ValTreeKind, Value,
-    VariantDiscr,
+    OutlivesPredicate, ParamConst, ParamTy, Pattern, PatternKind, PredicatePolarity,
+    ProjectionPredicate, ScalarInt, Term, TermKind, TraitDef, TraitPredicate, Ty, TyCtxt,
+    TypingEnv, UpvarArgs, ValTreeKind, Value, VariantDiscr,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
@@ -592,29 +592,37 @@ impl<'tcx> ExecBuilder<'tcx> {
                     }
                 }
             }
-            ClauseKind::WellFormed(term) => SolClause::WellFormed(self.mk_projection_term(term)),
 
-            // might be supported later, together with alias type
+            // less important clauses
+            ClauseKind::WellFormed(term) => SolClause::WellFormed(self.mk_projection_term(term)),
             ClauseKind::Projection(ProjectionPredicate { projection_term, term }) => {
                 SolClause::Projection(
                     self.mk_projection_term(projection_term.to_term(self.tcx)),
                     self.mk_projection_term(term),
                 )
             }
+            ClauseKind::TypeOutlives(OutlivesPredicate(ty, region)) => {
+                if !(region.is_erased() || region.is_static()) {
+                    bug!("[invariant] regions should be erased or static in THIR: {region}");
+                }
+                SolClause::TypeOutlives(self.mk_type(ty))
+            }
+            ClauseKind::ConstArgHasType(cval, ty) => {
+                SolClause::ConstHasType(self.mk_const(cval), self.mk_type(ty))
+            }
+            ClauseKind::ConstEvaluatable(cval) => SolClause::ConstEvaluatable(self.mk_const(cval)),
 
             // unsupported
-            ClauseKind::ConstArgHasType(..)
-            | ClauseKind::ConstEvaluatable(..)
-            | ClauseKind::HostEffect(..) => {
+            ClauseKind::HostEffect(..) => {
                 bug!("[unsupported] clause");
             }
 
             // unexpected
-            ClauseKind::RegionOutlives(..) | ClauseKind::TypeOutlives(..) => {
-                bug!("[invariant] unexpected outlives clause {clause} in THIR");
+            ClauseKind::RegionOutlives(..) => {
+                bug!("[invariant] unexpected region outlives clause: {clause}");
             }
             ClauseKind::UnstableFeature(..) => {
-                bug!("[invariant] unexpected unstable feature clause {clause} in THIR");
+                bug!("[invariant] unexpected unstable feature clause: {clause}");
             }
         };
 
@@ -774,19 +782,22 @@ impl<'tcx> ExecBuilder<'tcx> {
                 );
                 SolType::Opaque(Box::new(actual_ty))
             }
-            ty::Alias(AliasTyKind::Free, _) => bug!("[invariant] free alias type: {ty}"),
+            ty::Alias(AliasTyKind::Free, _) => {
+                let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
+                assert_ne!(norm_ty, ty, "[invariant] free alias type should be normalized");
+                SolType::Opaque(Box::new(self.mk_type(norm_ty)))
+            }
 
             // unsupported
             ty::Coroutine(..) | ty::CoroutineClosure(..) | ty::CoroutineWitness(..) => {
                 bug!("[unsupported] coroutine type")
             }
+            ty::UnsafeBinder(..) => {
+                bug!("[unsupported] unsafe binder")
+            }
 
             // unexpected
-            ty::Infer(..)
-            | ty::Bound(..)
-            | ty::UnsafeBinder(..)
-            | ty::Placeholder(..)
-            | ty::Error(..) => {
+            ty::Infer(..) | ty::Bound(..) | ty::Placeholder(..) | ty::Error(..) => {
                 bug!("[invariant] unexpected type: {ty}")
             }
         };
@@ -1920,6 +1931,9 @@ pub(crate) enum SolClause {
     TraitNotImpl(SolIdent, Vec<SolGenericArg>),
     WellFormed(SolProjTerm),
     Projection(SolProjTerm, SolProjTerm),
+    TypeOutlives(SolType),
+    ConstHasType(SolConst, SolType),
+    ConstEvaluatable(SolConst),
 }
 
 /*
