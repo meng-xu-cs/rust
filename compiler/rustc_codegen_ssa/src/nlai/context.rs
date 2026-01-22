@@ -375,8 +375,8 @@ impl<'tcx> ExecBuilder<'tcx> {
             GenericArgKind::Type(ty) => SolGenericArg::Type(self.mk_type(ty)),
             GenericArgKind::Const(val) => SolGenericArg::Const(self.mk_const(val)),
             GenericArgKind::Lifetime(region) => {
-                if !region.is_erased() {
-                    bug!("[invariant] regions not erased in THIR: {region}");
+                if !(region.is_erased() || region.is_static()) {
+                    bug!("[invariant] regions should be erased or static in THIR: {region}");
                 }
                 SolGenericArg::Lifetime
             }
@@ -662,8 +662,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
             }
             ty::Ref(region, referent_ty, mutability) => {
-                if !region.is_erased() {
-                    bug!("[invariant] regions not erased in THIR: {region}");
+                if !(region.is_erased() || region.is_static()) {
+                    bug!("[invariant] regions should be erased or static in THIR: {region}");
                 }
                 let sub_ty = self.mk_type(*referent_ty);
                 match mutability {
@@ -711,8 +711,8 @@ impl<'tcx> ExecBuilder<'tcx> {
 
             // dynamic
             ty::Dynamic(predicates, region) => {
-                if !region.is_erased() {
-                    bug!("[invariant] regions not erased in THIR: {region}");
+                if !(region.is_erased() || region.is_static()) {
+                    bug!("[invariant] regions should be erased or static in THIR: {region}");
                 }
                 let clauses = predicates
                     .iter()
