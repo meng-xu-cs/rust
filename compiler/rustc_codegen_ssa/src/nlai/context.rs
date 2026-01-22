@@ -26,6 +26,8 @@ use rustc_middle::ty::{
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
+use rustc_trait_selection::infer::TyCtxtInferExt;
+use rustc_trait_selection::traits;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -371,7 +373,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
                 SolExternAbi::System
             }
-            _ => bug!("[unsupported] ABI {:?}", abi),
+            _ => bug!("[unsupported] ABI"),
         }
     }
 
@@ -604,7 +606,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             ClauseKind::ConstArgHasType(..)
             | ClauseKind::ConstEvaluatable(..)
             | ClauseKind::HostEffect(..) => {
-                bug!("[unsupported] clause {clause} in THIR");
+                bug!("[unsupported] clause");
             }
 
             // unexpected
@@ -738,10 +740,33 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // alias
-            ty::Alias(AliasTyKind::Projection, _) | ty::Alias(AliasTyKind::Inherent, _) => {
-                let actual_ty =
-                    self.mk_type(self.tcx.normalize_erasing_regions(self.typing_env, ty));
-                SolType::Alias(Box::new(actual_ty))
+            ty::Alias(AliasTyKind::Projection, alias_ty) => {
+                let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
+                if norm_ty != ty {
+                    SolType::Alias(Box::new(self.mk_type(norm_ty)))
+                } else {
+                    // It is possible that normalization does not change the type, for example,
+                    // when the projection comes from a type parameter (which implements a trait),
+                    // e.g., <P as Foo>::T, where P is the type parameter of the THIR definition.
+                    let (trait_ref, own_ty_args) = alias_ty.trait_ref_and_own_args(self.tcx);
+                    let (trait_ident, trait_ty_args) =
+                        self.mk_trait(self.tcx.trait_def(trait_ref.def_id), trait_ref.args);
+                    let item_ty_args =
+                        own_ty_args.iter().map(|arg| self.mk_generic_arg(*arg)).collect();
+
+                    // construct the associated type
+                    SolType::Assoc {
+                        trait_ident,
+                        trait_ty_args,
+                        item_ident: self.mk_ident(alias_ty.def_id),
+                        item_ty_args,
+                    }
+                }
+            }
+            ty::Alias(AliasTyKind::Inherent, _) => {
+                let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
+                assert_ne!(norm_ty, ty, "[invariant] inherent alias type should be normalized");
+                SolType::Alias(Box::new(self.mk_type(norm_ty)))
             }
             ty::Alias(AliasTyKind::Opaque, alias_ty) => {
                 let actual_ty = self.mk_type(
@@ -753,7 +778,7 @@ impl<'tcx> ExecBuilder<'tcx> {
 
             // unsupported
             ty::Coroutine(..) | ty::CoroutineClosure(..) | ty::CoroutineWitness(..) => {
-                bug!("[unsupported] coroutine type: {ty}")
+                bug!("[unsupported] coroutine type")
             }
 
             // unexpected
@@ -806,19 +831,32 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
             ConstKind::Value(val) => SolConst::Value(self.mk_value(val)),
 
+            // evaluate unevaluated constants
+            ConstKind::Unevaluated(_) => {
+                // evaluate it with an inference context
+                let evaluated = traits::try_evaluate_const(
+                    &self.tcx.infer_ctxt().build(self.typing_env.typing_mode),
+                    cval,
+                    self.typing_env.param_env,
+                )
+                .unwrap_or_else(|_| bug!("[unsupported] unevaluatable const"));
+
+                if matches!(evaluated.kind(), ConstKind::Unevaluated(_)) {
+                    bug!("[invariant] unable to fully evaluate const: {cval} -> {evaluated}");
+                }
+                self.mk_const(evaluated)
+            }
+
             // unsupported
             ConstKind::Expr(..) => {
-                bug!("[unsupported] const expr {cval}")
+                bug!("[unsupported] const expr")
             }
 
             // unexpected
             ConstKind::Infer(..)
             | ConstKind::Bound(..)
-            | ConstKind::Unevaluated(..)
             | ConstKind::Placeholder(..)
-            | ConstKind::Error(..) => {
-                bug!("[invariant] unexpected const {cval}")
-            }
+            | ConstKind::Error(..) => bug!("[invariant] unexpected const: {cval}"),
         };
 
         self.log_stack.pop();
@@ -1795,6 +1833,12 @@ pub(crate) enum SolType {
     FnPtr(SolExternAbi, Vec<SolType>, Box<SolType>),
     // dynamic types
     Dynamic(Vec<SolClause>),
+    Assoc {
+        trait_ident: SolIdent,
+        trait_ty_args: Vec<SolGenericArg>,
+        item_ident: SolIdent,
+        item_ty_args: Vec<SolGenericArg>,
+    },
     // alias types
     Alias(Box<SolType>),
     Opaque(Box<SolType>),
