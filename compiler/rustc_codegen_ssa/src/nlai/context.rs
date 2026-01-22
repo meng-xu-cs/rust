@@ -18,10 +18,11 @@ use rustc_middle::thir::{
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
-    AdtDef, AdtKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig, GenericArg,
-    GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, List, ParamConst,
-    ParamTy, Pattern, PatternKind, PredicatePolarity, ScalarInt, Term, TermKind, TraitDef,
-    TraitPredicate, Ty, TyCtxt, UpvarArgs, ValTreeKind, Value, VariantDiscr,
+    AdtDef, AdtKind, AliasTyKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig,
+    GenericArg, GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, List,
+    ParamConst, ParamTy, Pattern, PatternKind, PredicatePolarity, ProjectionPredicate, ScalarInt,
+    Term, TermKind, TraitDef, TraitPredicate, Ty, TyCtxt, TypingEnv, UpvarArgs, ValTreeKind, Value,
+    VariantDiscr,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
@@ -48,6 +49,9 @@ struct BaseBuilder<'tcx> {
 struct ExecBuilder<'tcx> {
     /// compiler context
     tcx: TyCtxt<'tcx>,
+
+    /// typing env, for normalization and region erasure
+    typing_env: TypingEnv<'tcx>,
 
     /// base builder
     base: BaseBuilder<'tcx>,
@@ -282,8 +286,10 @@ impl<'tcx> ExecBuilder<'tcx> {
         owner_id: OwnerId,
         generics: Vec<SolGenericParam>,
     ) -> Self {
+        let tcx = base.tcx;
         Self {
-            tcx: base.tcx,
+            tcx,
+            typing_env: TypingEnv::post_analysis(tcx, owner_id).with_post_analysis_normalized(tcx),
             base,
             owner_id,
             generics,
@@ -349,7 +355,7 @@ impl<'tcx> ExecBuilder<'tcx> {
         safety: Safety,
     ) -> SolExternAbi {
         match abi {
-            ExternAbi::Rust => {
+            ExternAbi::Rust | ExternAbi::RustCall => {
                 if c_variadic {
                     bug!("[invariant] Rust ABI should not be variadic");
                 }
@@ -570,10 +576,9 @@ impl<'tcx> ExecBuilder<'tcx> {
     pub(crate) fn mk_clause(&mut self, clause: Clause<'tcx>) -> SolClause {
         self.log_stack.push("Clause", format!("{clause}"));
 
-        let parsed = match clause
-            .kind()
-            .no_bound_vars()
-            .unwrap_or_else(|| bug!("[unsupported] higher-ranked clause: {clause}"))
+        let parsed = match self
+            .tcx
+            .normalize_erasing_late_bound_regions(self.typing_env, clause.kind())
         {
             ClauseKind::Trait(TraitPredicate { trait_ref, polarity }) => {
                 let (trait_ident, trait_ty_args) =
@@ -588,9 +593,11 @@ impl<'tcx> ExecBuilder<'tcx> {
             ClauseKind::WellFormed(term) => SolClause::WellFormed(self.mk_projection_term(term)),
 
             // might be supported later, together with alias type
-            ClauseKind::Projection(..) => {
-                // FIXME: support alias projection
-                bug!("[unsupported] alias projection {clause}")
+            ClauseKind::Projection(ProjectionPredicate { projection_term, term }) => {
+                SolClause::Projection(
+                    self.mk_projection_term(projection_term.to_term(self.tcx)),
+                    self.mk_projection_term(term),
+                )
             }
 
             // unsupported
@@ -705,9 +712,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                 SolType::Closure(ident, generic_args)
             }
             ty::FnPtr(sig_binder, FnHeader { c_variadic, abi, safety }) => {
-                let sig = sig_binder
-                    .no_bound_vars()
-                    .unwrap_or_else(|| bug!("[unsupported] higher-ranked fn ptr type: {ty}"));
+                let sig =
+                    self.tcx.normalize_erasing_late_bound_regions(self.typing_env, *sig_binder);
                 let abi = self.mk_abi(*abi, *c_variadic, *safety);
 
                 let ret_ty = self.mk_type(sig.output());
@@ -732,13 +738,18 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // alias
-            ty::Alias(_, alias_ty) => {
-                // FIXME: re-enable finer-grained definition for alias types
+            ty::Alias(AliasTyKind::Projection, _) | ty::Alias(AliasTyKind::Inherent, _) => {
+                let actual_ty =
+                    self.mk_type(self.tcx.normalize_erasing_regions(self.typing_env, ty));
+                SolType::Alias(Box::new(actual_ty))
+            }
+            ty::Alias(AliasTyKind::Opaque, alias_ty) => {
                 let actual_ty = self.mk_type(
                     self.tcx.type_of(alias_ty.def_id).instantiate(self.tcx, alias_ty.args),
                 );
-                SolType::Alias(Box::new(actual_ty))
+                SolType::Opaque(Box::new(actual_ty))
             }
+            ty::Alias(AliasTyKind::Free, _) => bug!("[invariant] free alias type: {ty}"),
 
             // unsupported
             ty::Coroutine(..) | ty::CoroutineClosure(..) | ty::CoroutineWitness(..) => {
@@ -930,16 +941,16 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // strings
-            (LitKind::Str(v, _), ty::Str) => SolValue::Str(v.to_ident_string()),
-            (LitKind::ByteStr(v, _), ty::Slice(elem_ty))
-                if elem_ty.kind() == &ty::Uint(UintTy::U8) =>
+            (LitKind::Str(v, _), ty::Ref(_, inner_ty, Mutability::Not))
+                if matches!(inner_ty.kind(), ty::Str) =>
             {
-                SolValue::Slice(v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect())
+                SolValue::RefStr(v.to_ident_string())
             }
-            (LitKind::CStr(v, _), ty::Slice(elem_ty))
-                if elem_ty.kind() == &ty::Uint(UintTy::U8) =>
-            {
-                SolValue::Slice(v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect())
+            (LitKind::ByteStr(v, _), ty::Ref(_, inner_ty, Mutability::Not)) if matches!(inner_ty.kind(), ty::Slice(elem_ty) if matches!(elem_ty.kind(), ty::Uint(UintTy::U8))) => {
+                SolValue::RefSlice(v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect())
+            }
+            (LitKind::CStr(v, _), ty::Ref(_, inner_ty, Mutability::Not)) if matches!(inner_ty.kind(), ty::Slice(elem_ty) if matches!(elem_ty.kind(), ty::Uint(UintTy::U8))) => {
+                SolValue::RefSlice(v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect())
             }
 
             // unexpected
@@ -990,14 +1001,74 @@ impl<'tcx> ExecBuilder<'tcx> {
                     sig.inputs().iter().map(|input_ty| self.mk_type(*input_ty)).collect();
 
                 // parse parameters
-                if thir.params.len() != params.len() {
-                    bug!(
-                        "[invariant] parameter count mismatch: THIR has {} but signature has {}",
+                let mut param_iter = thir.params.iter_enumerated();
+                if thir.params.len() == params.len() + 1 {
+                    // special case for closure: first parameter is the closure environment
+                    let (index0, param0) = param_iter.next().unwrap();
+                    assert_eq!(index0.index(), 0, "[invariant] expect parameter index 0");
+
+                    let (closure_id, closure_ty_args) = match param0.ty.kind() {
+                        ty::Ref(_, inner_ty, Mutability::Not) => match inner_ty.kind() {
+                            ty::Closure(closure_id, closure_ty_args) => {
+                                (*closure_id, *closure_ty_args)
+                            }
+                            _ => bug!("[invariant] expect &closure as param 0: got {}", param0.ty),
+                        },
+                        _ => bug!("[invariant] expect &closure as param 0: got {}", param0.ty),
+                    };
+
+                    // sanity check with previous recordings
+                    assert_eq!(
+                        self.owner_id.to_def_id(),
+                        closure_id,
+                        "[invariant] closure id mismatch",
+                    );
+                    assert_eq!(
+                        self.generics.len(),
+                        closure_ty_args.len(),
+                        "[invariant] closure generics count mismatch",
+                    );
+
+                    /* FIXME: check closure generic arguments match (it currently does not hold)
+                    for (ty_arg, ty_param) in closure_ty_args.iter().zip(self.generics.clone()) {
+                        let parsed_ty_arg = self.mk_generic_arg(ty_arg);
+                        match (parsed_ty_arg, ty_param.kind) {
+                            (SolGenericArg::Type(ty), SolGenericKind::Type) => {
+                                assert_eq!(
+                                    ty,
+                                    SolType::Param(ty_param.ident),
+                                    "[invariant] closure generic type argument mismatch"
+                                );
+                            }
+                            (SolGenericArg::Const(cval), SolGenericKind::Const) => {
+                                assert_eq!(
+                                    cval,
+                                    SolConst::Param(ty_param.ident),
+                                    "[invariant] closure generic const argument mismatch"
+                                );
+                            }
+                            (SolGenericArg::Lifetime, SolGenericKind::Lifetime) => {
+                                // nothing to check for lifetime
+                            }
+                            _ => bug!("[invariant] closure generic argument/parameter mismatch"),
+                        }
+                    }
+                     */
+                } else {
+                    assert_eq!(
                         thir.params.len(),
-                        params.len()
+                        params.len(),
+                        "[invariant] parameter count mismatch",
                     );
                 }
-                // FIXME: record parameter patterns as well
+
+                // declared parameters should match type declarations
+                for (param_ty, (_param_id, param_decl)) in params.iter().zip(param_iter) {
+                    let declared_param_ty = self.mk_type(param_decl.ty);
+                    assert_eq!(param_ty, &declared_param_ty, "[invariant] parameter type mismatch");
+
+                    // FIXME: record parameter patterns as well
+                }
 
                 // parse the body expression
                 let body = self.mk_expr(thir, expr);
@@ -1503,6 +1574,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
         // unpack the exec builder
         let ExecBuilder {
             tcx: _,
+            typing_env: _,
             mut base,
             owner_id: _,
             generics,
@@ -1725,6 +1797,7 @@ pub(crate) enum SolType {
     Dynamic(Vec<SolClause>),
     // alias types
     Alias(Box<SolType>),
+    Opaque(Box<SolType>),
 }
 
 /// A pattern type
@@ -1802,6 +1875,7 @@ pub(crate) enum SolClause {
     TraitImpl(SolIdent, Vec<SolGenericArg>),
     TraitNotImpl(SolIdent, Vec<SolGenericArg>),
     WellFormed(SolProjTerm),
+    Projection(SolProjTerm, SolProjTerm),
 }
 
 /*
@@ -1838,8 +1912,8 @@ pub(crate) enum SolValue {
     F64(String),
     F128(String),
     // string
-    Str(String),
-    Slice(Vec<SolValue>),
+    RefStr(String),
+    RefSlice(Vec<SolValue>),
     // composite
     Tuple(Vec<SolValue>),
 }
