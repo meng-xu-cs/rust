@@ -6,7 +6,7 @@ use rustc_abi::ExternAbi;
 use rustc_ast::{AttrStyle, FloatTy, IntTy, LitFloatType, LitIntType, LitKind, Mutability, UintTy};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
-use rustc_hir::def_id::{DefId, LOCAL_CRATE};
+use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{
     Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, MatchSource, Mod, OwnerId, Safety,
 };
@@ -177,9 +177,15 @@ impl<'tcx> BaseBuilder<'tcx> {
     }
 
     /// Record a MIR node in the THIR body with its metadata
-    fn mk_mir<T: SolIR>(&mut self, hir_id: HirId, span: Span, data: T) -> SolMIR<T> {
+    fn mk_mir<T: SolIR>(
+        &mut self,
+        def_id: LocalDefId,
+        hir_id: HirId,
+        span: Span,
+        data: T,
+    ) -> SolMIR<T> {
         SolMIR {
-            ident: self.mk_ident(hir_id.expect_owner().to_def_id()),
+            ident: self.mk_ident(def_id.to_def_id()),
             span: self.mk_span(span),
             doc_comments: self.mk_doc_comments(hir_id),
             data,
@@ -248,7 +254,8 @@ impl<'tcx> BaseBuilder<'tcx> {
                 ItemKind::Mod(mod_ident, mod_content) => {
                     let module_data = self.mk_module(mod_ident.name, *mod_content);
                     self.mk_mir(
-                        HirId::make_owner(owner_id.def_id),
+                        owner_id.def_id,
+                        item_id.hir_id(),
                         span,
                         SolItem::Module(module_data),
                     )
@@ -1416,10 +1423,11 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
 
     // recursively build the modules starting from the root module
     let module_data = base_builder.mk_module(tcx.crate_name(LOCAL_CRATE), *tcx.hir_root_module());
-    let module_mir = base_builder.mk_mir(CRATE_HIR_ID, DUMMY_SP, module_data);
+    let module_mir = base_builder.mk_mir(CRATE_DEF_ID, CRATE_HIR_ID, DUMMY_SP, module_data);
 
     // process all body owners in this crate
     let mut bundles = vec![];
+
     for owner_id in tcx.hir_body_owners() {
         let def_id = owner_id.to_def_id();
         let def_desc = util_debug_symbol(tcx, def_id, &List::empty());
@@ -1450,8 +1458,8 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             let param_name = SolParamName(param_symbol.to_ident_string());
             let param_kind = match param_def_kind {
                 GenericParamDefKind::Lifetime => SolGenericKind::Lifetime,
-                GenericParamDefKind::Type { .. } => SolGenericKind::Type,
-                GenericParamDefKind::Const { .. } => SolGenericKind::Const,
+                GenericParamDefKind::Type { has_default: _, synthetic: _ } => SolGenericKind::Type,
+                GenericParamDefKind::Const { has_default: _ } => SolGenericKind::Const,
             };
             bundle_generics.push(SolGenericParam {
                 ident: param_ident,
@@ -1512,8 +1520,8 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
         }
 
         // complete the bundle construction
-        let hir_id = HirId::make_owner(owner_id);
-        let exec_full = base.mk_mir(hir_id, tcx.hir_span_with_body(hir_id), exec);
+        let hir_id = tcx.local_def_id_to_hir_id(owner_id);
+        let exec_full = base.mk_mir(owner_id, hir_id, tcx.hir_span_with_body(hir_id), exec);
         bundles.push(SolBundle {
             generics,
             adt_defs: flat_adt_defs,
