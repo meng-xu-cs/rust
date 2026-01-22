@@ -568,10 +568,12 @@ impl<'tcx> ExecBuilder<'tcx> {
 
     /// Record a clause in a predicate
     pub(crate) fn mk_clause(&mut self, clause: Clause<'tcx>) -> SolClause {
-        match clause
+        self.log_stack.push("Clause", format!("{clause}"));
+
+        let parsed = match clause
             .kind()
             .no_bound_vars()
-            .unwrap_or_else(|| bug!("[unsupported] higher-ranked clause {clause}"))
+            .unwrap_or_else(|| bug!("[unsupported] higher-ranked clause: {clause}"))
         {
             ClauseKind::Trait(TraitPredicate { trait_ref, polarity }) => {
                 let (trait_ident, trait_ty_args) =
@@ -605,12 +607,17 @@ impl<'tcx> ExecBuilder<'tcx> {
             ClauseKind::UnstableFeature(..) => {
                 bug!("[invariant] unexpected unstable feature clause {clause} in THIR");
             }
-        }
+        };
+
+        self.log_stack.pop();
+        parsed
     }
 
     /// Record a type in MIR/THIR context
     pub(crate) fn mk_type(&mut self, ty: Ty<'tcx>) -> SolType {
-        match ty.kind() {
+        self.log_stack.push("Type", format!("{ty}"));
+
+        let parsed = match ty.kind() {
             // baseline
             ty::Never => SolType::Never,
 
@@ -700,7 +707,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::FnPtr(sig_binder, FnHeader { c_variadic, abi, safety }) => {
                 let sig = sig_binder
                     .no_bound_vars()
-                    .unwrap_or_else(|| bug!("[unsupported] higher-ranked fn ptr type {ty}"));
+                    .unwrap_or_else(|| bug!("[unsupported] higher-ranked fn ptr type: {ty}"));
                 let abi = self.mk_abi(*abi, *c_variadic, *safety);
 
                 let ret_ty = self.mk_type(sig.output());
@@ -735,7 +742,7 @@ impl<'tcx> ExecBuilder<'tcx> {
 
             // unsupported
             ty::Coroutine(..) | ty::CoroutineClosure(..) | ty::CoroutineWitness(..) => {
-                bug!("[unsupported] coroutine type {ty}")
+                bug!("[unsupported] coroutine type: {ty}")
             }
 
             // unexpected
@@ -744,9 +751,12 @@ impl<'tcx> ExecBuilder<'tcx> {
             | ty::UnsafeBinder(..)
             | ty::Placeholder(..)
             | ty::Error(..) => {
-                bug!("[invariant] unexpected type {ty}")
+                bug!("[invariant] unexpected type: {ty}")
             }
-        }
+        };
+
+        self.log_stack.pop();
+        parsed
     }
 
     /// Record a pattern in the THIR context
@@ -777,7 +787,9 @@ impl<'tcx> ExecBuilder<'tcx> {
 
     /// Record a constant in MIR/THIR context
     pub(crate) fn mk_const(&mut self, cval: Const<'tcx>) -> SolConst {
-        match cval.kind() {
+        self.log_stack.push("Const", format!("{cval}"));
+
+        let parsed = match cval.kind() {
             ConstKind::Param(ParamConst { index, name }) => {
                 SolConst::Param(self.get_param(index, name, SolGenericKind::Const))
             }
@@ -796,7 +808,10 @@ impl<'tcx> ExecBuilder<'tcx> {
             | ConstKind::Error(..) => {
                 bug!("[invariant] unexpected const {cval}")
             }
-        }
+        };
+
+        self.log_stack.pop();
+        parsed
     }
 
     /// Record a (constant) value in MIR/THIR context
