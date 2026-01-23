@@ -1124,13 +1124,21 @@ impl<'tcx> ExecBuilder<'tcx> {
                         closure_id,
                         "[invariant] closure id mismatch",
                     );
+
+                    /*
+                     * NOTE: the actual closure type arguments have three synthetic generics:
+                     * <closure_kind>: I16,
+                     * <closure_signature>: fn(..) -> ..
+                     * <upvars>: (..) (a.k.a, a tuple)
+                     * We skip these three synthetic type arguments in the generics declarations
+                     */
                     assert_eq!(
-                        self.generics.len(),
+                        self.generics.len() + 3,
                         closure_ty_args.len(),
                         "[invariant] closure generics count mismatch",
                     );
 
-                    /* FIXME: check closure generic arguments match (it currently does not hold)
+                    // sanity check that the closure type arguments matches the generic parameters
                     for (ty_arg, ty_param) in closure_ty_args.iter().zip(self.generics.clone()) {
                         let parsed_ty_arg = self.mk_generic_arg(ty_arg);
                         match (parsed_ty_arg, ty_param.kind) {
@@ -1154,7 +1162,6 @@ impl<'tcx> ExecBuilder<'tcx> {
                             _ => bug!("[invariant] closure generic argument/parameter mismatch"),
                         }
                     }
-                     */
                 } else {
                     assert_eq!(
                         thir.params.len(),
@@ -1619,11 +1626,16 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
         let def_id = owner_id.to_def_id();
         let def_desc = util_debug_symbol(tcx, def_id, &List::empty());
 
+        // check if the owner is a closure
+        let is_closure = tcx.is_closure_like(def_id);
+
         // skip coroutine-related owners
-        if matches!(
-            tcx.type_of(def_id).instantiate_identity().kind(),
-            ty::Coroutine(..) | ty::CoroutineClosure(..)
-        ) {
+        if is_closure
+            && matches!(
+                tcx.type_of(def_id).instantiate_identity().kind(),
+                ty::Coroutine(..) | ty::CoroutineClosure(..)
+            )
+        {
             continue;
         }
 
@@ -1653,7 +1665,18 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             let param_name = SolParamName(param_symbol.to_ident_string());
             let param_kind = match param_def_kind {
                 GenericParamDefKind::Lifetime => SolGenericKind::Lifetime,
-                GenericParamDefKind::Type { has_default: _, synthetic: _ } => SolGenericKind::Type,
+                GenericParamDefKind::Type { has_default: _, synthetic: _ } => {
+                    // skip injected type parameters in closures
+                    if is_closure
+                        && matches!(
+                            param_symbol.as_str(),
+                            "<closure_kind>" | "<closure_signature>" | "<upvars>"
+                        )
+                    {
+                        continue;
+                    }
+                    SolGenericKind::Type
+                }
                 GenericParamDefKind::Const { has_default: _ } => SolGenericKind::Const,
             };
             bundle_generics.push(SolGenericParam {
