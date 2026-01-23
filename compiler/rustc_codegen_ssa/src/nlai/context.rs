@@ -3,7 +3,10 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 
 use rustc_abi::ExternAbi;
-use rustc_ast::{AttrStyle, FloatTy, IntTy, LitFloatType, LitIntType, LitKind, Mutability, UintTy};
+use rustc_ast::{
+    AttrStyle, BindingMode, ByRef, FloatTy, IntTy, LitFloatType, LitIntType, LitKind, Mutability,
+    UintTy,
+};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
@@ -12,9 +15,9 @@ use rustc_hir::{
 };
 use rustc_middle::mir::{AssignOp, BinOp, BorrowKind, UnOp};
 use rustc_middle::thir::{
-    AdtExpr, AdtExprBase, Arm, Block, BlockId, BlockSafety, BodyTy, ClosureExpr, Expr, ExprId,
-    ExprKind, FieldExpr, FruInfo, LocalVarId, LogicalOp, Pat, PatKind, Stmt, StmtId, StmtKind,
-    Thir,
+    AdtExpr, AdtExprBase, Arm, Block, BlockId, BlockSafety, BodyTy, ClosureExpr,
+    DerefPatBorrowMode, Expr, ExprId, ExprKind, FieldExpr, FieldPat, FruInfo, LocalVarId,
+    LogicalOp, Pat, PatKind, Stmt, StmtId, StmtKind, Thir,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
@@ -342,9 +345,6 @@ impl<'tcx> ExecBuilder<'tcx> {
     fn mk_hir<T: SolIR>(&mut self, hir_id: HirId, data: T) -> SolHIR<T> {
         if hir_id.is_owner() {
             bug!("[invariant] expected non-owner HirId, found owner: {:?}", hir_id);
-        }
-        if hir_id.owner != self.owner_id {
-            bug!("[invariant] owner id mismatch: {:?} vs {:?}", self.owner_id, hir_id.owner);
         }
         SolHIR { doc_comments: self.mk_doc_comments(hir_id), data }
     }
@@ -829,9 +829,88 @@ impl<'tcx> ExecBuilder<'tcx> {
             PatKind::Wild => SolPatRule::Wild,
             PatKind::Never => SolPatRule::Never,
 
+            PatKind::Binding {
+                name,
+                mode: BindingMode(by_ref, mutability),
+                var,
+                ty,
+                subpattern,
+                is_primary: _,
+                is_shorthand: _,
+            } => {
+                let binding_mode = match (by_ref, mutability) {
+                    (ByRef::No, Mutability::Not) => SolBindMode::ByImmValue,
+                    (ByRef::No, Mutability::Mut) => SolBindMode::ByMutValue,
+                    (ByRef::Yes(_, Mutability::Not), Mutability::Not) => SolBindMode::ByImmRef,
+                    (ByRef::Yes(_, Mutability::Mut), Mutability::Mut) => SolBindMode::ByMutRef,
+                    _ => bug!("[invariant] invalid binding mode"),
+                };
+
+                let var_name = SolLocalVarName(name.to_ident_string());
+                let var_index = SolLocalVarIndex(var.0.local_id.index());
+                let var_type = self.mk_type(*ty);
+                let var_subpat = subpattern.as_ref().map(|sub_pat| Box::new(self.mk_pat(sub_pat)));
+                SolPatRule::Bind {
+                    name: var_name,
+                    var_id: var_index,
+                    ty: var_type,
+                    mode: binding_mode,
+                    subpat: var_subpat,
+                }
+            }
+            PatKind::Variant { adt_def, args, variant_index, subpatterns } => {
+                let (adt_ident, adt_ty_args) = self.mk_adt(*adt_def, args);
+                let variant = SolVariantIndex(variant_index.index());
+                let sub_pats = subpatterns
+                    .iter()
+                    .map(|FieldPat { field, pattern }| {
+                        (SolFieldIndex(field.index()), self.mk_pat(pattern))
+                    })
+                    .collect();
+                SolPatRule::Variant { adt_ident, adt_ty_args, variant, fields: sub_pats }
+            }
+            PatKind::Leaf { subpatterns } => {
+                let sub_pats = subpatterns
+                    .iter()
+                    .map(|FieldPat { field, pattern }| {
+                        (SolFieldIndex(field.index()), self.mk_pat(pattern))
+                    })
+                    .collect();
+                SolPatRule::Leaf { fields: sub_pats }
+            }
+            PatKind::Slice { box prefix, slice, box suffix } => {
+                let prefix_pats = prefix.iter().map(|pat| self.mk_pat(pat)).collect();
+                let slice_pat = slice.as_ref().map(|pat| Box::new(self.mk_pat(pat)));
+                let suffix_pats = suffix.iter().map(|pat| self.mk_pat(pat)).collect();
+                SolPatRule::Slice { prefix: prefix_pats, slice: slice_pat, suffix: suffix_pats }
+            }
+            PatKind::Array { prefix, slice, suffix } => {
+                let prefix_pats = prefix.iter().map(|pat| self.mk_pat(pat)).collect();
+                let slice_pat = slice.as_ref().map(|pat| Box::new(self.mk_pat(pat)));
+                let suffix_pats = suffix.iter().map(|pat| self.mk_pat(pat)).collect();
+                SolPatRule::Array { prefix: prefix_pats, slice: slice_pat, suffix: suffix_pats }
+            }
+
+            PatKind::Deref { subpattern } => SolPatRule::Deref(Box::new(self.mk_pat(subpattern))),
+            PatKind::DerefPattern { subpattern, borrow } => {
+                let sub_pat = Box::new(self.mk_pat(subpattern));
+                match borrow {
+                    DerefPatBorrowMode::Box => SolPatRule::DerefBox(sub_pat),
+                    DerefPatBorrowMode::Borrow(Mutability::Not) => SolPatRule::DerefImm(sub_pat),
+                    DerefPatBorrowMode::Borrow(Mutability::Mut) => SolPatRule::DerefMut(sub_pat),
+                }
+            }
+
+            PatKind::Constant { value } => SolPatRule::Constant(self.mk_value(*value)),
+            PatKind::Or { box pats } => {
+                SolPatRule::Or(pats.iter().map(|sub_pat| self.mk_pat(sub_pat)).collect())
+            }
+
+            // unsupported
+            PatKind::Range(..) => bug!("[unsupported] range pattern"),
+
             // unreachable
             PatKind::Error(..) => bug!("[invariant] unreachable pattern {kind:?}"),
-            _ => todo!(),
         };
 
         // construct the final pattern
@@ -1061,7 +1140,10 @@ impl<'tcx> ExecBuilder<'tcx> {
     /// Record a (constant) value for a ZST
     pub(crate) fn mk_value_from_zst(&mut self, ty: Ty<'tcx>) -> SolValue {
         self.mk_value_when_zst(ty).unwrap_or_else(|| {
-            bug!("[invariant] failed to create a value for ZST type {ty}");
+            bug!(
+                "[invariant] failed to create a value for ZST type {ty} with kind {:?}",
+                ty.kind()
+            );
         })
     }
 
@@ -1076,6 +1158,17 @@ impl<'tcx> ExecBuilder<'tcx> {
                     elem_vals.push(elem_val);
                 }
                 SolValue::Tuple(elem_vals)
+            }
+
+            ty::FnDef(def_id, ty_args) => {
+                let ident = self.mk_ident(*def_id);
+                let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+                SolValue::FuncDef(ident, generic_args)
+            }
+            ty::Closure(def_id, ty_args) => {
+                let ident = self.mk_ident(*def_id);
+                let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+                SolValue::Closure(ident, generic_args)
             }
 
             // FIXME: handle more ZST types
@@ -1206,6 +1299,7 @@ impl<'tcx> ExecBuilder<'tcx> {
     /// Record a THIR expression
     pub(crate) fn mk_expr(&mut self, thir: &Thir<'tcx>, expr_id: ExprId) -> SolExpr {
         let Expr { kind, ty, temp_scope_id: _, span } = &thir.exprs[expr_id];
+        self.log_stack.push("Expr", format!("{kind:?}"));
 
         // record type and span
         let expr_ty = self.mk_type(*ty);
@@ -1217,6 +1311,11 @@ impl<'tcx> ExecBuilder<'tcx> {
             ExprKind::Scope { region_scope: _, hir_id, value } => {
                 let inner_expr = self.mk_expr(thir, *value);
                 SolOp::Scope(self.mk_hir(*hir_id, inner_expr))
+            }
+            ExprKind::PlaceTypeAscription { source, user_ty: _, user_ty_span: _ }
+            | ExprKind::ValueTypeAscription { source, user_ty: _, user_ty_span: _ } => {
+                // FIXME: maybe record user type annocation as well?
+                SolOp::TypeAscribe(self.mk_expr(thir, *source))
             }
 
             // use
@@ -1235,15 +1334,11 @@ impl<'tcx> ExecBuilder<'tcx> {
             ExprKind::ConstParam { param: ParamConst { index, name }, def_id } => {
                 let param_ident = self.get_param(*index, *name, SolGenericKind::Const);
                 let const_ident = self.mk_ident(*def_id);
-                if param_ident != const_ident {
-                    bug!("[invariant] const param ident mismatch");
-                }
+                assert_eq!(param_ident, const_ident, "[invariant] const param ident mismatch",);
                 SolOp::ConstParam(param_ident)
             }
-            ExprKind::NamedConst { def_id, args, user_ty } => {
-                if user_ty.is_some() {
-                    bug!("[unsupported] named const with user type");
-                }
+            ExprKind::NamedConst { def_id, args, user_ty: _ } => {
+                // FIXME: maybe record user type annocation as well?
                 let const_ident = self.mk_ident(*def_id);
                 let generic_args = args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
                 SolOp::ConstValue(const_ident, generic_args)
@@ -1338,8 +1433,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                         SolOp::CastClosureFnPtr(operand, matches!(safety, Safety::Safe))
                     }
                     PointerCoercion::MutToConstPointer => SolOp::CastMutToConstPtr(operand),
-                    PointerCoercion::ArrayToPointer => SolOp::CastUnsizeAraryPtr(operand),
-                    PointerCoercion::Unsize => bug!("[invariant] unsize pointer coercion in THIR"),
+                    PointerCoercion::ArrayToPointer => SolOp::CastUnsizeArrayPtr(operand),
+                    PointerCoercion::Unsize => SolOp::CastUnsizeArrayRef(operand),
                 }
             }
             ExprKind::NeverToAny { source } => SolOp::NeverToAny(self.mk_expr(thir, *source)),
@@ -1358,14 +1453,10 @@ impl<'tcx> ExecBuilder<'tcx> {
                 adt_def,
                 variant_index,
                 args,
-                user_ty,
+                user_ty: _,
                 fields,
                 base: base_expr,
             }) => {
-                if user_ty.is_some() {
-                    bug!("[unsupported] ADT expr with user type");
-                }
-
                 // parse the definition
                 let (adt_ident, adt_args) = self.mk_adt(*adt_def, *args);
 
@@ -1387,6 +1478,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                         default_field_tys.iter().map(|field_ty| self.mk_type(*field_ty)).collect(),
                     ),
                 };
+
+                // FIXME: maybe record user type annocation as well?
 
                 // pack the ADT expression
                 SolOp::Adt {
@@ -1457,7 +1550,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             ExprKind::Let { expr, pat } => SolOp::Let(self.mk_expr(thir, *expr), self.mk_pat(pat)),
             ExprKind::Match { scrutinee, arms, match_source } => {
                 if matches!(match_source, MatchSource::AwaitDesugar) {
-                    bug!("[unsupported] match from await desugar");
+                    bug!("[unsupported] coroutine await match");
                 }
 
                 // parse scrutinee
@@ -1491,23 +1584,19 @@ impl<'tcx> ExecBuilder<'tcx> {
             // literals
             ExprKind::Literal { lit, neg } => {
                 if *neg {
-                    bug!("[unsupported] negated literal");
+                    bug!("[invariant] negated literal");
                 }
                 SolOp::BaseLiteral(
                     self.mk_value_from_lit_and_ty(lit.node, *ty),
                     self.mk_span(lit.span),
                 )
             }
-            ExprKind::NonHirLiteral { lit, user_ty } => {
-                if user_ty.is_some() {
-                    bug!("[unsupported] non-HIR literal with explicit user type");
-                }
+            ExprKind::NonHirLiteral { lit, user_ty: _ } => {
+                // FIXME: maybe record user type annocation as well?
                 SolOp::ScalarLiteral(self.mk_value_from_scalar(*ty, *lit))
             }
-            ExprKind::ZstLiteral { user_ty } => {
-                if user_ty.is_some() {
-                    bug!("[unsupported] ZST literal with explicit user type");
-                }
+            ExprKind::ZstLiteral { user_ty: _ } => {
+                // FIXME: maybe record user type annocation as well?
                 SolOp::ZstLiteral(self.mk_value_from_zst(*ty))
             }
 
@@ -1542,9 +1631,6 @@ impl<'tcx> ExecBuilder<'tcx> {
             ExprKind::ThreadLocalRef(..) => bug!("[unsupported] thread-local reference"),
             ExprKind::Become { .. } => bug!("[unsupported] become"),
 
-            ExprKind::PlaceTypeAscription { .. } => bug!("[unsupported] place type ascription"),
-            ExprKind::ValueTypeAscription { .. } => bug!("[unsupported] value type ascription"),
-
             ExprKind::WrapUnsafeBinder { .. } => bug!("[unsupported] wrap unsafe binder"),
             ExprKind::PlaceUnwrapUnsafeBinder { .. } => {
                 bug!("[unsupported] place unwrap unsafe binder")
@@ -1553,6 +1639,9 @@ impl<'tcx> ExecBuilder<'tcx> {
                 bug!("[unsupported] value unwrap unsafe binder")
             }
         };
+
+        // pop the log stack
+        self.log_stack.pop();
 
         // pack the expression
         SolExpr { ty: expr_ty, span: expr_span, op: Box::new(expr_op) }
@@ -2059,6 +2148,9 @@ pub(crate) enum SolValue {
     // composite
     Tuple(Vec<SolValue>),
     Array(SolType, Vec<SolValue>),
+    // function pointers
+    FuncDef(SolIdent, Vec<SolGenericArg>),
+    Closure(SolIdent, Vec<SolGenericArg>),
 }
 
 /*
@@ -2078,6 +2170,7 @@ pub(crate) struct SolExpr {
 pub(crate) enum SolOp {
     // markers
     Scope(SolHIR<SolExpr>),
+    TypeAscribe(SolExpr),
     // use
     Use(SolExpr),
     VarRef(SolLocalVarIndex),
@@ -2168,7 +2261,8 @@ pub(crate) enum SolOp {
     CastUnsafeFnPtr(SolExpr),
     CastClosureFnPtr(SolExpr, bool),
     CastMutToConstPtr(SolExpr),
-    CastUnsizeAraryPtr(SolExpr),
+    CastUnsizeArrayPtr(SolExpr),
+    CastUnsizeArrayRef(SolExpr),
     NeverToAny(SolExpr),
     // access
     Field {
@@ -2240,6 +2334,47 @@ pub(crate) enum SolPatRule {
     Missing,
     Wild,
     Never,
+    Bind {
+        name: SolLocalVarName,
+        var_id: SolLocalVarIndex,
+        mode: SolBindMode,
+        ty: SolType,
+        subpat: Option<Box<SolPattern>>,
+    },
+    Variant {
+        adt_ident: SolIdent,
+        adt_ty_args: Vec<SolGenericArg>,
+        variant: SolVariantIndex,
+        fields: Vec<(SolFieldIndex, SolPattern)>,
+    },
+    Leaf {
+        fields: Vec<(SolFieldIndex, SolPattern)>,
+    },
+    Slice {
+        prefix: Vec<SolPattern>,
+        slice: Option<Box<SolPattern>>,
+        suffix: Vec<SolPattern>,
+    },
+    Array {
+        prefix: Vec<SolPattern>,
+        slice: Option<Box<SolPattern>>,
+        suffix: Vec<SolPattern>,
+    },
+    Deref(Box<SolPattern>),
+    DerefBox(Box<SolPattern>),
+    DerefImm(Box<SolPattern>),
+    DerefMut(Box<SolPattern>),
+    Constant(SolValue),
+    Or(Vec<SolPattern>),
+}
+
+/// Binding mode
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolBindMode {
+    ByImmValue,
+    ByMutValue,
+    ByImmRef,
+    ByMutRef,
 }
 
 /// A match arm in THIR
@@ -2320,6 +2455,10 @@ pub(crate) struct SolModuleName(pub(crate) String);
 /// A parameter name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolParamName(pub(crate) String);
+
+/// A name to a local variable
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolLocalVarName(pub(crate) String);
 
 /// A index to a local variable
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
