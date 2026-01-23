@@ -981,22 +981,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                     ty::Array(elem_ty, _) => SolValue::Array(self.mk_type(*elem_ty), branch_values),
                     ty::Ref(_, inner_ty, _) => {
                         let inner_val = match inner_ty.kind() {
-                            ty::Str => SolValue::Str(
-                                String::from_utf8(
-                                    branch_values
-                                        .into_iter()
-                                        .map(|v| match v {
-                                            SolValue::U8(b) => b,
-                                            _ => bug!(
-                                                "[invariant] type mismatch for str valtree branch"
-                                            ),
-                                        })
-                                        .collect(),
-                                )
-                                .unwrap_or_else(|_| {
-                                    bug!("[invariant] invalid utf-8 in str valtree branch")
-                                }),
-                            ),
+                            ty::Str => SolValue::Str(util_values_to_string(&branch_values)),
                             ty::Slice(elem_ty) => {
                                 SolValue::Slice(self.mk_type(*elem_ty), branch_values)
                             }
@@ -1004,6 +989,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                         };
                         SolValue::Ref(Box::new(inner_val))
                     }
+                    ty::Str => SolValue::Str(util_values_to_string(&branch_values)),
                     // FIXME: handle more types
                     _ => bug!("[invariant] unhandled type for valtree branch: {ty}"),
                 }
@@ -1606,15 +1592,11 @@ impl<'tcx> ExecBuilder<'tcx> {
             ExprKind::Block { block } => SolOp::Block(self.mk_block(thir, *block)),
 
             // literals
-            ExprKind::Literal { lit, neg } => {
-                if *neg {
-                    bug!("[invariant] negated literal");
-                }
-                SolOp::BaseLiteral(
-                    self.mk_value_from_lit_and_ty(lit.node, *ty),
-                    self.mk_span(lit.span),
-                )
-            }
+            ExprKind::Literal { lit, neg } => SolOp::BaseLiteral(
+                *neg,
+                self.mk_value_from_lit_and_ty(lit.node, *ty),
+                self.mk_span(lit.span),
+            ),
             ExprKind::NonHirLiteral { lit, user_ty: _ } => {
                 // FIXME: maybe record user type annocation as well?
                 SolOp::ScalarLiteral(self.mk_value_from_scalar(*ty, *lit))
@@ -2339,7 +2321,7 @@ pub(crate) enum SolOp {
     // compound
     Block(SolBlock),
     // literals
-    BaseLiteral(SolValue, SolSpan),
+    BaseLiteral(bool, SolValue, SolSpan),
     ScalarLiteral(SolValue),
     ZstLiteral(SolValue),
     // closure
@@ -2577,4 +2559,19 @@ fn util_debug_symbol<'tcx>(
     } else {
         path_str
     }
+}
+
+/// helper for unpacking strings
+#[inline]
+fn util_values_to_string(bytes: &[SolValue]) -> String {
+    String::from_utf8(
+        bytes
+            .iter()
+            .map(|v| match v {
+                SolValue::U8(b) => *b,
+                _ => bug!("[invariant] expect u8 value for string bytes"),
+            })
+            .collect(),
+    )
+    .unwrap_or_else(|_| bug!("[invariant] invalid utf-8 string"))
 }
