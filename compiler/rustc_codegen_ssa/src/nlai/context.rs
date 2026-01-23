@@ -450,6 +450,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                         index: SolFieldIndex(field_idx.index()),
                         name: SolFieldName(field_def.name.to_ident_string()),
                         ty: self.mk_type(field_def.ty(self.tcx, ty_args)),
+                        default: field_def.value.map(|did| self.mk_ident(did)),
                     })
                     .collect();
                 SolAdtDef::Struct { fields }
@@ -466,6 +467,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                         index: SolFieldIndex(field_idx.index()),
                         name: SolFieldName(field_def.name.to_ident_string()),
                         ty: self.mk_type(field_def.ty(self.tcx, ty_args)),
+                        default: field_def.value.map(|did| self.mk_ident(did)),
                     })
                     .collect();
                 SolAdtDef::Union { fields }
@@ -498,9 +500,9 @@ impl<'tcx> ExecBuilder<'tcx> {
                             index: SolFieldIndex(field_idx.index()),
                             name: SolFieldName(field_def.name.to_ident_string()),
                             ty: self.mk_type(field_def.ty(self.tcx, ty_args)),
+                            default: field_def.value.map(|did| self.mk_ident(did)),
                         })
                         .collect();
-                    // FIXME: should add default value for FieldDef
                     variants.push(SolVariant {
                         index: variant_index,
                         name: variant_name,
@@ -820,7 +822,7 @@ impl<'tcx> ExecBuilder<'tcx> {
         let pat_ty = self.mk_type(*ty);
         let pat_span = self.mk_span(*span);
 
-        // FIXME: right now we don't care about the extra info, but maybe we want to record them?
+        // MAYFIX: right now we don't care about the extra info, but maybe we want to record them?
 
         // parse the pattern kind
         let pat_rule = match kind {
@@ -1249,8 +1251,18 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
             ty::Ref(_, inner_ty, _) => SolValue::Ref(Box::new(self.mk_value_when_zst(*inner_ty)?)),
 
-            // FIXME: are there more ZST types?
-            _ => return None,
+            _ => {
+                // double check that we should have captured all ZST cases above
+                if self
+                    .tcx
+                    .layout_of(self.typing_env.as_query_input(ty))
+                    .unwrap_or_else(|_| bug!("[invariant] unable to query layout of {ty}"))
+                    .is_zst()
+                {
+                    bug!("[invariant] unhandled ZST type: {ty}")
+                }
+                return None;
+            }
         };
         Some(zst_val)
     }
@@ -1302,7 +1314,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 SolValue::Ref(Box::new(inner_val))
             }
 
-            // FIXME: handle more types
+            // we should have covered all branch cases above
             _ => bug!("[invariant] unhandled type for valtree branch: {ty}"),
         }
     }
@@ -1444,7 +1456,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
             ExprKind::PlaceTypeAscription { source, user_ty: _, user_ty_span: _ }
             | ExprKind::ValueTypeAscription { source, user_ty: _, user_ty_span: _ } => {
-                // FIXME: maybe record user type annocation as well?
+                // MAYFIX: maybe record user type annotation as well?
                 SolOp::TypeAscribe(self.mk_expr(thir, *source))
             }
 
@@ -1477,7 +1489,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 SolOp::ConstParam(param_ident)
             }
             ExprKind::NamedConst { def_id, args, user_ty: _ } => {
-                // FIXME: maybe record user type annocation as well?
+                // MAYFIX: maybe record user type annotation as well?
                 let const_ident = self.mk_ident(*def_id);
                 let generic_args = args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
                 SolOp::ConstValue(const_ident, generic_args)
@@ -1618,7 +1630,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                     ),
                 };
 
-                // FIXME: maybe record user type annocation as well?
+                // MAYFIX: maybe record user type annotation as well?
 
                 // pack the ADT expression
                 SolOp::Adt {
@@ -1727,11 +1739,11 @@ impl<'tcx> ExecBuilder<'tcx> {
                 self.mk_span(lit.span),
             ),
             ExprKind::NonHirLiteral { lit, user_ty: _ } => {
-                // FIXME: maybe record user type annocation as well?
+                // MAYFIX: record user type annotation as well?
                 SolOp::ScalarLiteral(self.mk_value_from_scalar(*ty, *lit))
             }
             ExprKind::ZstLiteral { user_ty: _ } => {
-                // FIXME: maybe record user type annocation as well?
+                // MAYFIX: record user type annotation as well?
                 SolOp::ZstLiteral(self.mk_value_from_zst(*ty))
             }
 
@@ -1753,7 +1765,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                     }
                 };
                 let closure_upvars = upvars.iter().map(|v| self.mk_expr(thir, *v)).collect();
-                // FIXME: maybe we should do something about the movability and fake reads as well?
+                // MAYFIX: maybe we should do something about the movability and fake reads as well?
                 SolOp::Closure(closure_ident, closure_ty_args, closure_upvars)
             }
 
@@ -2214,6 +2226,7 @@ pub(crate) struct SolField {
     pub(crate) index: SolFieldIndex,
     pub(crate) name: SolFieldName,
     pub(crate) ty: SolType,
+    pub(crate) default: Option<SolIdent>,
 }
 
 /// A field definition in an ADT
