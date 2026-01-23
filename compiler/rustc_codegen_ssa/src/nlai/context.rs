@@ -966,60 +966,8 @@ impl<'tcx> ExecBuilder<'tcx> {
             ValTreeKind::Leaf(leaf) => self.mk_value_from_scalar(val.ty, *leaf),
             ValTreeKind::Branch(box []) => self.mk_value_from_zst(ty),
             ValTreeKind::Branch(box branches) => {
-                let branch_consts: Vec<_> =
-                    branches.iter().map(|cval| self.mk_const(*cval)).collect();
-                match ty.kind() {
-                    // FIXME: we should check that the values and types are consistent
-                    ty::Tuple(_) => SolValue::Tuple(branch_consts),
-                    ty::Array(elem_ty, _) => SolValue::Array(self.mk_type(*elem_ty), branch_consts),
-                    ty::Slice(elem_ty) => SolValue::Slice(self.mk_type(*elem_ty), branch_consts),
-                    ty::Str => SolValue::Str(util_values_to_string(&branch_consts)),
-                    ty::Adt(def, ty_args) => {
-                        let (adt_ident, adt_ty_args) = self.mk_adt(*def, ty_args);
-                        match def.adt_kind() {
-                            AdtKind::Struct => {
-                                let variant = def.non_enum_variant();
-                                assert_eq!(
-                                    branch_consts.len(),
-                                    variant.fields.len(),
-                                    "[invariant] struct value field count mismatch"
-                                );
-                                SolValue::Struct(
-                                    adt_ident,
-                                    adt_ty_args,
-                                    variant
-                                        .fields
-                                        .iter_enumerated()
-                                        .zip(branch_consts)
-                                        .map(|((field_idx, _), branch_const)| {
-                                            (SolFieldIndex(field_idx.index()), branch_const)
-                                        })
-                                        .collect(),
-                                )
-                            }
-                            AdtKind::Enum => bug!("[unsupported] enum const value"),
-                            AdtKind::Union => bug!("[unsupported] union const value"),
-                        }
-                    }
-
-                    // reference types
-                    ty::Ref(_, inner_ty, _) => {
-                        let inner_val = match inner_ty.kind() {
-                            ty::Str => SolValue::Str(util_values_to_string(&branch_consts)),
-                            ty::Slice(elem_ty) => {
-                                SolValue::Slice(self.mk_type(*elem_ty), branch_consts)
-                            }
-                            ty::Array(elem_ty, _) => {
-                                SolValue::Array(self.mk_type(*elem_ty), branch_consts)
-                            }
-                            _ => bug!("[invariant] type mismatch for valtree branch: {ty}"),
-                        };
-                        SolValue::Ref(Box::new(inner_val))
-                    }
-
-                    // FIXME: handle more types
-                    _ => bug!("[invariant] unhandled type for valtree branch: {ty}"),
-                }
+                let consts: Vec<_> = branches.iter().map(|cval| self.mk_const(*cval)).collect();
+                self.mk_value_from_branch_consts(ty, consts)
             }
         }
     }
@@ -1046,10 +994,6 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::Float(FloatTy::F32) => SolValue::F32(scalar.to_f32().to_string()),
             ty::Float(FloatTy::F64) => SolValue::F64(scalar.to_f64().to_string()),
             ty::Float(FloatTy::F128) => SolValue::F128(scalar.to_f128().to_string()),
-            // reference
-            ty::Ref(_, inner_ty, _) => {
-                SolValue::Ref(Box::new(self.mk_value_from_scalar(*inner_ty, scalar)))
-            }
             ty::RawPtr(_, _) => {
                 if !scalar.is_null() {
                     bug!("[unsupported] non-null scalar pointer")
@@ -1058,6 +1002,13 @@ impl<'tcx> ExecBuilder<'tcx> {
                 // FIXME: record inner type
                 SolValue::PtrNull
             }
+
+            // reference
+            ty::Ref(_, inner_ty, _) => {
+                SolValue::Ref(Box::new(self.mk_value_from_scalar(*inner_ty, scalar)))
+            }
+
+            // unexpected
             _ => bug!("[invariant] unhandled scalar value {scalar} for type {ty}"),
         }
     }
@@ -1191,6 +1142,8 @@ impl<'tcx> ExecBuilder<'tcx> {
         match ty.kind() {
             ty::Str => SolValue::Str(String::new()),
             ty::Slice(elem_ty) => SolValue::Slice(self.mk_type(*elem_ty), vec![]),
+
+            // reference
             ty::Ref(_, inner_ty, _) => {
                 let inner_val = match inner_ty.kind() {
                     ty::Str => SolValue::Str(String::new()),
@@ -1199,6 +1152,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                 };
                 SolValue::Ref(Box::new(inner_val))
             }
+
+            // unexpected
             _ => bug!("[invariant] failed to create a value for ZST type {ty}"),
         }
     }
@@ -1298,6 +1253,58 @@ impl<'tcx> ExecBuilder<'tcx> {
             _ => return None,
         };
         Some(zst_val)
+    }
+
+    /// Record a (constant) value based on vector of branches
+    pub(crate) fn mk_value_from_branch_consts(
+        &mut self,
+        ty: Ty<'tcx>,
+        consts: Vec<SolConst>,
+    ) -> SolValue {
+        match ty.kind() {
+            // FIXME: we should check that the values and types are consistent
+            ty::Str => SolValue::Str(util_values_to_string(&consts)),
+            ty::Slice(elem_ty) => SolValue::Slice(self.mk_type(*elem_ty), consts),
+
+            ty::Tuple(_) => SolValue::Tuple(consts),
+            ty::Array(elem_ty, _) => SolValue::Array(self.mk_type(*elem_ty), consts),
+            ty::Adt(def, ty_args) => {
+                let (adt_ident, adt_ty_args) = self.mk_adt(*def, ty_args);
+                match def.adt_kind() {
+                    AdtKind::Struct => {
+                        let variant = def.non_enum_variant();
+                        assert_eq!(
+                            consts.len(),
+                            variant.fields.len(),
+                            "[invariant] struct value field count mismatch"
+                        );
+                        SolValue::Struct(
+                            adt_ident,
+                            adt_ty_args,
+                            variant
+                                .fields
+                                .iter_enumerated()
+                                .zip(consts)
+                                .map(|((field_idx, _), field_const)| {
+                                    (SolFieldIndex(field_idx.index()), field_const)
+                                })
+                                .collect(),
+                        )
+                    }
+                    AdtKind::Enum => bug!("[unsupported] enum const value"),
+                    AdtKind::Union => bug!("[unsupported] union const value"),
+                }
+            }
+
+            // reference types
+            ty::Ref(_, inner_ty, _) => {
+                let inner_val = self.mk_value_from_branch_consts(*inner_ty, consts);
+                SolValue::Ref(Box::new(inner_val))
+            }
+
+            // FIXME: handle more types
+            _ => bug!("[invariant] unhandled type for valtree branch: {ty}"),
+        }
     }
 
     /// Record a executable, i.e., a THIR body (for a function or a constant/static)
