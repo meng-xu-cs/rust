@@ -966,30 +966,57 @@ impl<'tcx> ExecBuilder<'tcx> {
             ValTreeKind::Leaf(leaf) => self.mk_value_from_scalar(val.ty, *leaf),
             ValTreeKind::Branch(box []) => self.mk_value_from_zst(ty),
             ValTreeKind::Branch(box branches) => {
-                let branch_values: Vec<_> = branches
-                    .iter()
-                    .map(|cval| match self.mk_const(*cval) {
-                        SolConst::Value(sval) => sval,
-                        SolConst::Param(_) => {
-                            bug!("[invariant] expected value const in valtree branch")
-                        }
-                    })
-                    .collect();
-
+                let branch_consts: Vec<_> =
+                    branches.iter().map(|cval| self.mk_const(*cval)).collect();
                 match ty.kind() {
                     // FIXME: we should check that the values and types are consistent
-                    ty::Array(elem_ty, _) => SolValue::Array(self.mk_type(*elem_ty), branch_values),
+                    ty::Tuple(_) => SolValue::Tuple(branch_consts),
+                    ty::Array(elem_ty, _) => SolValue::Array(self.mk_type(*elem_ty), branch_consts),
+                    ty::Slice(elem_ty) => SolValue::Slice(self.mk_type(*elem_ty), branch_consts),
+                    ty::Str => SolValue::Str(util_values_to_string(&branch_consts)),
+                    ty::Adt(def, ty_args) => {
+                        let (adt_ident, adt_ty_args) = self.mk_adt(*def, ty_args);
+                        match def.adt_kind() {
+                            AdtKind::Struct => {
+                                let variant = def.non_enum_variant();
+                                assert_eq!(
+                                    branch_consts.len(),
+                                    variant.fields.len(),
+                                    "[invariant] struct value field count mismatch"
+                                );
+                                SolValue::Struct(
+                                    adt_ident,
+                                    adt_ty_args,
+                                    variant
+                                        .fields
+                                        .iter_enumerated()
+                                        .zip(branch_consts)
+                                        .map(|((field_idx, _), branch_const)| {
+                                            (SolFieldIndex(field_idx.index()), branch_const)
+                                        })
+                                        .collect(),
+                                )
+                            }
+                            AdtKind::Enum => bug!("[unsupported] enum const value"),
+                            AdtKind::Union => bug!("[unsupported] union const value"),
+                        }
+                    }
+
+                    // reference types
                     ty::Ref(_, inner_ty, _) => {
                         let inner_val = match inner_ty.kind() {
-                            ty::Str => SolValue::Str(util_values_to_string(&branch_values)),
+                            ty::Str => SolValue::Str(util_values_to_string(&branch_consts)),
                             ty::Slice(elem_ty) => {
-                                SolValue::Slice(self.mk_type(*elem_ty), branch_values)
+                                SolValue::Slice(self.mk_type(*elem_ty), branch_consts)
+                            }
+                            ty::Array(elem_ty, _) => {
+                                SolValue::Array(self.mk_type(*elem_ty), branch_consts)
                             }
                             _ => bug!("[invariant] type mismatch for valtree branch: {ty}"),
                         };
                         SolValue::Ref(Box::new(inner_val))
                     }
-                    ty::Str => SolValue::Str(util_values_to_string(&branch_values)),
+
                     // FIXME: handle more types
                     _ => bug!("[invariant] unhandled type for valtree branch: {ty}"),
                 }
@@ -1118,13 +1145,19 @@ impl<'tcx> ExecBuilder<'tcx> {
                     ty::Slice(elem_ty) if matches!(elem_ty.kind(), ty::Uint(UintTy::U8)) => {
                         SolValue::Slice(
                             SolType::U8,
-                            v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect(),
+                            v.as_byte_str()
+                                .iter()
+                                .map(|b| SolConst::Value(SolValue::U8(*b)))
+                                .collect(),
                         )
                     }
                     ty::Array(elem_ty, _) if matches!(elem_ty.kind(), ty::Uint(UintTy::U8)) => {
                         SolValue::Array(
                             SolType::U8,
-                            v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect(),
+                            v.as_byte_str()
+                                .iter()
+                                .map(|b| SolConst::Value(SolValue::U8(*b)))
+                                .collect(),
                         )
                     }
                     _ => bug!("[invariant] literal and type mismatch: {lit} vs {ty}"),
@@ -1134,12 +1167,15 @@ impl<'tcx> ExecBuilder<'tcx> {
             (LitKind::CStr(v, _), ty::Ref(_, inner_ty, Mutability::Not)) if matches!(inner_ty.kind(), ty::Slice(elem_ty) if matches!(elem_ty.kind(), ty::Uint(UintTy::U8))) => {
                 SolValue::Ref(Box::new(SolValue::Slice(
                     SolType::U8,
-                    v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect(),
+                    v.as_byte_str().iter().map(|b| SolConst::Value(SolValue::U8(*b))).collect(),
                 )))
             }
 
             // unexpected
             (LitKind::Err(_), _) => bug!("[invariant] unexpected literal {lit}"),
+
+            // unsupported
+            (_, ty::Pat(..)) => bug!("[unsupported] literal for pattern type"),
 
             // all other cases are considered type mismatches
             _ => bug!("[invariant] literal and type mismatch: {lit} vs {ty}"),
@@ -1171,7 +1207,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let mut elem_vals = vec![];
                 for elem_ty in elems.iter() {
                     let elem_val = self.mk_value_when_zst(elem_ty)?;
-                    elem_vals.push(elem_val);
+                    elem_vals.push(SolConst::Value(elem_val));
                 }
                 SolValue::Tuple(elem_vals)
             }
@@ -1182,7 +1218,10 @@ impl<'tcx> ExecBuilder<'tcx> {
                     SolValue::Array(self.mk_type(*elem_ty), vec![])
                 } else {
                     let elem_val = self.mk_value_when_zst(*elem_ty)?;
-                    SolValue::Array(self.mk_type(*elem_ty), vec![elem_val; size as usize])
+                    SolValue::Array(
+                        self.mk_type(*elem_ty),
+                        vec![SolConst::Value(elem_val); size as usize],
+                    )
                 }
             }
             ty::Adt(def, ty_args) => {
@@ -1195,7 +1234,10 @@ impl<'tcx> ExecBuilder<'tcx> {
                         for (field_idx, field_def) in variant.fields.iter_enumerated() {
                             let field_val =
                                 self.mk_value_when_zst(field_def.ty(self.tcx, ty_args))?;
-                            fields.push((SolFieldIndex(field_idx.index()), field_val));
+                            fields.push((
+                                SolFieldIndex(field_idx.index()),
+                                SolConst::Value(field_val),
+                            ));
                         }
                         SolValue::Struct(adt_ident, adt_ty_args, fields)
                     }
@@ -1208,7 +1250,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                             adt_ident,
                             adt_ty_args,
                             SolFieldIndex(field_idx.index()),
-                            Box::new(field_val),
+                            Box::new(SolConst::Value(field_val)),
                         )
                     }
                     AdtKind::Enum => {
@@ -1221,7 +1263,10 @@ impl<'tcx> ExecBuilder<'tcx> {
                         for (field_idx, field_def) in variant_def.fields.iter_enumerated() {
                             let field_val =
                                 self.mk_value_when_zst(field_def.ty(self.tcx, ty_args))?;
-                            fields.push((SolFieldIndex(field_idx.index()), field_val));
+                            fields.push((
+                                SolFieldIndex(field_idx.index()),
+                                SolConst::Value(field_val),
+                            ));
                         }
                         SolValue::Enum(
                             adt_ident,
@@ -2224,12 +2269,12 @@ pub(crate) enum SolValue {
     // string
     Str(String),
     // composite
-    Tuple(Vec<SolValue>),
-    Slice(SolType, Vec<SolValue>),
-    Array(SolType, Vec<SolValue>),
-    Struct(SolIdent, Vec<SolGenericArg>, Vec<(SolFieldIndex, SolValue)>),
-    Union(SolIdent, Vec<SolGenericArg>, SolFieldIndex, Box<SolValue>),
-    Enum(SolIdent, Vec<SolGenericArg>, SolVariantIndex, Vec<(SolFieldIndex, SolValue)>),
+    Tuple(Vec<SolConst>),
+    Slice(SolType, Vec<SolConst>),
+    Array(SolType, Vec<SolConst>),
+    Struct(SolIdent, Vec<SolGenericArg>, Vec<(SolFieldIndex, SolConst)>),
+    Union(SolIdent, Vec<SolGenericArg>, SolFieldIndex, Box<SolConst>),
+    Enum(SolIdent, Vec<SolGenericArg>, SolVariantIndex, Vec<(SolFieldIndex, SolConst)>),
     // reference
     Ref(Box<SolValue>),
     PtrNull,
@@ -2640,12 +2685,12 @@ fn util_debug_symbol<'tcx>(
 
 /// helper for unpacking strings
 #[inline]
-fn util_values_to_string(bytes: &[SolValue]) -> String {
+fn util_values_to_string(bytes: &[SolConst]) -> String {
     String::from_utf8(
         bytes
             .iter()
             .map(|v| match v {
-                SolValue::U8(b) => *b,
+                SolConst::Value(SolValue::U8(b)) => *b,
                 _ => bug!("[invariant] expect u8 value for string bytes"),
             })
             .collect(),
