@@ -1019,7 +1019,15 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::Float(FloatTy::F32) => SolValue::F32(scalar.to_f32().to_string()),
             ty::Float(FloatTy::F64) => SolValue::F64(scalar.to_f64().to_string()),
             ty::Float(FloatTy::F128) => SolValue::F128(scalar.to_f128().to_string()),
-            _ => todo!(),
+            // reference
+            ty::Ref(_, inner_ty, _) => {
+                SolValue::Ref(Box::new(self.mk_value_from_scalar(*inner_ty, scalar)))
+            }
+            ty::RawPtr(_, _) if scalar.is_null() => {
+                // FIXME: record inner type
+                SolValue::PtrNull
+            }
+            _ => bug!("[invariant] unhandled scalar value {scalar} for type {ty}"),
         }
     }
 
@@ -1144,6 +1152,9 @@ impl<'tcx> ExecBuilder<'tcx> {
             // special-case for empty string
             match ty.kind() {
                 ty::Str => SolValue::Str(String::new()),
+                ty::Ref(_, inner_ty, _) if inner_ty.is_str() => {
+                    SolValue::Ref(Box::new(SolValue::Str(String::new())))
+                }
                 _ => bug!(
                     "[invariant] failed to create a value for ZST type {ty} with kind {:?}",
                     ty.kind()
@@ -1232,6 +1243,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
                 SolValue::Closure(ident, generic_args)
             }
+            ty::Ref(_, inner_ty, _) => SolValue::Ref(Box::new(self.mk_value_when_zst(*inner_ty)?)),
 
             // FIXME: are there more ZST types?
             _ => return None,
@@ -2220,6 +2232,7 @@ pub(crate) enum SolValue {
     Enum(SolIdent, Vec<SolGenericArg>, SolVariantIndex, Vec<(SolFieldIndex, SolValue)>),
     // reference
     Ref(Box<SolValue>),
+    PtrNull,
     // function pointers
     FuncDef(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
