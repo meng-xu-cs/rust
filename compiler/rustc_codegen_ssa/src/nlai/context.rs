@@ -996,18 +996,26 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::Float(FloatTy::F32) => SolValue::F32(scalar.to_f32().to_string()),
             ty::Float(FloatTy::F64) => SolValue::F64(scalar.to_f64().to_string()),
             ty::Float(FloatTy::F128) => SolValue::F128(scalar.to_f128().to_string()),
-            ty::RawPtr(_, _) => {
+            ty::RawPtr(inner_ty, mutability) => {
                 if !scalar.is_null() {
-                    bug!("[unsupported] non-null scalar pointer")
+                    bug!("[unsupported] non-null scalar pointer");
                 }
 
-                // FIXME: record inner type
-                SolValue::PtrNull
+                // as far as we concern, only null pointers are meaningful constant values
+                let pointee_ty = self.mk_type(*inner_ty);
+                match mutability {
+                    Mutability::Not => SolValue::ImmPtrNull(pointee_ty),
+                    Mutability::Mut => SolValue::MutPtrNull(pointee_ty),
+                }
             }
 
             // reference
-            ty::Ref(_, inner_ty, _) => {
-                SolValue::Ref(Box::new(self.mk_value_from_scalar(*inner_ty, scalar)))
+            ty::Ref(_, inner_ty, mutability) => {
+                let inner_val = self.mk_value_from_scalar(*inner_ty, scalar);
+                match mutability {
+                    Mutability::Not => SolValue::ImmRef(Box::new(inner_val)),
+                    Mutability::Mut => SolValue::MutRef(Box::new(inner_val)),
+                }
             }
 
             // unexpected
@@ -1095,7 +1103,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             (LitKind::Str(v, _), ty::Ref(_, inner_ty, Mutability::Not))
                 if matches!(inner_ty.kind(), ty::Str) =>
             {
-                SolValue::Ref(Box::new(SolValue::Str(v.to_ident_string())))
+                SolValue::ImmRef(Box::new(SolValue::Str(v.to_ident_string())))
             }
             (LitKind::ByteStr(v, _), ty::Ref(_, inner_ty, Mutability::Not)) => {
                 let inner_val = match inner_ty.kind() {
@@ -1119,7 +1127,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                     }
                     _ => bug!("[invariant] literal and type mismatch: {lit} vs {ty}"),
                 };
-                SolValue::Ref(Box::new(inner_val))
+                SolValue::ImmRef(Box::new(inner_val))
             }
 
             // unexpected
@@ -1146,13 +1154,13 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::Slice(elem_ty) => SolValue::Slice(self.mk_type(*elem_ty), vec![]),
 
             // reference
-            ty::Ref(_, inner_ty, _) => {
+            ty::Ref(_, inner_ty, Mutability::Not) => {
                 let inner_val = match inner_ty.kind() {
                     ty::Str => SolValue::Str(String::new()),
                     ty::Slice(elem_ty) => SolValue::Slice(self.mk_type(*elem_ty), vec![]),
                     _ => bug!("[invariant] failed to create a value for ZST type {ty}"),
                 };
-                SolValue::Ref(Box::new(inner_val))
+                SolValue::ImmRef(Box::new(inner_val))
             }
 
             // unexpected
@@ -1249,7 +1257,9 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
                 SolValue::Closure(ident, generic_args)
             }
-            ty::Ref(_, inner_ty, _) => SolValue::Ref(Box::new(self.mk_value_when_zst(*inner_ty)?)),
+            ty::Ref(_, inner_ty, Mutability::Not) => {
+                SolValue::ImmRef(Box::new(self.mk_value_when_zst(*inner_ty)?))
+            }
 
             _ => {
                 // double check that we should have captured all ZST cases above
@@ -1309,9 +1319,9 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // reference types
-            ty::Ref(_, inner_ty, _) => {
+            ty::Ref(_, inner_ty, Mutability::Not) => {
                 let inner_val = self.mk_value_from_branch_consts(*inner_ty, consts);
-                SolValue::Ref(Box::new(inner_val))
+                SolValue::ImmRef(Box::new(inner_val))
             }
 
             // we should have covered all branch cases above
@@ -2300,8 +2310,10 @@ pub(crate) enum SolValue {
     Union(SolIdent, Vec<SolGenericArg>, SolFieldIndex, Box<SolConst>),
     Enum(SolIdent, Vec<SolGenericArg>, SolVariantIndex, Vec<(SolFieldIndex, SolConst)>),
     // reference
-    Ref(Box<SolValue>),
-    PtrNull,
+    ImmRef(Box<SolValue>),
+    MutRef(Box<SolValue>),
+    ImmPtrNull(SolType),
+    MutPtrNull(SolType),
     // function pointers
     FuncDef(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
