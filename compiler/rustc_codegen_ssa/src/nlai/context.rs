@@ -578,10 +578,7 @@ impl<'tcx> ExecBuilder<'tcx> {
     pub(crate) fn mk_clause(&mut self, clause: Clause<'tcx>) -> SolClause {
         self.log_stack.push("Clause", format!("{clause}"));
 
-        let parsed = match self
-            .tcx
-            .normalize_erasing_late_bound_regions(self.typing_env, clause.kind())
-        {
+        let parsed = match self.tcx.instantiate_bound_regions_with_erased(clause.kind()) {
             ClauseKind::Trait(TraitPredicate { trait_ref, polarity }) => {
                 let (trait_ident, trait_ty_args) =
                     self.mk_trait(self.tcx.trait_def(trait_ref.def_id), trait_ref.args);
@@ -607,6 +604,15 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
                 SolClause::TypeOutlives(self.mk_type(ty))
             }
+            ClauseKind::RegionOutlives(OutlivesPredicate(r1, r2)) => {
+                if !(r1.is_erased() || r1.is_static()) {
+                    bug!("[invariant] regions should be erased or static in THIR: {r1}");
+                }
+                if !(r2.is_erased() || r2.is_static()) {
+                    bug!("[invariant] regions should be erased or static in THIR: {r2}");
+                }
+                SolClause::RegionOutlives
+            }
             ClauseKind::ConstArgHasType(cval, ty) => {
                 SolClause::ConstHasType(self.mk_const(cval), self.mk_type(ty))
             }
@@ -618,9 +624,6 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // unexpected
-            ClauseKind::RegionOutlives(..) => {
-                bug!("[invariant] unexpected region outlives clause: {clause}");
-            }
             ClauseKind::UnstableFeature(..) => {
                 bug!("[invariant] unexpected unstable feature clause: {clause}");
             }
@@ -722,8 +725,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 SolType::Closure(ident, generic_args)
             }
             ty::FnPtr(sig_binder, FnHeader { c_variadic, abi, safety }) => {
-                let sig =
-                    self.tcx.normalize_erasing_late_bound_regions(self.typing_env, *sig_binder);
+                let sig = self.tcx.instantiate_bound_regions_with_erased(*sig_binder);
                 let abi = self.mk_abi(*abi, *c_variadic, *safety);
 
                 let ret_ty = self.mk_type(sig.output());
@@ -749,25 +751,29 @@ impl<'tcx> ExecBuilder<'tcx> {
 
             // alias
             ty::Alias(AliasTyKind::Projection, alias_ty) => {
-                let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
-                if norm_ty != ty {
-                    SolType::Alias(Box::new(self.mk_type(norm_ty)))
-                } else {
-                    // It is possible that normalization does not change the type, for example,
-                    // when the projection comes from a type parameter (which implements a trait),
-                    // e.g., <P as Foo>::T, where P is the type parameter of the THIR definition.
-                    let (trait_ref, own_ty_args) = alias_ty.trait_ref_and_own_args(self.tcx);
-                    let (trait_ident, trait_ty_args) =
-                        self.mk_trait(self.tcx.trait_def(trait_ref.def_id), trait_ref.args);
-                    let item_ty_args =
-                        own_ty_args.iter().map(|arg| self.mk_generic_arg(*arg)).collect();
+                match self.tcx.try_normalize_erasing_regions(self.typing_env, ty) {
+                    Ok(norm_ty) if norm_ty != ty => SolType::Alias(Box::new(self.mk_type(norm_ty))),
+                    _ => {
+                        // It is possible that normalization does not change the type, for example,
+                        // when the projection comes from a type parameter (which implements a trait),
+                        // e.g., <P as Foo>::T, where P is the type parameter of the THIR definition.
+                        //
+                        // Another possiblility is that we treat the `dyn Trait` it itself as Self,
+                        // and the projection is from the trait object, e.g., `<dyn Foo as Foo>::T`.
+                        // We can't further normalize the `dyn Foo` here.
+                        let (trait_ref, own_ty_args) = alias_ty.trait_ref_and_own_args(self.tcx);
+                        let (trait_ident, trait_ty_args) =
+                            self.mk_trait(self.tcx.trait_def(trait_ref.def_id), trait_ref.args);
+                        let item_ty_args =
+                            own_ty_args.iter().map(|arg| self.mk_generic_arg(*arg)).collect();
 
-                    // construct the associated type
-                    SolType::Assoc {
-                        trait_ident,
-                        trait_ty_args,
-                        item_ident: self.mk_ident(alias_ty.def_id),
-                        item_ty_args,
+                        // construct the associated type
+                        SolType::Assoc {
+                            trait_ident,
+                            trait_ty_args,
+                            item_ident: self.mk_ident(alias_ty.def_id),
+                            item_ty_args,
+                        }
                     }
                 }
             }
@@ -877,12 +883,48 @@ impl<'tcx> ExecBuilder<'tcx> {
     /// Record a (constant) value in MIR/THIR context
     pub(crate) fn mk_value(&mut self, val: Value<'tcx>) -> SolValue {
         let Value { ty, valtree } = val;
-
         match *valtree {
             ValTreeKind::Leaf(leaf) => self.mk_value_from_scalar(val.ty, *leaf),
             ValTreeKind::Branch(box []) => self.mk_value_from_zst(ty),
-            ValTreeKind::Branch(box _) => {
-                todo!("[todo] multi-branch constant {val} for type {ty}")
+            ValTreeKind::Branch(box branches) => {
+                let branch_values: Vec<_> = branches
+                    .iter()
+                    .map(|cval| match self.mk_const(*cval) {
+                        SolConst::Value(sval) => sval,
+                        SolConst::Param(_) => {
+                            bug!("[invariant] expected value const in valtree branch")
+                        }
+                    })
+                    .collect();
+
+                match ty.kind() {
+                    // FIXME: we should check that the values and types are consistent
+                    ty::Array(elem_ty, _) => SolValue::Array(self.mk_type(*elem_ty), branch_values),
+                    ty::Ref(_, inner_ty, _) => match inner_ty.kind() {
+                        ty::Str => SolValue::RefStr(
+                            String::from_utf8(
+                                branch_values
+                                    .into_iter()
+                                    .map(|v| match v {
+                                        SolValue::U8(b) => b,
+                                        _ => {
+                                            bug!("[invariant] type mismatch for str valtree branch")
+                                        }
+                                    })
+                                    .collect(),
+                            )
+                            .unwrap_or_else(|_| {
+                                bug!("[invariant] invalid utf-8 in str valtree branch")
+                            }),
+                        ),
+                        ty::Slice(elem_ty) => {
+                            SolValue::RefSlice(self.mk_type(*elem_ty), branch_values)
+                        }
+                        _ => bug!("[invariant] type mismatch for valtree branch: {ty}"),
+                    },
+                    // FIXME: handle more types
+                    _ => bug!("[invariant] unhandled type for valtree branch: {ty}"),
+                }
             }
         }
     }
@@ -996,10 +1038,16 @@ impl<'tcx> ExecBuilder<'tcx> {
                 SolValue::RefStr(v.to_ident_string())
             }
             (LitKind::ByteStr(v, _), ty::Ref(_, inner_ty, Mutability::Not)) if matches!(inner_ty.kind(), ty::Slice(elem_ty) if matches!(elem_ty.kind(), ty::Uint(UintTy::U8))) => {
-                SolValue::RefSlice(v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect())
+                SolValue::RefSlice(
+                    SolType::U8,
+                    v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect(),
+                )
             }
             (LitKind::CStr(v, _), ty::Ref(_, inner_ty, Mutability::Not)) if matches!(inner_ty.kind(), ty::Slice(elem_ty) if matches!(elem_ty.kind(), ty::Uint(UintTy::U8))) => {
-                SolValue::RefSlice(v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect())
+                SolValue::RefSlice(
+                    SolType::U8,
+                    v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect(),
+                )
             }
 
             // unexpected
@@ -1932,6 +1980,7 @@ pub(crate) enum SolClause {
     WellFormed(SolProjTerm),
     Projection(SolProjTerm, SolProjTerm),
     TypeOutlives(SolType),
+    RegionOutlives,
     ConstHasType(SolConst, SolType),
     ConstEvaluatable(SolConst),
 }
@@ -1971,9 +2020,10 @@ pub(crate) enum SolValue {
     F128(String),
     // string
     RefStr(String),
-    RefSlice(Vec<SolValue>),
+    RefSlice(SolType, Vec<SolValue>),
     // composite
     Tuple(Vec<SolValue>),
+    Array(SolType, Vec<SolValue>),
 }
 
 /*
