@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
 use std::path::PathBuf;
 
-use rustc_abi::ExternAbi;
+use rustc_abi::{ExternAbi, FieldIdx, VariantIdx};
 use rustc_ast::{
     AttrStyle, BindingMode, ByRef, FloatTy, IntTy, LitFloatType, LitIntType, LitKind, Mutability,
     UintTy,
@@ -1141,10 +1141,14 @@ impl<'tcx> ExecBuilder<'tcx> {
     /// Record a (constant) value for a ZST
     pub(crate) fn mk_value_from_zst(&mut self, ty: Ty<'tcx>) -> SolValue {
         self.mk_value_when_zst(ty).unwrap_or_else(|| {
-            bug!(
-                "[invariant] failed to create a value for ZST type {ty} with kind {:?}",
-                ty.kind()
-            );
+            // special-case for empty string
+            match ty.kind() {
+                ty::Str => SolValue::Str(String::new()),
+                _ => bug!(
+                    "[invariant] failed to create a value for ZST type {ty} with kind {:?}",
+                    ty.kind()
+                ),
+            }
         })
     }
 
@@ -1160,6 +1164,63 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
                 SolValue::Tuple(elem_vals)
             }
+            ty::Array(elem_ty, length) => {
+                // an array is a ZST if its element type is a ZST or its length is zero
+                let size = length.try_to_target_usize(self.tcx)?;
+                if size == 0 {
+                    SolValue::Array(self.mk_type(*elem_ty), vec![])
+                } else {
+                    let elem_val = self.mk_value_when_zst(*elem_ty)?;
+                    SolValue::Array(self.mk_type(*elem_ty), vec![elem_val; size as usize])
+                }
+            }
+            ty::Adt(def, ty_args) => {
+                let (adt_ident, adt_ty_args) = self.mk_adt(*def, ty_args);
+                match def.adt_kind() {
+                    AdtKind::Struct => {
+                        // a struct is a ZST if all its fields are ZSTs
+                        let variant = def.non_enum_variant();
+                        let mut fields = vec![];
+                        for (field_idx, field_def) in variant.fields.iter_enumerated() {
+                            let field_val =
+                                self.mk_value_when_zst(field_def.ty(self.tcx, ty_args))?;
+                            fields.push((SolFieldIndex(field_idx.index()), field_val));
+                        }
+                        SolValue::Struct(adt_ident, adt_ty_args, fields)
+                    }
+                    AdtKind::Union => {
+                        // a union is a ZST if it has only one feasible field and the field is a ZST
+                        let field_idx = get_uniquely_feasible_field(self.tcx, *def, ty_args)?;
+                        let field_def = def.non_enum_variant().fields.get(field_idx).unwrap();
+                        let field_val = self.mk_value_when_zst(field_def.ty(self.tcx, ty_args))?;
+                        SolValue::Union(
+                            adt_ident,
+                            adt_ty_args,
+                            SolFieldIndex(field_idx.index()),
+                            Box::new(field_val),
+                        )
+                    }
+                    AdtKind::Enum => {
+                        // an enum is a ZST if it has only one feasible variant and all fields in that variant are ZSTs
+                        let variant_idx = get_uniquely_feasible_variant(self.tcx, *def, ty_args)?;
+
+                        // parse the fields in that feasible variant
+                        let variant_def = def.variant(variant_idx);
+                        let mut fields = vec![];
+                        for (field_idx, field_def) in variant_def.fields.iter_enumerated() {
+                            let field_val =
+                                self.mk_value_when_zst(field_def.ty(self.tcx, ty_args))?;
+                            fields.push((SolFieldIndex(field_idx.index()), field_val));
+                        }
+                        SolValue::Enum(
+                            adt_ident,
+                            adt_ty_args,
+                            SolVariantIndex(variant_idx.index()),
+                            fields,
+                        )
+                    }
+                }
+            }
 
             ty::FnDef(def_id, ty_args) => {
                 let ident = self.mk_ident(*def_id);
@@ -1172,7 +1233,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 SolValue::Closure(ident, generic_args)
             }
 
-            // FIXME: handle more ZST types
+            // FIXME: are there more ZST types?
             _ => return None,
         };
         Some(zst_val)
@@ -2154,6 +2215,9 @@ pub(crate) enum SolValue {
     Tuple(Vec<SolValue>),
     Slice(SolType, Vec<SolValue>),
     Array(SolType, Vec<SolValue>),
+    Struct(SolIdent, Vec<SolGenericArg>, Vec<(SolFieldIndex, SolValue)>),
+    Union(SolIdent, Vec<SolGenericArg>, SolFieldIndex, Box<SolValue>),
+    Enum(SolIdent, Vec<SolGenericArg>, SolVariantIndex, Vec<(SolFieldIndex, SolValue)>),
     // reference
     Ref(Box<SolValue>),
     // function pointers
@@ -2574,4 +2638,95 @@ fn util_values_to_string(bytes: &[SolValue]) -> String {
             .collect(),
     )
     .unwrap_or_else(|_| bug!("[invariant] invalid utf-8 string"))
+}
+
+/// Check whether a type has any feasible value
+#[inline]
+fn has_feasible_value<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    match ty.kind() {
+        // infeasible
+        ty::Never => false,
+
+        // feasible
+        ty::Bool
+        | ty::Char
+        | ty::Int(_)
+        | ty::Uint(_)
+        | ty::Float(_)
+        | ty::Str
+        | ty::FnDef(..)
+        | ty::Closure(..)
+        | ty::FnPtr(..) => true,
+
+        // conditional
+        ty::Tuple(elems) => elems.iter().all(|e| has_feasible_value(tcx, e)),
+        ty::Adt(adt_def, generics) => match adt_def.adt_kind() {
+            AdtKind::Struct => adt_def
+                .non_enum_variant()
+                .fields
+                .iter()
+                .all(|f| has_feasible_value(tcx, f.ty(tcx, generics))),
+            AdtKind::Union => adt_def
+                .non_enum_variant()
+                .fields
+                .iter()
+                .any(|f| has_feasible_value(tcx, f.ty(tcx, generics))),
+            AdtKind::Enum => adt_def.variants().iter().any(|variant| {
+                variant.fields.iter().all(|f| has_feasible_value(tcx, f.ty(tcx, generics)))
+            }),
+        },
+
+        // inner-type
+        ty::Array(sub, _) | ty::Slice(sub) | ty::Ref(_, sub, _) | ty::RawPtr(sub, _) => {
+            has_feasible_value(tcx, *sub)
+        }
+
+        // unsupported
+        ty::Dynamic(..) => bug!("[unsupported] feasibility query for dynamic type"),
+
+        // should not appear
+        _ => bug!("[invariant] unexpected type in feasibility query: {ty}"),
+    }
+}
+
+/// Get a uniquely feasible field for a union
+#[inline]
+fn get_uniquely_feasible_field<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: AdtDef<'tcx>,
+    generics: GenericArgsRef<'tcx>,
+) -> Option<FieldIdx> {
+    let mut feasible_field = None;
+    for (field_idx, field_def) in def.non_enum_variant().fields.iter_enumerated() {
+        if has_feasible_value(tcx, field_def.ty(tcx, generics)) {
+            if feasible_field.is_some() {
+                // found more than one feasible fields
+                return None;
+            }
+            feasible_field = Some(field_idx);
+        }
+    }
+    // return the uniquely feasible field, if any
+    feasible_field
+}
+
+/// Get a uniquely feasible variant for an enum
+#[inline]
+fn get_uniquely_feasible_variant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: AdtDef<'tcx>,
+    generics: GenericArgsRef<'tcx>,
+) -> Option<VariantIdx> {
+    let mut feasible_variant = None;
+    for (variant_idx, variant_def) in def.variants().iter_enumerated() {
+        if variant_def.fields.iter().all(|f| has_feasible_value(tcx, f.ty(tcx, generics))) {
+            if feasible_variant.is_some() {
+                // found more than one feasible variants
+                return None;
+            }
+            feasible_variant = Some(variant_idx);
+        }
+    }
+    // return the uniquely feasible variant, if any
+    feasible_variant
 }
