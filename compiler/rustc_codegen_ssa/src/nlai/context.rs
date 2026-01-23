@@ -979,28 +979,31 @@ impl<'tcx> ExecBuilder<'tcx> {
                 match ty.kind() {
                     // FIXME: we should check that the values and types are consistent
                     ty::Array(elem_ty, _) => SolValue::Array(self.mk_type(*elem_ty), branch_values),
-                    ty::Ref(_, inner_ty, _) => match inner_ty.kind() {
-                        ty::Str => SolValue::RefStr(
-                            String::from_utf8(
-                                branch_values
-                                    .into_iter()
-                                    .map(|v| match v {
-                                        SolValue::U8(b) => b,
-                                        _ => {
-                                            bug!("[invariant] type mismatch for str valtree branch")
-                                        }
-                                    })
-                                    .collect(),
-                            )
-                            .unwrap_or_else(|_| {
-                                bug!("[invariant] invalid utf-8 in str valtree branch")
-                            }),
-                        ),
-                        ty::Slice(elem_ty) => {
-                            SolValue::RefSlice(self.mk_type(*elem_ty), branch_values)
-                        }
-                        _ => bug!("[invariant] type mismatch for valtree branch: {ty}"),
-                    },
+                    ty::Ref(_, inner_ty, _) => {
+                        let inner_val = match inner_ty.kind() {
+                            ty::Str => SolValue::Str(
+                                String::from_utf8(
+                                    branch_values
+                                        .into_iter()
+                                        .map(|v| match v {
+                                            SolValue::U8(b) => b,
+                                            _ => bug!(
+                                                "[invariant] type mismatch for str valtree branch"
+                                            ),
+                                        })
+                                        .collect(),
+                                )
+                                .unwrap_or_else(|_| {
+                                    bug!("[invariant] invalid utf-8 in str valtree branch")
+                                }),
+                            ),
+                            ty::Slice(elem_ty) => {
+                                SolValue::Slice(self.mk_type(*elem_ty), branch_values)
+                            }
+                            _ => bug!("[invariant] type mismatch for valtree branch: {ty}"),
+                        };
+                        SolValue::Ref(Box::new(inner_val))
+                    }
                     // FIXME: handle more types
                     _ => bug!("[invariant] unhandled type for valtree branch: {ty}"),
                 }
@@ -1114,19 +1117,31 @@ impl<'tcx> ExecBuilder<'tcx> {
             (LitKind::Str(v, _), ty::Ref(_, inner_ty, Mutability::Not))
                 if matches!(inner_ty.kind(), ty::Str) =>
             {
-                SolValue::RefStr(v.to_ident_string())
+                SolValue::Ref(Box::new(SolValue::Str(v.to_ident_string())))
             }
-            (LitKind::ByteStr(v, _), ty::Ref(_, inner_ty, Mutability::Not)) if matches!(inner_ty.kind(), ty::Slice(elem_ty) if matches!(elem_ty.kind(), ty::Uint(UintTy::U8))) => {
-                SolValue::RefSlice(
-                    SolType::U8,
-                    v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect(),
-                )
+            (LitKind::ByteStr(v, _), ty::Ref(_, inner_ty, Mutability::Not)) => {
+                let inner_val = match inner_ty.kind() {
+                    ty::Slice(elem_ty) if matches!(elem_ty.kind(), ty::Uint(UintTy::U8)) => {
+                        SolValue::Slice(
+                            SolType::U8,
+                            v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect(),
+                        )
+                    }
+                    ty::Array(elem_ty, _) if matches!(elem_ty.kind(), ty::Uint(UintTy::U8)) => {
+                        SolValue::Array(
+                            SolType::U8,
+                            v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect(),
+                        )
+                    }
+                    _ => bug!("[invariant] literal and type mismatch: {lit} vs {ty}"),
+                };
+                SolValue::Ref(Box::new(inner_val))
             }
             (LitKind::CStr(v, _), ty::Ref(_, inner_ty, Mutability::Not)) if matches!(inner_ty.kind(), ty::Slice(elem_ty) if matches!(elem_ty.kind(), ty::Uint(UintTy::U8))) => {
-                SolValue::RefSlice(
+                SolValue::Ref(Box::new(SolValue::Slice(
                     SolType::U8,
                     v.as_byte_str().iter().map(|b| SolValue::U8(*b)).collect(),
-                )
+                )))
             }
 
             // unexpected
@@ -2143,11 +2158,13 @@ pub(crate) enum SolValue {
     F64(String),
     F128(String),
     // string
-    RefStr(String),
-    RefSlice(SolType, Vec<SolValue>),
+    Str(String),
     // composite
     Tuple(Vec<SolValue>),
+    Slice(SolType, Vec<SolValue>),
     Array(SolType, Vec<SolValue>),
+    // reference
+    Ref(Box<SolValue>),
     // function pointers
     FuncDef(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
