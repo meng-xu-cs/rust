@@ -1050,7 +1050,11 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::Ref(_, inner_ty, _) => {
                 SolValue::Ref(Box::new(self.mk_value_from_scalar(*inner_ty, scalar)))
             }
-            ty::RawPtr(_, _) if scalar.is_null() => {
+            ty::RawPtr(_, _) => {
+                if !scalar.is_null() {
+                    bug!("[unsupported] non-null scalar pointer")
+                }
+
                 // FIXME: record inner type
                 SolValue::PtrNull
             }
@@ -1164,17 +1168,12 @@ impl<'tcx> ExecBuilder<'tcx> {
                 };
                 SolValue::Ref(Box::new(inner_val))
             }
-            (LitKind::CStr(v, _), ty::Ref(_, inner_ty, Mutability::Not)) if matches!(inner_ty.kind(), ty::Slice(elem_ty) if matches!(elem_ty.kind(), ty::Uint(UintTy::U8))) => {
-                SolValue::Ref(Box::new(SolValue::Slice(
-                    SolType::U8,
-                    v.as_byte_str().iter().map(|b| SolConst::Value(SolValue::U8(*b))).collect(),
-                )))
-            }
 
             // unexpected
-            (LitKind::Err(_), _) => bug!("[invariant] unexpected literal {lit}"),
+            (LitKind::Err(..), _) => bug!("[invariant] unexpected literal {lit}"),
 
             // unsupported
+            (LitKind::CStr(..), _) => bug!("[unsupported] CStr literal"),
             (_, ty::Pat(..)) => bug!("[unsupported] literal for pattern type"),
 
             // all other cases are considered type mismatches
@@ -1184,19 +1183,24 @@ impl<'tcx> ExecBuilder<'tcx> {
 
     /// Record a (constant) value for a ZST
     pub(crate) fn mk_value_from_zst(&mut self, ty: Ty<'tcx>) -> SolValue {
-        self.mk_value_when_zst(ty).unwrap_or_else(|| {
-            // special-case for empty string
-            match ty.kind() {
-                ty::Str => SolValue::Str(String::new()),
-                ty::Ref(_, inner_ty, _) if inner_ty.is_str() => {
-                    SolValue::Ref(Box::new(SolValue::Str(String::new())))
-                }
-                _ => bug!(
-                    "[invariant] failed to create a value for ZST type {ty} with kind {:?}",
-                    ty.kind()
-                ),
+        if let Some(zst_val) = self.mk_value_when_zst(ty) {
+            return zst_val;
+        }
+
+        // special-case for empty string and empty slice
+        match ty.kind() {
+            ty::Str => SolValue::Str(String::new()),
+            ty::Slice(elem_ty) => SolValue::Slice(self.mk_type(*elem_ty), vec![]),
+            ty::Ref(_, inner_ty, _) => {
+                let inner_val = match inner_ty.kind() {
+                    ty::Str => SolValue::Str(String::new()),
+                    ty::Slice(elem_ty) => SolValue::Slice(self.mk_type(*elem_ty), vec![]),
+                    _ => bug!("[invariant] failed to create a value for ZST type {ty}"),
+                };
+                SolValue::Ref(Box::new(inner_val))
             }
-        })
+            _ => bug!("[invariant] failed to create a value for ZST type {ty}"),
+        }
     }
 
     /// Try to record a (constant) value for a ZST or None of the type is not zero-sized
