@@ -814,14 +814,13 @@ impl<'tcx> ExecBuilder<'tcx> {
 
     /// Record a pattern in the THIR context
     pub(crate) fn mk_pat(&mut self, pat: &Pat<'tcx>) -> SolPattern {
-        let Pat { ty, span, extra, kind } = pat;
+        let Pat { ty, span, extra: _, kind } = pat;
 
         // parse the basics
-        if extra.is_some() {
-            bug!("[unsupported] extra pattern info");
-        }
         let pat_ty = self.mk_type(*ty);
         let pat_span = self.mk_span(*span);
+
+        // FIXME: right now we don't care about the extra info, but maybe we want to record them?
 
         // parse the pattern kind
         let pat_rule = match kind {
@@ -839,11 +838,12 @@ impl<'tcx> ExecBuilder<'tcx> {
                 is_shorthand: _,
             } => {
                 let binding_mode = match (by_ref, mutability) {
-                    (ByRef::No, Mutability::Not) => SolBindMode::ByImmValue,
-                    (ByRef::No, Mutability::Mut) => SolBindMode::ByMutValue,
-                    (ByRef::Yes(_, Mutability::Not), Mutability::Not) => SolBindMode::ByImmRef,
-                    (ByRef::Yes(_, Mutability::Mut), Mutability::Mut) => SolBindMode::ByMutRef,
-                    _ => bug!("[invariant] invalid binding mode"),
+                    (ByRef::No, Mutability::Not) => SolBindMode::ImmByValue,
+                    (ByRef::No, Mutability::Mut) => SolBindMode::MutByValue,
+                    (ByRef::Yes(_, Mutability::Not), Mutability::Not) => SolBindMode::ImmByImmRef,
+                    (ByRef::Yes(_, Mutability::Not), Mutability::Mut) => SolBindMode::ImmByMutRef,
+                    (ByRef::Yes(_, Mutability::Mut), Mutability::Not) => SolBindMode::MutByImmRef,
+                    (ByRef::Yes(_, Mutability::Mut), Mutability::Mut) => SolBindMode::MutByMutRef,
                 };
 
                 let var_name = SolLocalVarName(name.to_ident_string());
@@ -1336,11 +1336,20 @@ impl<'tcx> ExecBuilder<'tcx> {
             // use
             ExprKind::Use { source } => SolOp::Use(self.mk_expr(thir, *source)),
             ExprKind::VarRef { id: LocalVarId(var_id) } => {
-                assert_eq!(var_id.owner, self.owner_id, "[invariant] local var owner mismatch");
+                // FIXME: whlie we can't enforce the following check because closure may refer to upvar,
+                // we need to find a better way to ensure the correctness of local var references.
+                // assert_eq!(var_id.owner, self.owner_id, "[invariant] local var owner mismatch");
                 SolOp::VarRef(SolLocalVarIndex(var_id.local_id.index()))
             }
             ExprKind::UpvarRef { closure_def_id, var_hir_id: LocalVarId(var_id) } => {
-                assert_eq!(var_id.owner, self.owner_id, "[invariant] local var owner mismatch");
+                // FIXME: whlie we can't enforce the following check because closure may refer to upvar,
+                // we need to find a better way to ensure the correctness of upvar references.
+                // assert_eq!(var_id.owner, self.owner_id, "[invariant] local var owner mismatch");
+                assert_eq!(
+                    closure_def_id,
+                    &self.owner_id.to_def_id(),
+                    "[invariant] closure def_id mismatch"
+                );
                 SolOp::UpVarRef(
                     self.mk_ident(*closure_def_id),
                     SolLocalVarIndex(var_id.local_id.index()),
@@ -1358,7 +1367,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let generic_args = args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
                 SolOp::ConstValue(const_ident, generic_args)
             }
-            ExprKind::StaticRef { .. } => todo!(),
+            ExprKind::StaticRef { .. } => bug!("[unsupported] static ref"),
 
             // intrinsics
             ExprKind::Box { value } => SolOp::Box(self.mk_expr(thir, *value)),
@@ -2388,10 +2397,12 @@ pub(crate) enum SolPatRule {
 /// Binding mode
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolBindMode {
-    ByImmValue,
-    ByMutValue,
-    ByImmRef,
-    ByMutRef,
+    ImmByValue,
+    MutByValue,
+    ImmByImmRef,
+    ImmByMutRef,
+    MutByImmRef,
+    MutByMutRef,
 }
 
 /// A match arm in THIR
