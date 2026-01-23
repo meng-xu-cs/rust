@@ -1091,6 +1091,11 @@ impl<'tcx> ExecBuilder<'tcx> {
             BodyTy::Fn(sig) => {
                 let FnSig { abi, c_variadic, safety, inputs_and_output: _ } = sig;
 
+                // ignore unsupported case
+                if c_variadic {
+                    bug!("[unsupported] variadic function");
+                }
+
                 // parse function signature
                 let parsed_abi = self.mk_abi(abi, c_variadic, safety);
                 let ret_ty = self.mk_type(sig.output());
@@ -1100,17 +1105,16 @@ impl<'tcx> ExecBuilder<'tcx> {
                 // parse parameters
                 let mut param_iter = thir.params.iter_enumerated();
                 if thir.params.len() == params.len() + 1 {
-                    // special case for closure: first parameter is the closure environment
+                    // special case for closure: first parameter must be closure-related
                     let (index0, param0) = param_iter.next().unwrap();
                     assert_eq!(index0.index(), 0, "[invariant] expect parameter index 0");
 
                     let (closure_id, closure_ty_args) = match param0.ty.kind() {
-                        ty::Ref(_, inner_ty, Mutability::Not) => match inner_ty.kind() {
-                            ty::Closure(closure_id, closure_ty_args) => {
-                                (*closure_id, *closure_ty_args)
-                            }
+                        ty::Ref(_, inner_ty, _) => match inner_ty.kind() {
+                            ty::Closure(c_id, c_ty_args) => (*c_id, *c_ty_args),
                             _ => bug!("[invariant] expect &closure as param 0: got {}", param0.ty),
                         },
+                        ty::Closure(c_id, c_ty_args) => (*c_id, *c_ty_args),
                         _ => bug!("[invariant] expect &closure as param 0: got {}", param0.ty),
                     };
 
@@ -1614,6 +1618,14 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
     for owner_id in tcx.hir_body_owners() {
         let def_id = owner_id.to_def_id();
         let def_desc = util_debug_symbol(tcx, def_id, &List::empty());
+
+        // skip coroutine-related owners
+        if matches!(
+            tcx.type_of(def_id).instantiate_identity().kind(),
+            ty::Coroutine(..) | ty::CoroutineClosure(..)
+        ) {
+            continue;
+        }
 
         // retrieve the THIR body
         let (thir_body, thir_expr) = tcx
