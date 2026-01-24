@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
 use std::path::PathBuf;
 
-use rustc_abi::{ExternAbi, FieldIdx, VariantIdx};
+use rustc_abi::{ExternAbi, FieldIdx, FieldsShape, Size, VariantIdx, Variants};
 use rustc_ast::{
     AttrStyle, BindingMode, ByRef, FloatTy, IntTy, LitFloatType, LitIntType, LitKind, Mutability,
     UintTy,
@@ -13,7 +13,7 @@ use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{
     Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, MatchSource, Mod, OwnerId, Safety,
 };
-use rustc_middle::mir::interpret::GlobalAlloc;
+use rustc_middle::mir::interpret::{AllocRange, Allocation, GlobalAlloc, Scalar};
 use rustc_middle::mir::{AssignOp, BinOp, BorrowKind, UnOp};
 use rustc_middle::thir::{
     AdtExpr, AdtExprBase, Arm, Block, BlockId, BlockSafety, BodyTy, ClosureExpr,
@@ -76,6 +76,9 @@ struct ExecBuilder<'tcx> {
 
     /// collected definitions of traits
     trait_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolTraitDef>>>,
+
+    /// static initializers
+    static_inits: BTreeMap<SolIdent, Option<SolValue>>,
 
     /// log stack
     log_stack: LogStack,
@@ -305,6 +308,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             cp_types: BTreeMap::new(),
             adt_defs: BTreeMap::new(),
             trait_defs: BTreeMap::new(),
+            static_inits: BTreeMap::new(),
             log_stack: LogStack::new(),
         }
     }
@@ -742,7 +746,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let ret_ty = self.mk_type(sig.output());
                 let params: Vec<_> =
                     sig.inputs().iter().map(|input_ty| self.mk_type(*input_ty)).collect();
-                SolType::FnPtr(abi, params, Box::new(ret_ty))
+                SolType::FnPtr(SolFnSig { abi, param_tys: params, output_ty: Box::new(ret_ty) })
             }
 
             // dynamic
@@ -1383,6 +1387,141 @@ impl<'tcx> ExecBuilder<'tcx> {
         }
     }
 
+    /// Record a static initializer
+    pub(crate) fn mk_static_init(&mut self, def_id: DefId, ty: Ty<'tcx>) -> SolIdent {
+        let ident = self.mk_ident(def_id);
+
+        // if already defined or is being defined, return the key
+        if self.static_inits.contains_key(&ident) {
+            return ident;
+        }
+
+        // mark start
+        let def_desc = util_debug_symbol(self.tcx, def_id, &List::empty());
+        self.log_stack.push("Static", format!("{def_desc}"));
+
+        // first update the entry to mark that static initialization in progress
+        self.static_inits.insert(ident.clone(), None);
+
+        // externally defined statics are unsupported
+        if !self.tcx.is_ctfe_mir_available(def_id) {
+            bug!("[unsupported] static without CTFE mir");
+        }
+
+        // evaluate the static initializer
+        let alloc = self
+            .tcx
+            .eval_static_initializer(def_id)
+            .unwrap_or_else(|_| bug!("[invariant] unable to evaluate static initializer"));
+        let memory = alloc.inner();
+
+        // process the constant value from memory
+        let (_, value) = self.read_const_from_memory_and_layout(memory, Size::ZERO, ty);
+
+        // update the static initializer entry
+        self.static_inits.insert(ident.clone(), Some(value));
+
+        // mark end
+        self.log_stack.pop();
+
+        // return the identifier
+        ident
+    }
+
+    /// Helper function to read a constant from memory with given type and offset
+    fn read_const_from_memory_and_layout(
+        &mut self,
+        memory: &Allocation,
+        offset: Size,
+        ty: Ty<'tcx>,
+    ) -> (Size, SolValue) {
+        // utility
+        let read_primitive = |tcx: TyCtxt<'tcx>, start, size: Size, is_provenane: bool| {
+            memory.read_scalar(&tcx, AllocRange { start, size }, is_provenane).unwrap_or_else(|e| {
+                bug!("[invariant] failed to read a primitive in memory allocation: {e:?}")
+            })
+        };
+
+        // get the layout of the type
+        let layout = self
+            .tcx
+            .layout_of(self.typing_env.as_query_input(ty))
+            .unwrap_or_else(|_| bug!("[invariant] unable to query layout of type {ty}"))
+            .layout;
+
+        // case by type
+        let value = match ty.kind() {
+            // primitives
+            ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) => {
+                match layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect a 0-variant for type: {ty}"),
+                }
+                if !matches!(layout.fields, FieldsShape::Primitive) {
+                    bug!("[invariant] expect a primitive field for type: {ty}");
+                }
+
+                let scalar = read_primitive(self.tcx, offset, layout.size, false)
+                    .to_scalar_int()
+                    .unwrap_or_else(|_| bug!("[invariant] expect a scalar int for type {ty}"));
+                self.mk_value_from_scalar(ty, scalar)
+            }
+
+            // function pointer
+            ty::FnPtr(..) => {
+                // sanity check on the variants
+                match &layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect a 0-variant for type {ty}"),
+                }
+
+                // construct the type
+                let fn_sig = match self.mk_type(ty) {
+                    SolType::FnPtr(fn_sig) => fn_sig,
+                    _ => bug!("[invariant] expect a function pointer type for {ty}"),
+                };
+
+                // read and parse the pointer
+                let pointer_size = self.tcx.data_layout.pointer_size();
+                if layout.size != pointer_size {
+                    bug!("[invariant] unexpected layout size for fn-ptr {ty}");
+                }
+                match read_primitive(self.tcx, offset, pointer_size, true) {
+                    Scalar::Ptr(ptr, _) => {
+                        let (prov, offset) = ptr.into_raw_parts();
+                        if offset != Size::ZERO {
+                            bug!("[invariant] unexpected non-zero offset for function pointer");
+                        }
+
+                        match self.tcx.global_alloc(prov.alloc_id()) {
+                            GlobalAlloc::Function { instance } => {
+                                let ident = self.mk_ident(instance.def_id());
+                                let ty_args = instance
+                                    .args
+                                    .iter()
+                                    .map(|arg| self.mk_generic_arg(arg))
+                                    .collect();
+                                SolValue::FnPtr(fn_sig, ident, ty_args)
+                            }
+                            _ => bug!("[invariant] unexpected allocation for function pointer"),
+                        }
+                    }
+                    Scalar::Int(int) => {
+                        if !int.is_null() {
+                            bug!("[invariant] unexpected non-null integer for function pointer");
+                        }
+                        SolValue::FnPtrNull(fn_sig)
+                    }
+                }
+            }
+
+            _ => bug!("[invariant] unhandled type for reading constant from memory: {ty}"),
+        };
+
+        // return the size consumed and the value
+        (layout.size, value)
+    }
+
     /// Record a executable, i.e., a THIR body (for a function or a constant/static)
     pub(crate) fn mk_exec(&mut self, thir: &Thir<'tcx>, expr: ExprId) -> SolExec {
         // switch-case on the body type
@@ -1574,14 +1713,21 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let generic_args = args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
                 SolOp::ConstValue(const_ident, generic_args)
             }
-            ExprKind::StaticRef { alloc_id, ty, def_id } => {
-                let static_ident = self.mk_ident(*def_id);
-                let static_ty = self.mk_type(*ty);
+            ExprKind::StaticRef { alloc_id, ty: ref_ty, def_id } => {
+                // sanity check
                 match self.tcx.global_alloc(*alloc_id) {
                     GlobalAlloc::Static(static_def_id) if static_def_id == *def_id => {}
                     _ => bug!("[invariant] invalid static ref in THIR"),
                 }
-                SolOp::StaticRef(static_ident, static_ty)
+
+                // ensure type matches
+                assert_eq!(ty, ref_ty, "[invariant] static ref type mismatch");
+                let mem_ty = match ref_ty.kind() {
+                    ty::Ref(_, inner_ty, _) => inner_ty,
+                    _ => bug!("[invariant] static ref must be a reference type"),
+                };
+                let static_ident = self.mk_static_init(*def_id, *mem_ty);
+                SolOp::StaticRef(static_ident)
             }
 
             // intrinsics
@@ -1979,6 +2125,8 @@ impl<'tcx> ExecBuilder<'tcx> {
             SolValue::MutPtrNull(inner_ty) => SolType::MutPtr(Box::new(inner_ty.clone())),
             SolValue::FuncDef(ident, ty_args) => SolType::Function(ident.clone(), ty_args.clone()),
             SolValue::Closure(ident, ty_args) => SolType::Closure(ident.clone(), ty_args.clone()),
+            SolValue::FnPtr(fn_sig, _, _) => SolType::FnPtr(fn_sig.clone()),
+            SolValue::FnPtrNull(fn_sig) => SolType::FnPtr(fn_sig.clone()),
         }
     }
 
@@ -2121,6 +2269,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             cp_types,
             adt_defs,
             trait_defs,
+            static_inits,
             log_stack,
         } = exec_builder;
         assert!(log_stack.is_empty(), "[invariant] log stack is not empty");
@@ -2147,6 +2296,15 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             }
         }
 
+        // collect static initializers
+        let mut flat_static_inits = vec![];
+        for (ident, init) in static_inits.into_iter() {
+            flat_static_inits.push((
+                ident,
+                init.unwrap_or_else(|| bug!("[invariant] missing static initializer")),
+            ));
+        }
+
         // complete the bundle construction
         let hir_id = tcx.local_def_id_to_hir_id(owner_id);
         let exec_full = base.mk_mir(owner_id, hir_id, tcx.hir_span_with_body(hir_id), exec);
@@ -2155,6 +2313,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             cp_types: cp_types.into_iter().collect(),
             adt_defs: flat_adt_defs,
             trait_defs: flat_trait_defs,
+            static_inits: flat_static_inits,
             executable: exec_full,
         });
 
@@ -2228,6 +2387,7 @@ pub(crate) struct SolBundle {
     pub(crate) cp_types: Vec<(SolIdent, SolType)>,
     pub(crate) adt_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolAdtDef)>,
     pub(crate) trait_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTraitDef)>,
+    pub(crate) static_inits: Vec<(SolIdent, SolValue)>,
     pub(crate) executable: SolMIR<SolExec>,
 }
 
@@ -2338,7 +2498,7 @@ pub(crate) enum SolType {
     // function pointer
     Function(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
-    FnPtr(SolExternAbi, Vec<SolType>, Box<SolType>),
+    FnPtr(SolFnSig),
     // dynamic types
     Dynamic(Vec<SolClause>),
     Assoc {
@@ -2350,6 +2510,14 @@ pub(crate) enum SolType {
     // alias types
     Alias(Box<SolType>),
     Opaque(Box<SolType>),
+}
+
+/// A function signature
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolFnSig {
+    pub(crate) abi: SolExternAbi,
+    pub(crate) param_tys: Vec<SolType>,
+    pub(crate) output_ty: Box<SolType>,
 }
 
 /// A pattern type
@@ -2485,6 +2653,8 @@ pub(crate) enum SolValue {
     // function pointers
     FuncDef(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
+    FnPtr(SolFnSig, SolIdent, Vec<SolGenericArg>),
+    FnPtrNull(SolFnSig),
 }
 
 /*
@@ -2511,7 +2681,7 @@ pub(crate) enum SolOp {
     UpVarRef(SolIdent, SolLocalVarIndex),
     ConstParam(SolIdent),
     ConstValue(SolIdent, Vec<SolGenericArg>),
-    StaticRef(SolIdent, SolType),
+    StaticRef(SolIdent),
     // intrisics
     Box(SolExpr),
     Deref(SolExpr),
