@@ -67,6 +67,9 @@ struct ExecBuilder<'tcx> {
     /// generics declarations
     generics: Vec<SolGenericParam>,
 
+    /// constant param types
+    cp_types: BTreeMap<SolIdent, SolType>,
+
     /// collected definitions of datatypes
     adt_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolAdtDef>>>,
 
@@ -298,6 +301,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             base,
             owner_id,
             generics,
+            cp_types: BTreeMap::new(),
             adt_defs: BTreeMap::new(),
             trait_defs: BTreeMap::new(),
             log_stack: LogStack::new(),
@@ -679,7 +683,11 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::Foreign(def_id) => SolType::Foreign(self.mk_ident(*def_id)),
             ty::Adt(adt_def, ty_args) => {
                 let (ident, generic_args) = self.mk_adt(*adt_def, ty_args);
-                SolType::Adt(ident, generic_args)
+                match adt_def.adt_kind() {
+                    AdtKind::Struct => SolType::Struct(ident, generic_args),
+                    AdtKind::Union => SolType::Union(ident, generic_args),
+                    AdtKind::Enum => SolType::Enum(ident, generic_args),
+                }
             }
 
             // reference types
@@ -1284,12 +1292,51 @@ impl<'tcx> ExecBuilder<'tcx> {
         consts: Vec<SolConst>,
     ) -> SolValue {
         match ty.kind() {
-            // FIXME: we should check that the values and types are consistent
             ty::Str => SolValue::Str(util_values_to_string(&consts)),
-            ty::Slice(elem_ty) => SolValue::Slice(self.mk_type(*elem_ty), consts),
 
-            ty::Tuple(_) => SolValue::Tuple(consts),
-            ty::Array(elem_ty, _) => SolValue::Array(self.mk_type(*elem_ty), consts),
+            ty::Slice(elem_ty) => {
+                let const_ty = self.mk_type(*elem_ty);
+                consts.iter().for_each(|c| {
+                    assert_eq!(
+                        self.type_of_const(c),
+                        const_ty,
+                        "[invariant] slice element type mismatch"
+                    )
+                });
+                SolValue::Slice(const_ty, consts)
+            }
+
+            ty::Tuple(elem_tys) => {
+                assert_eq!(
+                    consts.len(),
+                    elem_tys.len(),
+                    "[invariant] tuple element count mismatch"
+                );
+                consts.iter().zip(elem_tys.iter()).for_each(|(c, ty)| {
+                    let const_ty = self.type_of_const(c);
+                    let expected_ty = self.mk_type(ty);
+                    assert_eq!(const_ty, expected_ty, "[invariant] tuple element type mismatch")
+                });
+                SolValue::Tuple(consts)
+            }
+
+            ty::Array(elem_ty, len) => {
+                let const_ty = self.mk_type(*elem_ty);
+                consts.iter().for_each(|c| {
+                    assert_eq!(
+                        self.type_of_const(c),
+                        const_ty,
+                        "[invariant] array element type mismatch"
+                    )
+                });
+                let size = len
+                    .try_to_target_usize(self.tcx)
+                    .unwrap_or_else(|| bug!("[invariant] unable to determine array size"))
+                    as usize;
+                assert_eq!(consts.len(), size, "[invariant] array element count mismatch");
+                SolValue::Array(const_ty, consts)
+            }
+
             ty::Adt(def, ty_args) => {
                 let (adt_ident, adt_ty_args) = self.mk_adt(*def, ty_args);
                 match def.adt_kind() {
@@ -1298,7 +1345,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                         assert_eq!(
                             consts.len(),
                             variant.fields.len(),
-                            "[invariant] struct value field count mismatch"
+                            "[invariant] struct field count mismatch"
                         );
                         SolValue::Struct(
                             adt_ident,
@@ -1307,7 +1354,13 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 .fields
                                 .iter_enumerated()
                                 .zip(consts)
-                                .map(|((field_idx, _), field_const)| {
+                                .map(|((field_idx, field_def), field_const)| {
+                                    let field_ty = field_def.ty(self.tcx, ty_args);
+                                    assert_eq!(
+                                        self.type_of_const(&field_const),
+                                        self.mk_type(field_ty),
+                                        "[invariant] struct field type mismatch"
+                                    );
                                     (SolFieldIndex(field_idx.index()), field_const)
                                 })
                                 .collect(),
@@ -1855,6 +1908,76 @@ impl<'tcx> ExecBuilder<'tcx> {
 
         SolBlock { safety: block_safety, stmts: block_stmts, expr: block_expr, span: block_span }
     }
+
+    /// Derive the type of a value
+    pub(crate) fn type_of_value(&self, val: &SolValue) -> SolType {
+        match val {
+            SolValue::Bool(_) => SolType::Bool,
+            SolValue::Char(_) => SolType::Char,
+            SolValue::I8(_) => SolType::I8,
+            SolValue::I16(_) => SolType::I16,
+            SolValue::I32(_) => SolType::I32,
+            SolValue::I64(_) => SolType::I64,
+            SolValue::I128(_) => SolType::I128,
+            SolValue::Isize(_) => SolType::Isize,
+            SolValue::U8(_) => SolType::U8,
+            SolValue::U16(_) => SolType::U16,
+            SolValue::U32(_) => SolType::U32,
+            SolValue::U64(_) => SolType::U64,
+            SolValue::U128(_) => SolType::U128,
+            SolValue::Usize(_) => SolType::Usize,
+            SolValue::F16(_) => SolType::F16,
+            SolValue::F32(_) => SolType::F32,
+            SolValue::F64(_) => SolType::F64,
+            SolValue::F128(_) => SolType::F128,
+            SolValue::Str(_) => SolType::Str,
+            SolValue::Tuple(elems) => {
+                SolType::Tuple(elems.iter().map(|elem| self.type_of_const(elem)).collect())
+            }
+            SolValue::Slice(elem_ty, _) => SolType::Slice(Box::new(elem_ty.clone())),
+            SolValue::Array(elem_ty, elems) => SolType::Array(
+                Box::new(elem_ty.clone()),
+                Box::new(SolConst::Value(SolValue::Usize(elems.len()))),
+            ),
+            SolValue::Struct(adt_ident, adt_args, ..) => {
+                SolType::Struct(adt_ident.clone(), adt_args.clone())
+            }
+            SolValue::Union(adt_ident, adt_args, ..) => {
+                SolType::Union(adt_ident.clone(), adt_args.clone())
+            }
+            SolValue::Enum(adt_ident, adt_args, ..) => {
+                SolType::Enum(adt_ident.clone(), adt_args.clone())
+            }
+            SolValue::ImmRef(inner_val) => SolType::ImmRef(Box::new(self.type_of_value(inner_val))),
+            SolValue::MutRef(inner_val) => SolType::MutRef(Box::new(self.type_of_value(inner_val))),
+            SolValue::ImmPtrNull(inner_ty) => SolType::ImmPtr(Box::new(inner_ty.clone())),
+            SolValue::MutPtrNull(inner_ty) => SolType::MutPtr(Box::new(inner_ty.clone())),
+            SolValue::FuncDef(ident, ty_args) => SolType::Function(ident.clone(), ty_args.clone()),
+            SolValue::Closure(ident, ty_args) => SolType::Closure(ident.clone(), ty_args.clone()),
+        }
+    }
+
+    pub(crate) fn type_of_const(&self, constant: &SolConst) -> SolType {
+        match constant {
+            SolConst::Value(val) => self.type_of_value(val),
+            SolConst::Param(ident) => self
+                .generics
+                .iter()
+                .find(|param| ident == &param.ident)
+                .map(|param| match param.kind {
+                    SolGenericKind::Type => SolType::Param(ident.clone()),
+                    SolGenericKind::Const => self
+                        .cp_types
+                        .get(ident)
+                        .unwrap_or_else(|| {
+                            bug!("[invariant] const generic used but type not found")
+                        })
+                        .clone(),
+                    SolGenericKind::Lifetime => bug!("[invariant] lifetime generic used as const"),
+                })
+                .unwrap_or_else(|| bug!("[invariant] generic parameter not found")),
+        }
+    }
 }
 
 /// Build the crate
@@ -1892,6 +2015,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
 
         // collect the generics of the body
         let mut bundle_generics = vec![];
+        let mut const_param_types = vec![];
         let generics = tcx.generics_of(def_id);
         for i in 0..generics.count() {
             let GenericParamDef {
@@ -1923,7 +2047,14 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
                     }
                     SolGenericKind::Type
                 }
-                GenericParamDefKind::Const { has_default: _ } => SolGenericKind::Const,
+                GenericParamDefKind::Const { has_default: _ } => {
+                    // pre-collect the types of const parameters
+                    let const_ty = tcx.type_of(*param_def_id).instantiate_identity();
+                    const_param_types.push((param_ident.clone(), const_ty));
+
+                    // still return the proper generic kind
+                    SolGenericKind::Const
+                }
             };
             bundle_generics.push(SolGenericParam {
                 ident: param_ident,
@@ -1942,6 +2073,12 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
         // mark start
         exec_builder.log_stack.push("THIR", def_desc);
 
+        // collect the const param types
+        for (const_ident, const_ty) in const_param_types.into_iter() {
+            let parsed_ty = exec_builder.mk_type(const_ty);
+            exec_builder.cp_types.insert(const_ident.clone(), parsed_ty);
+        }
+
         // build the executable body
         let thir_lock = thir_body.borrow();
         let exec = exec_builder.mk_exec(&*thir_lock, thir_expr);
@@ -1956,6 +2093,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             mut base,
             owner_id: _,
             generics,
+            cp_types,
             adt_defs,
             trait_defs,
             log_stack,
@@ -1989,6 +2127,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
         let exec_full = base.mk_mir(owner_id, hir_id, tcx.hir_span_with_body(hir_id), exec);
         bundles.push(SolBundle {
             generics,
+            cp_types: cp_types.into_iter().collect(),
             adt_defs: flat_adt_defs,
             trait_defs: flat_trait_defs,
             executable: exec_full,
@@ -2061,6 +2200,7 @@ pub(crate) struct SolCrate {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolBundle {
     pub(crate) generics: Vec<SolGenericParam>,
+    pub(crate) cp_types: Vec<(SolIdent, SolType)>,
     pub(crate) adt_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolAdtDef)>,
     pub(crate) trait_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTraitDef)>,
     pub(crate) executable: SolMIR<SolExec>,
@@ -2155,7 +2295,10 @@ pub(crate) enum SolType {
     Pat(Box<SolType>, Box<SolTyPat>),
     // dependencies
     Foreign(SolIdent),
-    Adt(SolIdent, Vec<SolGenericArg>),
+    // algebraic data types
+    Struct(SolIdent, Vec<SolGenericArg>),
+    Union(SolIdent, Vec<SolGenericArg>),
+    Enum(SolIdent, Vec<SolGenericArg>),
     // reference types
     ImmPtr(Box<SolType>),
     MutPtr(Box<SolType>),
