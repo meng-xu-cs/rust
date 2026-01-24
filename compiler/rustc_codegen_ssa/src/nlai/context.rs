@@ -13,6 +13,7 @@ use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{
     Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, MatchSource, Mod, OwnerId, Safety,
 };
+use rustc_middle::mir::interpret::GlobalAlloc;
 use rustc_middle::mir::{AssignOp, BinOp, BorrowKind, UnOp};
 use rustc_middle::thir::{
     AdtExpr, AdtExprBase, Arm, Block, BlockId, BlockSafety, BodyTy, ClosureExpr,
@@ -1573,7 +1574,15 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let generic_args = args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
                 SolOp::ConstValue(const_ident, generic_args)
             }
-            ExprKind::StaticRef { .. } => bug!("[unsupported] static ref"),
+            ExprKind::StaticRef { alloc_id, ty, def_id } => {
+                let static_ident = self.mk_ident(*def_id);
+                let static_ty = self.mk_type(*ty);
+                match self.tcx.global_alloc(*alloc_id) {
+                    GlobalAlloc::Static(static_def_id) if static_def_id == *def_id => {}
+                    _ => bug!("[invariant] invalid static ref in THIR"),
+                }
+                SolOp::StaticRef(static_ident, static_ty)
+            }
 
             // intrinsics
             ExprKind::Box { value } => SolOp::Box(self.mk_expr(thir, *value)),
@@ -2502,6 +2511,7 @@ pub(crate) enum SolOp {
     UpVarRef(SolIdent, SolLocalVarIndex),
     ConstParam(SolIdent),
     ConstValue(SolIdent, Vec<SolGenericArg>),
+    StaticRef(SolIdent, SolType),
     // intrisics
     Box(SolExpr),
     Deref(SolExpr),
