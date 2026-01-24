@@ -17,7 +17,7 @@ use rustc_middle::mir::{AssignOp, BinOp, BorrowKind, UnOp};
 use rustc_middle::thir::{
     AdtExpr, AdtExprBase, Arm, Block, BlockId, BlockSafety, BodyTy, ClosureExpr,
     DerefPatBorrowMode, Expr, ExprId, ExprKind, FieldExpr, FieldPat, FruInfo, LocalVarId,
-    LogicalOp, Pat, PatKind, Stmt, StmtId, StmtKind, Thir,
+    LogicalOp, Param, Pat, PatKind, Stmt, StmtId, StmtKind, Thir,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{
@@ -1401,6 +1401,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                     sig.inputs().iter().map(|input_ty| self.mk_type(*input_ty)).collect();
 
                 // parse parameters
+                let mut is_closure = false;
                 let mut param_iter = thir.params.iter_enumerated();
                 if thir.params.len() == params.len() + 1 {
                     // special case for closure: first parameter must be closure-related
@@ -1460,6 +1461,9 @@ impl<'tcx> ExecBuilder<'tcx> {
                             _ => bug!("[invariant] closure generic argument/parameter mismatch"),
                         }
                     }
+
+                    // now we are sure that this is a closure
+                    is_closure = true;
                 } else {
                     assert_eq!(
                         thir.params.len(),
@@ -1469,18 +1473,30 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
 
                 // declared parameters should match type declarations
-                for (param_ty, (_param_id, param_decl)) in params.iter().zip(param_iter) {
-                    let declared_param_ty = self.mk_type(param_decl.ty);
-                    assert_eq!(param_ty, &declared_param_ty, "[invariant] parameter type mismatch");
+                let mut param_decls = vec![];
+                for (
+                    (idx, param_ty),
+                    (param_id, Param { pat, ty, ty_span: _, self_kind: _, hir_id: _ }),
+                ) in params.into_iter().enumerate().zip(param_iter)
+                {
+                    assert_eq!(
+                        idx + if is_closure { 1 } else { 0 },
+                        param_id.index(),
+                        "[invariant] parameter id not sequential"
+                    );
 
-                    // FIXME: record parameter patterns as well
+                    let decl_ty = self.mk_type(*ty);
+                    assert_eq!(param_ty, decl_ty, "[invariant] parameter type mismatch");
+
+                    let decl_pat = pat.as_ref().map(|p| self.mk_pat(p));
+                    param_decls.push((decl_ty, decl_pat));
                 }
 
                 // parse the body expression
                 let body = self.mk_expr(thir, expr);
 
                 // pack the information
-                SolExec::Function(SolFnDef { abi: parsed_abi, ret_ty, params, body })
+                SolExec::Function(SolFnDef { abi: parsed_abi, ret_ty, params: param_decls, body })
             }
             BodyTy::Const(ty) => {
                 // sanity checks
@@ -2244,7 +2260,7 @@ pub(crate) enum SolExec {
 pub(crate) struct SolFnDef {
     pub(crate) abi: SolExternAbi,
     pub(crate) ret_ty: SolType,
-    pub(crate) params: Vec<SolType>,
+    pub(crate) params: Vec<(SolType, Option<SolPattern>)>,
     pub(crate) body: SolExpr,
 }
 
