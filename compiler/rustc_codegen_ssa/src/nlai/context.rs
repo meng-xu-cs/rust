@@ -87,6 +87,9 @@ struct ExecBuilder<'tcx> {
     /// static initializers
     static_inits: BTreeMap<SolIdent, Option<SolValue>>,
 
+    /// local variables
+    var_scope: BTreeMap<SolLocalVarIndex, SolLocalVarName>,
+
     /// log stack
     log_stack: LogStack,
 }
@@ -316,6 +319,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             adt_defs: BTreeMap::new(),
             trait_defs: BTreeMap::new(),
             static_inits: BTreeMap::new(),
+            var_scope: BTreeMap::new(),
             log_stack: LogStack::new(),
         }
     }
@@ -840,9 +844,17 @@ impl<'tcx> ExecBuilder<'tcx> {
         parsed
     }
 
+    /// Record a local variable identifier
+    pub(crate) fn mk_local_var_id(&mut self, LocalVarId(var_id): LocalVarId) -> SolLocalVarIndex {
+        SolLocalVarIndex(var_id.owner.def_id.local_def_index.index(), var_id.local_id.index())
+    }
+
     /// Record a pattern in the THIR context
     pub(crate) fn mk_pat(&mut self, pat: &Pat<'tcx>) -> SolPattern {
         let Pat { ty, span, extra: _, kind } = pat;
+
+        // mark the beginning
+        self.log_stack.push("Pattern", format!("{kind:?}"));
 
         // parse the basics
         let pat_ty = self.mk_type(*ty);
@@ -862,7 +874,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 var,
                 ty,
                 subpattern,
-                is_primary: _,
+                is_primary,
                 is_shorthand: _,
             } => {
                 let binding_mode = match (by_ref, mutability) {
@@ -875,9 +887,20 @@ impl<'tcx> ExecBuilder<'tcx> {
                 };
 
                 let var_name = SolLocalVarName(name.to_ident_string());
-                let var_index = SolLocalVarIndex(var.0.local_id.index());
+                let var_index = self.mk_local_var_id(*var);
                 let var_type = self.mk_type(*ty);
                 let var_subpat = subpattern.as_ref().map(|sub_pat| Box::new(self.mk_pat(sub_pat)));
+
+                // record the binding if primary
+                if *is_primary {
+                    let existing = self.var_scope.insert(var_index.clone(), var_name.clone());
+                    assert!(
+                        existing.is_none(),
+                        "[invariant] local variable {name} (with id: {}) is already defined",
+                        var.0
+                    );
+                }
+
                 SolPatRule::Bind {
                     name: var_name,
                     var_id: var_index,
@@ -961,6 +984,9 @@ impl<'tcx> ExecBuilder<'tcx> {
             // unreachable
             PatKind::Error(..) => bug!("[invariant] unreachable pattern {kind:?}"),
         };
+
+        // end of parsing
+        self.log_stack.pop();
 
         // construct the final pattern
         SolPattern { ty: pat_ty, rule: pat_rule, span: pat_span }
@@ -2380,25 +2406,27 @@ impl<'tcx> ExecBuilder<'tcx> {
 
             // use
             ExprKind::Use { source } => SolOp::Use(self.mk_expr(thir, *source)),
-            ExprKind::VarRef { id: LocalVarId(var_id) } => {
-                // FIXME: whlie we can't enforce the following check because closure may refer to upvar,
-                // we need to find a better way to ensure the correctness of local var references.
-                // assert_eq!(var_id.owner, self.owner_id, "[invariant] local var owner mismatch");
-                SolOp::VarRef(SolLocalVarIndex(var_id.local_id.index()))
+            ExprKind::VarRef { id } => {
+                let var_id = self.mk_local_var_id(*id);
+                assert!(
+                    self.var_scope.contains_key(&var_id),
+                    "[invariant] reference to undeclared local variable {id:?}"
+                );
+                SolOp::LocalVar(var_id)
             }
-            ExprKind::UpvarRef { closure_def_id, var_hir_id: LocalVarId(var_id) } => {
-                // FIXME: whlie we can't enforce the following check because closure may refer to upvar,
-                // we need to find a better way to ensure the correctness of upvar references.
-                // assert_eq!(var_id.owner, self.owner_id, "[invariant] local var owner mismatch");
+            ExprKind::UpvarRef { closure_def_id, var_hir_id } => {
                 assert_eq!(
                     closure_def_id,
                     &self.owner_id.to_def_id(),
                     "[invariant] closure def_id mismatch"
                 );
-                SolOp::UpVarRef(
-                    self.mk_ident(*closure_def_id),
-                    SolLocalVarIndex(var_id.local_id.index()),
-                )
+
+                let var_id = self.mk_local_var_id(*var_hir_id);
+                assert!(
+                    !self.var_scope.contains_key(&var_id),
+                    "[invariant] upvar refers to a declared local variable {var_hir_id:?}"
+                );
+                SolOp::UpVar(var_id)
             }
             ExprKind::ConstParam { param: ParamConst { index, name }, def_id } => {
                 let param_ident = self.get_param(*index, *name, SolGenericKind::Const);
@@ -2989,6 +3017,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             adt_defs,
             trait_defs,
             static_inits,
+            var_scope: _,
             log_stack,
         } = exec_builder;
         assert!(log_stack.is_empty(), "[invariant] log stack is not empty");
@@ -3399,8 +3428,8 @@ pub(crate) enum SolOp {
     TypeAscribe(SolExpr),
     // use
     Use(SolExpr),
-    VarRef(SolLocalVarIndex),
-    UpVarRef(SolIdent, SolLocalVarIndex),
+    LocalVar(SolLocalVarIndex),
+    UpVar(SolLocalVarIndex),
     ConstParam(SolIdent),
     ConstValue(SolIdent, Vec<SolGenericArg>),
     StaticRef(SolIdent),
@@ -3705,7 +3734,7 @@ pub(crate) struct SolLocalVarName(pub(crate) String);
 
 /// A index to a local variable
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct SolLocalVarIndex(pub(crate) usize);
+pub(crate) struct SolLocalVarIndex(pub(crate) usize, pub(crate) usize);
 
 /// A field name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
