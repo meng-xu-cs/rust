@@ -1442,6 +1442,17 @@ impl<'tcx> ExecBuilder<'tcx> {
             })
         };
 
+        // special handlings before layout-based reading
+        match ty.kind() {
+            ty::Alias(..) => {
+                let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
+                assert_ne!(norm_ty, ty, "[invariant] alias type should be normalized");
+                return self.read_const_from_memory_and_layout(memory, offset, norm_ty);
+            }
+            // all other types, continue to layout-based reading
+            _ => (),
+        };
+
         // get the layout of the type
         let layout = self
             .tcx
@@ -1455,7 +1466,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) => {
                 match layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
-                    _ => bug!("[invariant] expect a 0-variant for type: {ty}"),
+                    _ => bug!("[invariant] expect a 0-variant for primitive type: {ty}"),
                 }
                 if !matches!(layout.fields, FieldsShape::Primitive) {
                     bug!("[invariant] expect a primitive field for type: {ty}");
@@ -1467,12 +1478,222 @@ impl<'tcx> ExecBuilder<'tcx> {
                 self.mk_value_from_scalar(ty, scalar)
             }
 
+            // pointers
+            ty::RawPtr(sub_ty, _) | ty::Ref(_, sub_ty, _) => {
+                // sanity check on the variants
+                match &layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect a 0-variant for ptr type {ty}"),
+                }
+
+                // need to resolve the dynamic type (if relevant)
+                let pointer_size = self.tcx.data_layout.pointer_size();
+                let is_dyn_ty = matches!(sub_ty.kind(), ty::Dynamic(..));
+
+                let actual_sub_ty = if is_dyn_ty {
+                    // the dynamic type must carries a metadata
+                    if layout.size != pointer_size * 2 {
+                        bug!("[invariant] expect metadata in the layout for {ty}");
+                    }
+
+                    // derive the metadata offset
+                    let offset_metadata = match &layout.fields {
+                        FieldsShape::Arbitrary { offsets, in_memory_order: _ } => {
+                            // we know the metadata should be the second field, but still verify it
+                            if offsets.len() != 2 {
+                                bug!("[invariant] expect two fields for {ty}");
+                            }
+                            let mut offsets_iter = offsets.into_iter();
+                            let off_pointer = *offsets_iter.next().unwrap();
+                            let off_metadata = *offsets_iter.next().unwrap();
+                            if off_pointer.bytes_usize() != 0 || off_metadata != pointer_size {
+                                bug!("[invariant] unexpected offsets for {ty}");
+                            }
+                            off_metadata
+                        }
+                        _ => bug!("[invariant] expect arbitrary layout for {ty}"),
+                    };
+
+                    // read the metadata
+                    let alloc_id = match read_primitive(
+                        self.tcx,
+                        offset + offset_metadata,
+                        pointer_size,
+                        true,
+                    ) {
+                        Scalar::Int(_) => {
+                            bug!("[invariant] expect vtable for {sub_ty} in {ty}");
+                        }
+                        Scalar::Ptr(scalar_ptr, _) => {
+                            let (prov, offset) = scalar_ptr.into_raw_parts();
+                            if offset != Size::ZERO {
+                                bug!("[invariant] expect zero offset for vtable pointer");
+                            }
+                            prov.alloc_id()
+                        }
+                    };
+
+                    // get the actual underlying type behind the vtable
+                    let actual_ty = match self.tcx.global_alloc(alloc_id) {
+                        GlobalAlloc::VTable(vty, _) => vty,
+                        _ => bug!("[invariant] {ty} has non-vtable metadata"),
+                    };
+
+                    // ensure that the actual type is sized (so later we don't parse the metadata as size)
+                    if !actual_ty.is_sized(self.tcx, self.typing_env) {
+                        bug!("[assumption] actual type {actual_ty} behind vtable should be sized");
+                    }
+
+                    // return the actual type
+                    actual_ty
+                } else {
+                    *sub_ty
+                };
+
+                // read and parse the pointer
+                let const_val = match read_primitive(self.tcx, offset, pointer_size, true) {
+                    Scalar::Ptr(ptr, _) => {
+                        let (prov, offset) = ptr.into_raw_parts();
+
+                        match self.tcx.global_alloc(prov.alloc_id()) {
+                            GlobalAlloc::Memory(allocated) => {
+                                let inner_memory = allocated.inner();
+                                assert!(
+                                    matches!(inner_memory.mutability, Mutability::Not),
+                                    "[invariant] provenance to mutable memory: {ty}"
+                                );
+                                let (_, pointee_val) = self.read_const_from_memory_and_layout(
+                                    inner_memory,
+                                    offset,
+                                    actual_sub_ty,
+                                );
+
+                                // now construct the value
+                                match ty.kind() {
+                                    ty::Ref(_, _, Mutability::Not) => {
+                                        SolValue::ImmRef(Box::new(pointee_val))
+                                    }
+                                    ty::RawPtr(_, Mutability::Not) => {
+                                        SolValue::ImmPtr(Box::new(pointee_val))
+                                    }
+                                    ty::Ref(_, _, Mutability::Mut)
+                                    | ty::RawPtr(_, Mutability::Mut) => {
+                                        bug!("[invariant] mut ptr/ref to imm memory: {ty}")
+                                    }
+                                    _ => bug!("[invariant] unreachable type: {ty}"),
+                                }
+                            }
+                            GlobalAlloc::Static(def_id) => {
+                                self.mk_static_init(def_id, actual_sub_ty);
+                                // FIXME: represent recursive static references
+                                //        also don't forget to record `offset` variable
+                                bug!("[unsupported] offset to static");
+                            }
+
+                            // unsupported
+                            GlobalAlloc::TypeId { .. } => bug!("[unsupported] type id provenance"),
+                            GlobalAlloc::Function { .. } => {
+                                bug!("[unsupported] function provenance casted as pointer")
+                            }
+
+                            // unexpected
+                            GlobalAlloc::VTable(..) => {
+                                bug!("[invariant] unexpected provenance of type: {ty}")
+                            }
+                        }
+                    }
+                    Scalar::Int(int) => {
+                        if !int.is_null() {
+                            bug!("[unsupported] non-null scalar pointer");
+                        }
+                        let pointee_ty = self.mk_type(*sub_ty);
+
+                        // now construct the value
+                        match ty.kind() {
+                            ty::RawPtr(_, Mutability::Not) => SolValue::ImmPtrNull(pointee_ty),
+                            ty::RawPtr(_, Mutability::Mut) => SolValue::MutPtrNull(pointee_ty),
+                            ty::Ref(..) => {
+                                bug!("[invariant] null for reference: {ty}")
+                            }
+                            _ => bug!("[invariant] unreachable type: {ty}"),
+                        }
+                    }
+                };
+
+                // check whether the metadata should be a ZST
+                // NOTE: we only handle size-based metadata for now
+                let need_metadata = !actual_sub_ty.is_sized(self.tcx, self.typing_env);
+
+                // switch by whether we need metadata
+                if need_metadata {
+                    // sanity check on the shape of the fields
+                    if pointer_size * 2 != layout.size {
+                        bug!(
+                            "[invariant] invalid layout size for {ty},
+                            expect metadata but got {}",
+                            layout.size.bytes_usize()
+                        );
+                    }
+
+                    // derive the metadata offset
+                    let offset_metadata = match &layout.fields {
+                        FieldsShape::Arbitrary { offsets, in_memory_order: _ } => {
+                            if offsets.len() != 2 {
+                                bug!("[invariant] expect two fields for {ty}");
+                            }
+                            let mut offsets_iter = offsets.into_iter();
+                            let off_pointer = *offsets_iter.next().unwrap();
+                            let off_metadata = *offsets_iter.next().unwrap();
+                            if off_pointer.bytes_usize() != 0 || off_metadata != pointer_size {
+                                bug!("[invariant] unexpected offsets for {ty}");
+                            }
+                            off_metadata
+                        }
+                        _ => bug!("[invariant] expect arbitrary layout for {ty}"),
+                    };
+
+                    // read the metadata
+                    let metadata = match read_primitive(
+                        self.tcx,
+                        offset + offset_metadata,
+                        pointer_size,
+                        false,
+                    ) {
+                        Scalar::Int(scalar_int) => scalar_int.to_target_usize(self.tcx) as usize,
+                        Scalar::Ptr(..) => {
+                            bug!("[invariant] unexpected scalar ptr metadata for {ty}")
+                        }
+                    };
+
+                    // silently ignore the metadata for now
+                    // MAYFIX: we may want to record the metadata for future uses?
+                    let _ = metadata;
+                } else {
+                    // sanity check on the shape of the fields
+                    if !is_dyn_ty {
+                        if pointer_size != layout.size {
+                            bug!(
+                                "[invariant] invalid layout size for {ty},
+                                expect no more metadata behind dyn reference but got {}",
+                                layout.size.bytes_usize()
+                            );
+                        }
+                        if !matches!(layout.fields, FieldsShape::Primitive) {
+                            bug!("[invariant] expect a primitive field for {ty}");
+                        }
+                    }
+                }
+
+                // return the constructed constant value
+                const_val
+            }
+
             // function pointer
             ty::FnPtr(..) => {
                 // sanity check on the variants
                 match &layout.variants {
                     Variants::Single { index } if index.index() == 0 => {}
-                    _ => bug!("[invariant] expect a 0-variant for type {ty}"),
+                    _ => bug!("[invariant] expect a 0-variant for fn-ptr type {ty}"),
                 }
 
                 // construct the type
@@ -1515,7 +1736,172 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
             }
 
-            _ => bug!("[invariant] unhandled type for reading constant from memory: {ty}"),
+            // vector-alike
+            ty::Array(elem_ty, _) => {
+                match &layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect a 0-variant for array type {ty}"),
+                }
+                match &layout.fields {
+                    FieldsShape::Array { stride, count } => {
+                        let mut elements = vec![];
+                        for i in 0..*count {
+                            let elem_offset = offset + *stride * i;
+                            let (_, elem) = self.read_const_from_memory_and_layout(
+                                memory,
+                                elem_offset,
+                                *elem_ty,
+                            );
+                            elements.push(SolConst::Value(elem));
+                        }
+                        SolValue::Array(self.mk_type(*elem_ty), elements)
+                    }
+                    _ => bug!("[invariant] expect array field layout for array {ty}"),
+                }
+            }
+            ty::Slice(elem_ty) => {
+                match &layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect a 0-variant for slice type {ty}"),
+                }
+                match &layout.fields {
+                    FieldsShape::Array { stride, count } => {
+                        let mut elements = vec![];
+                        for i in 0..*count {
+                            let elem_offset = offset + *stride * i;
+                            let (_, elem) = self.read_const_from_memory_and_layout(
+                                memory,
+                                elem_offset,
+                                *elem_ty,
+                            );
+                            elements.push(SolConst::Value(elem));
+                        }
+                        SolValue::Slice(self.mk_type(*elem_ty), elements)
+                    }
+                    _ => bug!("[invariant] expect an array field layout for slice {ty}"),
+                }
+            }
+            ty::Str => {
+                match &layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect a 0-variant for str type"),
+                }
+                match &layout.fields {
+                    FieldsShape::Array { stride, count } => {
+                        let range = AllocRange { start: Size::ZERO, size: *stride * *count };
+                        let num_prov = memory.provenance().get_range(range, &self.tcx).count();
+                        if num_prov != 0 {
+                            bug!("[invariant] string memory contains provenance");
+                        }
+
+                        let bytes = memory
+                            .get_bytes_strip_provenance(&self.tcx, range)
+                            .unwrap_or_else(|e| {
+                                bug!("[invariant] failed to read bytes for string memory: {e:?}");
+                            });
+                        SolValue::Str(String::from_utf8(bytes.to_vec()).unwrap_or_else(|e| {
+                            bug!("[invariant] non utf-8 string memory: {e}");
+                        }))
+                    }
+                    _ => bug!("[invariant] expect an array field for str type"),
+                }
+            }
+
+            // packed
+            ty::Tuple(elem_tys) => {
+                match &layout.variants {
+                    Variants::Single { index } if index.index() == 0 => {}
+                    _ => bug!("[invariant] expect a 0-variant for tuple type {ty}"),
+                }
+                match &layout.fields {
+                    FieldsShape::Arbitrary { offsets, in_memory_order: _ } => {
+                        if offsets.len() != elem_tys.len() {
+                            bug!("[invariant] field count mismatch for tuple type {ty}");
+                        }
+
+                        let mut elements = vec![];
+                        for (i, elem_ty) in elem_tys.iter().enumerate() {
+                            let field_idx = FieldIdx::from_usize(i);
+                            let field_offset = *offsets.get(field_idx).unwrap_or_else(|| {
+                                bug!("[invariant] no offset for field {i} in {ty}");
+                            });
+                            let (_, elem) = self.read_const_from_memory_and_layout(
+                                memory,
+                                offset + field_offset,
+                                elem_ty,
+                            );
+                            elements.push(SolConst::Value(elem));
+                        }
+                        SolValue::Tuple(elements)
+                    }
+                    _ => bug!("[invariant] expect arbitrary fields for tuple {ty}"),
+                }
+            }
+
+            ty::Adt(def, ty_args) => {
+                let (adt_ident, adt_ty_args) = self.mk_adt(*def, ty_args);
+                match def.adt_kind() {
+                    AdtKind::Struct => {
+                        let field_details = def
+                            .non_enum_variant()
+                            .fields
+                            .iter_enumerated()
+                            .map(|(field_idx, field_def)| {
+                                (field_idx, field_def.name, field_def.ty(self.tcx, ty_args))
+                            })
+                            .collect::<Vec<_>>();
+
+                        match &layout.variants {
+                            Variants::Single { index } if index.index() == 0 => {}
+                            _ => bug!("[invariant] expect a 0-variant for struct type {ty}"),
+                        }
+                        match &layout.fields {
+                            FieldsShape::Arbitrary { offsets, in_memory_order: _ } => {
+                                if offsets.len() != field_details.len() {
+                                    bug!("[invariant] field count mismatch for struct {ty}");
+                                }
+
+                                let mut elements = vec![];
+                                for (field_idx, field_name, field_ty) in field_details {
+                                    let field_offset = *offsets.get(field_idx).unwrap_or_else(|| {
+                                    bug!("[invariant] no offset for field {field_name} in struct {ty}");
+                                });
+                                    let (_, elem) = self.read_const_from_memory_and_layout(
+                                        memory,
+                                        offset + field_offset,
+                                        field_ty,
+                                    );
+                                    elements.push((
+                                        SolFieldIndex(field_idx.index()),
+                                        SolConst::Value(elem),
+                                    ));
+                                }
+                                SolValue::Struct(adt_ident, adt_ty_args, elements)
+                            }
+                            _ => bug!("[invariant] expect arbitrary fields for struct {ty}"),
+                        }
+                    }
+                    AdtKind::Union => bug!("[unsupported] memory allocation for union"),
+                    AdtKind::Enum => bug!("[unsupported] memory allocation for enum"),
+                }
+            }
+
+            // closure
+            ty::Closure(def_id, ty_args) => SolValue::Closure(
+                self.mk_ident(*def_id),
+                ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect(),
+            ),
+
+            // unexpected
+            _ => bug!(
+                "[invariant] unhandled type for reading constant from memory: {ty}\n[{}]",
+                memory
+                    .get_bytes_unchecked(AllocRange { start: offset, size: memory.size() - offset })
+                    .iter()
+                    .map(|b| format!("{b}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
         };
 
         // return the size consumed and the value
@@ -1723,8 +2109,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                 // ensure type matches
                 assert_eq!(ty, ref_ty, "[invariant] static ref type mismatch");
                 let mem_ty = match ref_ty.kind() {
-                    ty::Ref(_, inner_ty, _) => inner_ty,
-                    _ => bug!("[invariant] static ref must be a reference type"),
+                    ty::Ref(_, inner_ty, _) | ty::RawPtr(inner_ty, _) => inner_ty,
+                    _ => bug!("[invariant] static ref must be a ref or a ptr type"),
                 };
                 let static_ident = self.mk_static_init(*def_id, *mem_ty);
                 SolOp::StaticRef(static_ident)
@@ -2121,6 +2507,8 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
             SolValue::ImmRef(inner_val) => SolType::ImmRef(Box::new(self.type_of_value(inner_val))),
             SolValue::MutRef(inner_val) => SolType::MutRef(Box::new(self.type_of_value(inner_val))),
+            SolValue::ImmPtr(inner_val) => SolType::ImmPtr(Box::new(self.type_of_value(inner_val))),
+            SolValue::MutPtr(inner_val) => SolType::MutPtr(Box::new(self.type_of_value(inner_val))),
             SolValue::ImmPtrNull(inner_ty) => SolType::ImmPtr(Box::new(inner_ty.clone())),
             SolValue::MutPtrNull(inner_ty) => SolType::MutPtr(Box::new(inner_ty.clone())),
             SolValue::FuncDef(ident, ty_args) => SolType::Function(ident.clone(), ty_args.clone()),
@@ -2648,6 +3036,8 @@ pub(crate) enum SolValue {
     // reference
     ImmRef(Box<SolValue>),
     MutRef(Box<SolValue>),
+    ImmPtr(Box<SolValue>),
+    MutPtr(Box<SolValue>),
     ImmPtrNull(SolType),
     MutPtrNull(SolType),
     // function pointers
