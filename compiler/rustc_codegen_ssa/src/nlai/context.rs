@@ -16,7 +16,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{
-    Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, MatchSource, Mod, OwnerId, Safety,
+    Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, MatchSource, Mod, OwnerId, RangeEnd, Safety,
 };
 use rustc_middle::middle::region::Scope;
 use rustc_middle::mir::interpret::{AllocRange, Allocation, GlobalAlloc, Scalar};
@@ -24,7 +24,7 @@ use rustc_middle::mir::{AssignOp, BinOp, BorrowKind, UnOp};
 use rustc_middle::thir::{
     AdtExpr, AdtExprBase, Arm, Block, BlockId, BlockSafety, BodyTy, ClosureExpr,
     DerefPatBorrowMode, Expr, ExprId, ExprKind, FieldExpr, FieldPat, FruInfo, LocalVarId,
-    LogicalOp, Param, Pat, PatKind, Stmt, StmtId, StmtKind, Thir,
+    LogicalOp, Param, Pat, PatKind, PatRange, PatRangeBoundary, Stmt, StmtId, StmtKind, Thir,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::util::Discr;
@@ -931,13 +931,32 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
             }
 
+            PatKind::Range(pat_range) => {
+                let PatRange { lo, hi, end, ty } = pat_range.as_ref();
+                let bound_lo = match lo {
+                    PatRangeBoundary::PosInfinity => bug!("[invariant] +inf in lo range"),
+                    PatRangeBoundary::NegInfinity => None,
+                    PatRangeBoundary::Finite(valtree) => {
+                        Some(self.mk_value_from_scalar(*ty, valtree.to_leaf()))
+                    }
+                };
+                let bound_hi = match hi {
+                    PatRangeBoundary::NegInfinity => bug!("[invariant] -inf in hi range"),
+                    PatRangeBoundary::PosInfinity => None,
+                    PatRangeBoundary::Finite(valtree) => {
+                        Some(self.mk_value_from_scalar(*ty, valtree.to_leaf()))
+                    }
+                };
+                let end_inclusive = match end {
+                    RangeEnd::Included => true,
+                    RangeEnd::Excluded => false,
+                };
+                SolPatRule::Range { lo: bound_lo, hi: bound_hi, end_inclusive }
+            }
             PatKind::Constant { value } => SolPatRule::Constant(self.mk_value(*value)),
             PatKind::Or { box pats } => {
                 SolPatRule::Or(pats.iter().map(|sub_pat| self.mk_pat(sub_pat)).collect())
             }
-
-            // unsupported
-            PatKind::Range(..) => bug!("[unsupported] range pattern"),
 
             // unreachable
             PatKind::Error(..) => bug!("[invariant] unreachable pattern {kind:?}"),
@@ -3573,6 +3592,11 @@ pub(crate) enum SolPatRule {
     DerefBox(Box<SolPattern>),
     DerefImm(Box<SolPattern>),
     DerefMut(Box<SolPattern>),
+    Range {
+        lo: Option<SolValue>,
+        hi: Option<SolValue>,
+        end_inclusive: bool,
+    },
     Constant(SolValue),
     Or(Vec<SolPattern>),
 }
