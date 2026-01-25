@@ -38,7 +38,7 @@ use rustc_middle::ty::{
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
 use rustc_trait_selection::infer::TyCtxtInferExt;
-use rustc_trait_selection::traits;
+use rustc_trait_selection::traits::{self, EvaluateConstErr};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -774,7 +774,10 @@ impl<'tcx> ExecBuilder<'tcx> {
             // alias
             ty::Alias(AliasTyKind::Projection, alias_ty) => {
                 match self.tcx.try_normalize_erasing_regions(self.typing_env, ty) {
-                    Ok(norm_ty) if norm_ty != ty => SolType::Alias(Box::new(self.mk_type(norm_ty))),
+                    Ok(norm_ty) if norm_ty != ty => {
+                        // MAYFIX: keep track of projection types separately, i.e., SolType::Proj(..)?
+                        self.mk_type(norm_ty)
+                    }
                     _ => {
                         // It is possible that normalization does not change the type, for example,
                         // when the projection comes from a type parameter (which implements a trait),
@@ -802,18 +805,21 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::Alias(AliasTyKind::Inherent, _) => {
                 let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
                 assert_ne!(norm_ty, ty, "[invariant] inherent alias type should be normalized");
-                SolType::Alias(Box::new(self.mk_type(norm_ty)))
+                // MAYFIX: keep track of inherent alias types separately, i.e., SolType::Alias(..)?
+                self.mk_type(norm_ty)
             }
             ty::Alias(AliasTyKind::Opaque, alias_ty) => {
-                let actual_ty = self.mk_type(
-                    self.tcx.type_of(alias_ty.def_id).instantiate(self.tcx, alias_ty.args),
-                );
-                SolType::Opaque(Box::new(actual_ty))
+                let norm_ty =
+                    self.tcx.type_of(alias_ty.def_id).instantiate(self.tcx, alias_ty.args);
+                assert_ne!(norm_ty, ty, "[invariant] opaque alias type should be normalized");
+                // MAYFIX: keep track of opaque alias types separately, i.e., SolType::Opaque(..)?
+                self.mk_type(norm_ty)
             }
             ty::Alias(AliasTyKind::Free, _) => {
                 let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
                 assert_ne!(norm_ty, ty, "[invariant] free alias type should be normalized");
-                SolType::Opaque(Box::new(self.mk_type(norm_ty)))
+                // MAYFIX: keep track of free alias types separately, i.e., SolType::Alias(..)?
+                self.mk_type(norm_ty)
             }
 
             // unsupported
@@ -952,19 +958,32 @@ impl<'tcx> ExecBuilder<'tcx> {
             ConstKind::Value(val) => SolConst::Value(self.mk_value(val)),
 
             // evaluate unevaluated constants
-            ConstKind::Unevaluated(_) => {
+            ConstKind::Unevaluated(uneval) => {
                 // evaluate it with an inference context
-                let evaluated = traits::try_evaluate_const(
+                match traits::try_evaluate_const(
                     &self.tcx.infer_ctxt().build(self.typing_env.typing_mode),
                     cval,
                     self.typing_env.param_env,
-                )
-                .unwrap_or_else(|_| bug!("[unsupported] unevaluatable const"));
+                ) {
+                    Ok(evaluated) => {
+                        if matches!(evaluated.kind(), ConstKind::Unevaluated(_)) {
+                            bug!("[invariant] fail to evaluate const: {cval} -> {evaluated}");
+                        }
+                        self.mk_const(evaluated)
+                    }
+                    Err(EvaluateConstErr::HasGenericsOrInfers) => {
+                        // very likey we hit an associated item that can't be evaluated now
+                        let const_ty = self.tcx.normalize_erasing_regions(
+                            self.typing_env,
+                            self.tcx.type_of(uneval.def).instantiate(self.tcx, uneval.args),
+                        );
 
-                if matches!(evaluated.kind(), ConstKind::Unevaluated(_)) {
-                    bug!("[invariant] unable to fully evaluate const: {cval} -> {evaluated}");
+                        // FIXME: also record the def_id and generic_args, currently we are not
+                        // recording it because we don't know how to eliminate the Self type reliably.
+                        SolConst::Unevaluated(self.mk_type(const_ty))
+                    }
+                    Err(_) => bug!("[invariant] failed to evaluate const {cval}"),
                 }
-                self.mk_const(evaluated)
             }
 
             // unsupported
@@ -2829,6 +2848,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                     SolGenericKind::Lifetime => bug!("[invariant] lifetime generic used as const"),
                 })
                 .unwrap_or_else(|| bug!("[invariant] generic parameter not found")),
+            SolConst::Unevaluated(ty) => ty.clone(),
         }
     }
 }
@@ -3188,8 +3208,8 @@ pub(crate) enum SolType {
         item_ty_args: Vec<SolGenericArg>,
     },
     // alias types
-    Alias(Box<SolType>),
-    Opaque(Box<SolType>),
+    // MAYFIX: currently we always resolve (i.e., normalize) alias/opaque types
+    // to their underlying types. We might want to keep them around in some cases.
 }
 
 /// A function signature
@@ -3292,6 +3312,7 @@ pub(crate) enum SolClause {
 pub(crate) enum SolConst {
     Param(SolIdent),
     Value(SolValue),
+    Unevaluated(SolType),
 }
 
 /// A constant with concrete value and type
