@@ -912,7 +912,9 @@ impl<'tcx> ExecBuilder<'tcx> {
                 SolPatRule::Array { prefix: prefix_pats, slice: slice_pat, suffix: suffix_pats }
             }
 
-            PatKind::Deref { subpattern } => SolPatRule::Deref(Box::new(self.mk_pat(subpattern))),
+            PatKind::Deref { pin: _, subpattern } => {
+                SolPatRule::Deref(Box::new(self.mk_pat(subpattern)))
+            }
             PatKind::DerefPattern { subpattern, borrow } => {
                 let sub_pat = Box::new(self.mk_pat(subpattern));
                 match borrow {
