@@ -1083,15 +1083,12 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::Float(FloatTy::F64) => SolValue::F64(scalar.to_f64().to_string()),
             ty::Float(FloatTy::F128) => SolValue::F128(scalar.to_f128().to_string()),
             ty::RawPtr(inner_ty, mutability) => {
-                if !scalar.is_null() {
-                    bug!("[unsupported] non-null scalar pointer");
-                }
-
-                // as far as we concern, only null pointers are meaningful constant values
+                // NOTE: we allow non-zero pointer values are meaningful (and nullptr) constant values
+                let ptrval = scalar.to_target_usize(self.tcx) as usize;
                 let pointee_ty = self.mk_type(*inner_ty);
                 match mutability {
-                    Mutability::Not => SolValue::ImmPtrNull(pointee_ty),
-                    Mutability::Mut => SolValue::MutPtrNull(pointee_ty),
+                    Mutability::Not => SolValue::ImmPtrNull(pointee_ty, ptrval),
+                    Mutability::Mut => SolValue::MutPtrNull(pointee_ty, ptrval),
                 }
             }
 
@@ -1693,10 +1690,33 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 }
                             }
                             GlobalAlloc::Static(def_id) => {
-                                self.mk_static_init(def_id, actual_sub_ty);
-                                // FIXME: represent recursive static references
-                                //        also don't forget to record `offset` variable
-                                bug!("[unsupported] offset to static");
+                                let static_ident = self.mk_static_init(def_id, actual_sub_ty);
+                                let pointee_ty = self.mk_type(actual_sub_ty);
+
+                                // now construct the value
+                                match ty.kind() {
+                                    ty::RawPtr(_, Mutability::Not) => SolValue::ImmPtrStatic(
+                                        pointee_ty,
+                                        static_ident,
+                                        offset.bytes_usize(),
+                                    ),
+                                    ty::RawPtr(_, Mutability::Mut) => SolValue::MutPtrStatic(
+                                        pointee_ty,
+                                        static_ident,
+                                        offset.bytes_usize(),
+                                    ),
+                                    ty::Ref(_, _, Mutability::Not) => SolValue::ImmRefStatic(
+                                        pointee_ty,
+                                        static_ident,
+                                        offset.bytes_usize(),
+                                    ),
+                                    ty::Ref(_, _, Mutability::Mut) => SolValue::MutRefStatic(
+                                        pointee_ty,
+                                        static_ident,
+                                        offset.bytes_usize(),
+                                    ),
+                                    _ => bug!("[invariant] unreachable type: {ty}"),
+                                }
                             }
 
                             // unsupported
@@ -1712,15 +1732,18 @@ impl<'tcx> ExecBuilder<'tcx> {
                         }
                     }
                     Scalar::Int(int) => {
-                        if !int.is_null() {
-                            bug!("[unsupported] non-null scalar pointer");
-                        }
-                        let pointee_ty = self.mk_type(*sub_ty);
+                        // NOTE: we allow non-zero pointer values are meaningful (and nullptr) constant values
+                        let ptrval = int.to_target_usize(self.tcx) as usize;
+                        let pointee_ty = self.mk_type(actual_sub_ty);
 
                         // now construct the value
                         match ty.kind() {
-                            ty::RawPtr(_, Mutability::Not) => SolValue::ImmPtrNull(pointee_ty),
-                            ty::RawPtr(_, Mutability::Mut) => SolValue::MutPtrNull(pointee_ty),
+                            ty::RawPtr(_, Mutability::Not) => {
+                                SolValue::ImmPtrNull(pointee_ty, ptrval)
+                            }
+                            ty::RawPtr(_, Mutability::Mut) => {
+                                SolValue::MutPtrNull(pointee_ty, ptrval)
+                            }
                             ty::Ref(..) => {
                                 bug!("[invariant] null for reference: {ty}")
                             }
@@ -2846,6 +2869,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             SolValue::F64(_) => SolType::F64,
             SolValue::F128(_) => SolType::F128,
             SolValue::Str(_) => SolType::Str,
+
             SolValue::Tuple(elems) => {
                 SolType::Tuple(elems.iter().map(|elem| self.type_of_const(elem)).collect())
             }
@@ -2863,12 +2887,19 @@ impl<'tcx> ExecBuilder<'tcx> {
             SolValue::Enum(adt_ident, adt_args, ..) => {
                 SolType::Enum(adt_ident.clone(), adt_args.clone())
             }
+
             SolValue::ImmRef(inner_val) => SolType::ImmRef(Box::new(self.type_of_value(inner_val))),
             SolValue::MutRef(inner_val) => SolType::MutRef(Box::new(self.type_of_value(inner_val))),
+            SolValue::ImmRefStatic(inner_ty, _, _) => SolType::ImmRef(Box::new(inner_ty.clone())),
+            SolValue::MutRefStatic(inner_ty, _, _) => SolType::MutRef(Box::new(inner_ty.clone())),
+
             SolValue::ImmPtr(inner_val) => SolType::ImmPtr(Box::new(self.type_of_value(inner_val))),
             SolValue::MutPtr(inner_val) => SolType::MutPtr(Box::new(self.type_of_value(inner_val))),
-            SolValue::ImmPtrNull(inner_ty) => SolType::ImmPtr(Box::new(inner_ty.clone())),
-            SolValue::MutPtrNull(inner_ty) => SolType::MutPtr(Box::new(inner_ty.clone())),
+            SolValue::ImmPtrStatic(inner_ty, _, _) => SolType::ImmPtr(Box::new(inner_ty.clone())),
+            SolValue::MutPtrStatic(inner_ty, _, _) => SolType::MutPtr(Box::new(inner_ty.clone())),
+            SolValue::ImmPtrNull(inner_ty, _) => SolType::ImmPtr(Box::new(inner_ty.clone())),
+            SolValue::MutPtrNull(inner_ty, _) => SolType::MutPtr(Box::new(inner_ty.clone())),
+
             SolValue::FuncDef(ident, ty_args) => SolType::Function(ident.clone(), ty_args.clone()),
             SolValue::Closure(ident, ty_args) => SolType::Closure(ident.clone(), ty_args.clone()),
             SolValue::FnPtr(fn_sig, _, _) => SolType::FnPtr(fn_sig.clone()),
@@ -3397,10 +3428,14 @@ pub(crate) enum SolValue {
     // reference
     ImmRef(Box<SolValue>),
     MutRef(Box<SolValue>),
+    ImmRefStatic(SolType, SolIdent, usize),
+    MutRefStatic(SolType, SolIdent, usize),
     ImmPtr(Box<SolValue>),
     MutPtr(Box<SolValue>),
-    ImmPtrNull(SolType),
-    MutPtrNull(SolType),
+    ImmPtrStatic(SolType, SolIdent, usize),
+    MutPtrStatic(SolType, SolIdent, usize),
+    ImmPtrNull(SolType, usize),
+    MutPtrNull(SolType, usize),
     // function pointers
     FuncDef(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
