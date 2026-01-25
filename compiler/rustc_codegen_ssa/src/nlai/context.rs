@@ -1744,8 +1744,11 @@ impl<'tcx> ExecBuilder<'tcx> {
                             ty::RawPtr(_, Mutability::Mut) => {
                                 SolValue::MutPtrNull(pointee_ty, ptrval)
                             }
-                            ty::Ref(..) => {
-                                bug!("[invariant] null for reference: {ty}")
+                            ty::Ref(_, _, Mutability::Not) => {
+                                SolValue::ImmRefNull(pointee_ty, ptrval)
+                            }
+                            ty::Ref(_, _, Mutability::Mut) => {
+                                SolValue::MutRefNull(pointee_ty, ptrval)
                             }
                             _ => bug!("[invariant] unreachable type: {ty}"),
                         }
@@ -2892,6 +2895,8 @@ impl<'tcx> ExecBuilder<'tcx> {
             SolValue::MutRef(inner_val) => SolType::MutRef(Box::new(self.type_of_value(inner_val))),
             SolValue::ImmRefStatic(inner_ty, _, _) => SolType::ImmRef(Box::new(inner_ty.clone())),
             SolValue::MutRefStatic(inner_ty, _, _) => SolType::MutRef(Box::new(inner_ty.clone())),
+            SolValue::ImmRefNull(inner_ty, _) => SolType::ImmRef(Box::new(inner_ty.clone())),
+            SolValue::MutRefNull(inner_ty, _) => SolType::MutRef(Box::new(inner_ty.clone())),
 
             SolValue::ImmPtr(inner_val) => SolType::ImmPtr(Box::new(self.type_of_value(inner_val))),
             SolValue::MutPtr(inner_val) => SolType::MutPtr(Box::new(self.type_of_value(inner_val))),
@@ -3430,6 +3435,8 @@ pub(crate) enum SolValue {
     MutRef(Box<SolValue>),
     ImmRefStatic(SolType, SolIdent, usize),
     MutRefStatic(SolType, SolIdent, usize),
+    ImmRefNull(SolType, usize),
+    MutRefNull(SolType, usize),
     ImmPtr(Box<SolValue>),
     MutPtr(Box<SolValue>),
     ImmPtrStatic(SolType, SolIdent, usize),
