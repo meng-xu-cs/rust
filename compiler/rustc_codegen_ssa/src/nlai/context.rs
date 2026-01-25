@@ -1,3 +1,5 @@
+// ignore-tidy-filelength
+
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
 use std::path::PathBuf;
@@ -1376,7 +1378,43 @@ impl<'tcx> ExecBuilder<'tcx> {
                         )
                     }
                     AdtKind::Union => bug!("[unsupported] union const value"),
-                    AdtKind::Enum => bug!("[unsupported] enum const value"),
+                    AdtKind::Enum => {
+                        // the first const is the variant index
+                        if consts.is_empty() {
+                            bug!("[invariant] enum const value with no variant");
+                        }
+
+                        let variant_index = match &consts[0] {
+                            SolConst::Value(SolValue::U32(idx)) => VariantIdx::from_u32(*idx),
+                            _ => bug!("[invariant] expect enum variant index as u32 const"),
+                        };
+
+                        let variant_def = def.variant(variant_index);
+                        assert_eq!(
+                            consts.len() - 1,
+                            variant_def.fields.len(),
+                            "[invariant] enum field count mismatch"
+                        );
+                        SolValue::Enum(
+                            adt_ident,
+                            adt_ty_args,
+                            SolVariantIndex(variant_index.index()),
+                            variant_def
+                                .fields
+                                .iter_enumerated()
+                                .zip(&consts[1..])
+                                .map(|((field_idx, field_def), field_const)| {
+                                    let field_ty = field_def.ty(self.tcx, ty_args);
+                                    assert_eq!(
+                                        self.type_of_const(field_const),
+                                        self.mk_type(field_ty),
+                                        "[invariant] enum field type mismatch"
+                                    );
+                                    (SolFieldIndex(field_idx.index()), field_const.clone())
+                                })
+                                .collect(),
+                        )
+                    }
                 }
             }
 
