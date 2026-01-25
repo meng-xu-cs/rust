@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
 use std::path::PathBuf;
 
-use rustc_abi::{ExternAbi, FieldIdx, FieldsShape, Size, VariantIdx, Variants};
+use rustc_abi::{
+    ExternAbi, FieldIdx, FieldsShape, Primitive, Scalar as ScalarAbi, Size, TagEncoding,
+    VariantIdx, Variants,
+};
 use rustc_ast::{
     AttrStyle, BindingMode, ByRef, FloatTy, IntTy, LitFloatType, LitIntType, LitKind, Mutability,
     UintTy,
@@ -21,6 +24,7 @@ use rustc_middle::thir::{
     LogicalOp, Param, Pat, PatKind, Stmt, StmtId, StmtKind, Thir,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
+use rustc_middle::ty::util::Discr;
 use rustc_middle::ty::{
     AdtDef, AdtKind, AliasTyKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig,
     GenericArg, GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, List,
@@ -1371,8 +1375,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 .collect(),
                         )
                     }
-                    AdtKind::Enum => bug!("[unsupported] enum const value"),
                     AdtKind::Union => bug!("[unsupported] union const value"),
+                    AdtKind::Enum => bug!("[unsupported] enum const value"),
                 }
             }
 
@@ -1881,8 +1885,238 @@ impl<'tcx> ExecBuilder<'tcx> {
                             _ => bug!("[invariant] expect arbitrary fields for struct {ty}"),
                         }
                     }
-                    AdtKind::Union => bug!("[unsupported] memory allocation for union"),
-                    AdtKind::Enum => bug!("[unsupported] memory allocation for enum"),
+                    AdtKind::Union => {
+                        match &layout.variants {
+                            Variants::Single { index } if index.index() == 0 => {}
+                            _ => bug!("[invariant] expect a 0-variant for union {ty}"),
+                        }
+                        if !matches!(layout.fields, FieldsShape::Union(..)) {
+                            bug!("[invariant] expect union fields for {ty}");
+                        }
+
+                        // expect only two fields in the union: one that matches the layout size and another that does not
+                        let field_details = def
+                            .non_enum_variant()
+                            .fields
+                            .iter_enumerated()
+                            .map(|(field_idx, field_def)| {
+                                (field_idx, field_def.ty(self.tcx, ty_args))
+                            })
+                            .collect::<Vec<_>>();
+
+                        if field_details.len() != 2 {
+                            bug!(
+                                "[invariant] expect two variants in union {ty} only, found {}",
+                                field_details.len()
+                            );
+                        }
+                        let (f1_idx, f1_ty) = field_details[0];
+                        let (f2_idx, f2_ty) = field_details[1];
+
+                        let f1_layout_size = self
+                            .tcx
+                            .layout_of(self.typing_env.as_query_input(f1_ty))
+                            .unwrap_or_else(|_| {
+                                bug!("[invariant] unable to query layout of type {f1_ty}")
+                            })
+                            .layout
+                            .size;
+                        let f2_layout_size = self
+                            .tcx
+                            .layout_of(self.typing_env.as_query_input(f2_ty))
+                            .unwrap_or_else(|_| {
+                                bug!("[invariant] unable to query layout of type {f2_ty}")
+                            })
+                            .layout
+                            .size;
+
+                        let (field_match_idx, field_match_ty, field_value_idx, field_value_ty) =
+                            match (f1_layout_size == layout.size, f2_layout_size == layout.size) {
+                                (true, true) => {
+                                    bug!("[invariant] found two matches in union {ty}");
+                                }
+                                (false, false) => {
+                                    bug!("[invariant] found no matches in union {ty}");
+                                }
+                                (true, false) => (f1_idx, f1_ty, f2_idx, f2_ty),
+                                (false, true) => (f2_idx, f2_ty, f1_idx, f1_ty),
+                            };
+
+                        // check whether the entire range is initialized
+                        let range = AllocRange { start: offset, size: layout.size };
+                        let initialized = memory.init_mask().is_range_initialized(range).is_ok();
+
+                        if initialized {
+                            // parse as the matched variant
+                            let (_, val) = self.read_const_from_memory_and_layout(
+                                memory,
+                                offset,
+                                field_match_ty,
+                            );
+                            SolValue::Union(
+                                adt_ident,
+                                adt_ty_args,
+                                SolFieldIndex(field_match_idx.as_usize()),
+                                Box::new(SolConst::Value(val)),
+                            )
+                        } else {
+                            // parse as the alternative variant
+                            let (_, val) = self.read_const_from_memory_and_layout(
+                                memory,
+                                offset,
+                                field_value_ty,
+                            );
+                            SolValue::Union(
+                                adt_ident,
+                                adt_ty_args,
+                                SolFieldIndex(field_value_idx.as_usize()),
+                                Box::new(SolConst::Value(val)),
+                            )
+                        }
+                    }
+                    AdtKind::Enum => {
+                        let (variant_idx, variant_layout) = match &layout.variants {
+                            Variants::Single { index } => {
+                                // the enum is known to be this single variant, maybe the other variants are all infeasible
+                                (*index, *layout)
+                            }
+                            Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
+                                // get the tag type
+                                let tag_type = match tag {
+                                    ScalarAbi::Initialized { value, valid_range: _ } => value,
+                                    ScalarAbi::Union { .. } => {
+                                        bug!("[invariant] unexpected tag spec for {ty}");
+                                    }
+                                };
+
+                                // get the offset for the tag field
+                                let tag_offset = match &layout.fields {
+                                    FieldsShape::Arbitrary { offsets, in_memory_order: _ } => {
+                                        *offsets.get(*tag_field).unwrap_or_else(|| {
+                                            bug!("[invariant] no offset for tag field for {ty}");
+                                        })
+                                    }
+                                    _ => bug!(
+                                        "[invariant] tagged variants do not have field spec in {ty}"
+                                    ),
+                                };
+
+                                // parse the tag value
+                                let tag_size = tag_type.size(&self.tcx);
+                                let tag_scalar = read_primitive(
+                                    self.tcx,
+                                    offset + tag_offset,
+                                    tag_size,
+                                    matches!(tag_type, Primitive::Pointer(_)),
+                                );
+
+                                // derive variant index
+                                let variant_idx = match tag_encoding {
+                                    TagEncoding::Direct => {
+                                        // direct tag encoding, the scalar value is the discriminant
+                                        let tag_value = tag_scalar.assert_scalar_int();
+                                        get_variant_by_discriminant(self.tcx, *def, tag_value)
+                                    }
+                                    TagEncoding::Niche {
+                                        untagged_variant,
+                                        niche_variants,
+                                        niche_start,
+                                    } => {
+                                        // recover the variant index from the niche tag
+                                        match tag_scalar {
+                                            Scalar::Int(int) => {
+                                                // NOTE: the discriminant and variant index of each variant coincide
+                                                let tag_index = int
+                                                    .to_bits_unchecked()
+                                                    .wrapping_sub(*niche_start)
+                                                    .wrapping_add(
+                                                        niche_variants.start().index() as u128
+                                                    );
+
+                                                if tag_index >= def.variants().len() as u128 {
+                                                    *untagged_variant
+                                                } else {
+                                                    VariantIdx::from_usize(tag_index as usize)
+                                                }
+                                            }
+                                            Scalar::Ptr(..) => {
+                                                // if we get a pointer as a tag, it must be on the untagged variant
+                                                *untagged_variant
+                                            }
+                                        }
+                                    }
+                                };
+
+                                // get variant layout
+                                let variant_layout =
+                                    variants.get(variant_idx).unwrap_or_else(|| {
+                                        bug!(
+                                            "[invariant] invalid variant index {} for {ty}",
+                                            variant_idx.index()
+                                        )
+                                    });
+
+                                // sanity check on the variant layout
+                                if !matches!(variant_layout.variants, Variants::Single { index } if index == variant_idx)
+                                {
+                                    bug!(
+                                        "[invariant] expect an indexed({})-variant for enum variant in {ty}",
+                                        variant_idx.index()
+                                    );
+                                }
+
+                                // return both the index and the layout
+                                (variant_idx, variant_layout)
+                            }
+                            Variants::Empty => {
+                                bug!("[invariant] unexpected empty variants for {ty}")
+                            }
+                        };
+
+                        // get the variant definition from typing
+                        let variant_def = def.variant(variant_idx);
+
+                        // get variant fields from layout
+                        let field_offsets = match &variant_layout.fields {
+                            FieldsShape::Arbitrary { offsets, in_memory_order: _ } => {
+                                if offsets.len() != variant_def.fields.len() {
+                                    bug!(
+                                        "[invariant] field count mismatch for variant {} in {ty}",
+                                        variant_def.name
+                                    );
+                                }
+                                offsets
+                            }
+                            _ => bug!(
+                                "[invariant] expect an arbitrary field for enum variant in {ty}"
+                            ),
+                        };
+
+                        // construct values for the variant fields
+                        let mut elements = vec![];
+                        for (field_idx, field_def) in variant_def.fields.iter_enumerated() {
+                            let field_offset = *field_offsets.get(field_idx).unwrap_or_else(|| {
+                                bug!(
+                                    "[invariant] no offset for field {} in {ty} variant {}",
+                                    field_def.name,
+                                    variant_def.name
+                                );
+                            });
+                            let (_, elem) = self.read_const_from_memory_and_layout(
+                                memory,
+                                offset + field_offset,
+                                field_def.ty(self.tcx, ty_args),
+                            );
+                            elements
+                                .push((SolFieldIndex(field_idx.index()), SolConst::Value(elem)));
+                        }
+                        SolValue::Enum(
+                            adt_ident,
+                            adt_ty_args,
+                            SolVariantIndex(variant_idx.index()),
+                            elements,
+                        )
+                    }
                 }
             }
 
@@ -3552,4 +3786,56 @@ fn get_uniquely_feasible_variant<'tcx>(
     }
     // return the uniquely feasible variant, if any
     feasible_variant
+}
+
+/// Lookup the variant index by discriminant value
+#[inline]
+fn get_variant_by_discriminant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: AdtDef<'tcx>,
+    scalar: ScalarInt,
+) -> VariantIdx {
+    let mut variant_idx_found = None;
+    for (variant_idx, discr) in def.discriminants(tcx) {
+        if scalar_eq_discriminant(scalar, discr) {
+            variant_idx_found = Some(variant_idx);
+            break;
+        }
+    }
+    variant_idx_found.unwrap_or_else(|| {
+        bug!("[invariant] no discriminant matches {scalar} for {}", tcx.def_path_str(def.did()));
+    })
+}
+
+/// Compare a scalar int and a discriminant
+#[inline]
+fn scalar_eq_discriminant(scalar: ScalarInt, Discr { val, ty }: Discr<'_>) -> bool {
+    let scalar_size = scalar.size().bytes();
+    match ty.kind() {
+        ty::Int(sub_ty) => match (sub_ty, scalar_size) {
+            (IntTy::I8, 1) => scalar.to_i8() == val as i8,
+            (IntTy::I16, 1) => scalar.to_i8() == val as i8,
+            (IntTy::I16, 2) => scalar.to_i16() == val as i16,
+            (IntTy::I32, 1) => scalar.to_i8() == val as i8,
+            (IntTy::I32, 2) => scalar.to_i16() == val as i16,
+            (IntTy::I32, 4) => scalar.to_i32() == val as i32,
+            (IntTy::I64, 1) => scalar.to_i8() == val as i8,
+            (IntTy::I64, 2) => scalar.to_i16() == val as i16,
+            (IntTy::I64, 4) => scalar.to_i32() == val as i32,
+            (IntTy::I64, 8) => scalar.to_i64() == val as i64,
+            (IntTy::I128, 1) => scalar.to_i8() == val as i8,
+            (IntTy::I128, 2) => scalar.to_i16() == val as i16,
+            (IntTy::I128, 4) => scalar.to_i32() == val as i32,
+            (IntTy::I128, 8) => scalar.to_i64() == val as i64,
+            (IntTy::I128, 16) => scalar.to_i128() == val as i128,
+            (IntTy::Isize, 1) => scalar.to_i8() == val as i8,
+            (IntTy::Isize, 2) => scalar.to_i16() == val as i16,
+            (IntTy::Isize, 4) => scalar.to_i32() == val as i32,
+            (IntTy::Isize, 8) => scalar.to_i64() == val as i64,
+            (IntTy::Isize, 16) => scalar.to_i128() == val as i128,
+            _ => bug!("[invariant] unexpected ({scalar_size}, {ty}) pair for discriminant"),
+        },
+        ty::Uint(_) => scalar.to_uint(scalar.size()) == val,
+        _ => scalar.to_bits_unchecked() == val,
+    }
 }
