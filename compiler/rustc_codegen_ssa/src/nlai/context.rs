@@ -18,6 +18,7 @@ use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{
     Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, MatchSource, Mod, OwnerId, Safety,
 };
+use rustc_middle::middle::region::Scope;
 use rustc_middle::mir::interpret::{AllocRange, Allocation, GlobalAlloc, Scalar};
 use rustc_middle::mir::{AssignOp, BinOp, BorrowKind, UnOp};
 use rustc_middle::thir::{
@@ -2329,9 +2330,9 @@ impl<'tcx> ExecBuilder<'tcx> {
         // switch-case on expression kind
         let expr_op = match kind {
             // markers
-            ExprKind::Scope { region_scope: _, hir_id, value } => {
+            ExprKind::Scope { region_scope, hir_id, value } => {
                 let inner_expr = self.mk_expr(thir, *value);
-                SolOp::Scope(self.mk_hir(*hir_id, inner_expr))
+                SolOp::Scope(self.mk_hir(*hir_id, inner_expr), self.mk_scope(*region_scope))
             }
             ExprKind::PlaceTypeAscription { source, user_ty: _, user_ty_span: _ }
             | ExprKind::ValueTypeAscription { source, user_ty: _, user_ty_span: _ } => {
@@ -2547,19 +2548,20 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // control-folow
-            ExprKind::If { if_then_scope: _, cond, then, else_opt } => SolOp::If {
+            ExprKind::If { if_then_scope, cond, then, else_opt } => SolOp::If {
                 cond: self.mk_expr(thir, *cond),
                 then: self.mk_expr(thir, *then),
                 else_opt: else_opt.map(|e| self.mk_expr(thir, e)),
+                scope: self.mk_scope(*if_then_scope),
             },
             ExprKind::Loop { body } => SolOp::Loop(self.mk_expr(thir, *body)),
-            ExprKind::Break { label: _, value } => {
+            ExprKind::Break { label, value } => {
                 // FIXME: handle scope (must be done)
-                SolOp::Break(value.map(|e| self.mk_expr(thir, e)))
+                SolOp::Break(self.mk_scope(*label), value.map(|e| self.mk_expr(thir, e)))
             }
-            ExprKind::Continue { label: _ } => {
+            ExprKind::Continue { label } => {
                 // FIXME: handle scope (must be done)
-                SolOp::Continue
+                SolOp::Continue(self.mk_scope(*label))
             }
             ExprKind::Return { value } => SolOp::Return(value.map(|e| self.mk_expr(thir, e))),
 
@@ -2604,7 +2606,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                 // parse arms
                 let mut parsed_arms = vec![];
                 for arm in arms.iter() {
-                    let Arm { pattern, guard, body, hir_id, scope: _, span } = &thir.arms[*arm];
+                    let Arm { pattern, guard, body, hir_id, scope, span } = &thir.arms[*arm];
+                    let arm_scope = self.mk_scope(*scope);
                     let arm_pattern = self.mk_pat(pattern);
                     let arm_guard = guard.map(|e| self.mk_expr(thir, e));
                     let arm_body = self.mk_expr(thir, *body);
@@ -2612,6 +2615,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                     let arm_hir = self.mk_hir(
                         *hir_id,
                         SolMatchArm {
+                            scope: arm_scope,
                             pat: arm_pattern,
                             guard: arm_guard,
                             body: arm_body,
@@ -2692,7 +2696,9 @@ impl<'tcx> ExecBuilder<'tcx> {
     pub(crate) fn mk_stmt(&mut self, thir: &Thir<'tcx>, stmt_id: StmtId) -> SolStmt {
         let Stmt { kind } = &thir.stmts[stmt_id];
         match kind {
-            StmtKind::Expr { scope: _, expr } => SolStmt::Expr(self.mk_expr(thir, *expr)),
+            StmtKind::Expr { scope, expr } => {
+                SolStmt::Expr(self.mk_scope(*scope), self.mk_expr(thir, *expr))
+            }
             StmtKind::Let {
                 remainder_scope: _,
                 init_scope: _,
@@ -2726,9 +2732,10 @@ impl<'tcx> ExecBuilder<'tcx> {
 
     /// Record a THIR block
     pub(crate) fn mk_block(&mut self, thir: &Thir<'tcx>, block_id: BlockId) -> SolBlock {
-        let Block { targeted_by_break: _, region_scope: _, span, stmts, expr, safety_mode } =
+        let Block { targeted_by_break: _, region_scope, span, stmts, expr, safety_mode } =
             &thir.blocks[block_id];
 
+        let block_scope = self.mk_scope(*region_scope);
         let block_safety = match safety_mode {
             BlockSafety::Safe => true,
             BlockSafety::BuiltinUnsafe | BlockSafety::ExplicitUnsafe(..) => false,
@@ -2737,7 +2744,18 @@ impl<'tcx> ExecBuilder<'tcx> {
         let block_stmts = stmts.iter().map(|stmt| self.mk_stmt(thir, *stmt)).collect();
         let block_expr = expr.map(|e| self.mk_expr(thir, e));
 
-        SolBlock { safety: block_safety, stmts: block_stmts, expr: block_expr, span: block_span }
+        SolBlock {
+            scope: block_scope,
+            safety: block_safety,
+            stmts: block_stmts,
+            expr: block_expr,
+            span: block_span,
+        }
+    }
+
+    /// Record a scope
+    pub(crate) fn mk_scope(&mut self, scope: Scope) -> SolScope {
+        SolScope { index: SolScopeIndex(scope.local_id.index()) }
     }
 
     /// Derive the type of a value
@@ -3337,7 +3355,7 @@ pub(crate) struct SolExpr {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolOp {
     // markers
-    Scope(SolHIR<SolExpr>),
+    Scope(SolHIR<SolExpr>, SolScope),
     TypeAscribe(SolExpr),
     // use
     Use(SolExpr),
@@ -3464,10 +3482,11 @@ pub(crate) enum SolOp {
         cond: SolExpr,
         then: SolExpr,
         else_opt: Option<SolExpr>,
+        scope: SolScope,
     },
     Loop(SolExpr),
-    Break(Option<SolExpr>),
-    Continue,
+    Break(SolScope, Option<SolExpr>),
+    Continue(SolScope),
     Return(Option<SolExpr>),
     // function calls
     Call {
@@ -3551,6 +3570,7 @@ pub(crate) enum SolBindMode {
 /// A match arm in THIR
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolMatchArm {
+    pub(crate) scope: SolScope,
     pub(crate) pat: SolPattern,
     pub(crate) guard: Option<SolExpr>,
     pub(crate) body: SolExpr,
@@ -3560,6 +3580,7 @@ pub(crate) struct SolMatchArm {
 /// A block of expressiosn in THIR
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolBlock {
+    pub(crate) scope: SolScope,
     pub(crate) safety: bool,
     pub(crate) stmts: Vec<SolStmt>,
     pub(crate) expr: Option<SolExpr>,
@@ -3569,8 +3590,14 @@ pub(crate) struct SolBlock {
 /// A statement in THIR
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolStmt {
-    Expr(SolExpr),
+    Expr(SolScope, SolExpr),
     Bind(SolHIR<SolLetBinding>),
+}
+
+/// A scope in THIR
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolScope {
+    pub(crate) index: SolScopeIndex,
 }
 
 /// Let binding in a statement in THIR
@@ -3654,6 +3681,10 @@ pub(crate) struct SolVariantIndex(pub(crate) usize);
 /// A variant discrimanant
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolVariantDiscr(pub(crate) u128);
+
+/// A scope index
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolScopeIndex(pub(crate) usize);
 
 /// A description of a definition path
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
