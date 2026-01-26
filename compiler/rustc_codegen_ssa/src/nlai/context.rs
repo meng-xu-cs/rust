@@ -14,6 +14,7 @@ use rustc_ast::{
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::attrs::AttributeKind;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{
     Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, MatchSource, Mod, OwnerId, RangeEnd, Safety,
@@ -115,7 +116,7 @@ impl<'tcx> BaseBuilder<'tcx> {
         };
 
         // insert into the cache
-        let desc = SolPathDesc(self.tcx.def_path_debug_str(def_id));
+        let desc = SolPathDesc(self.tcx.def_path_str(def_id));
         self.id_cache.insert(def_id, (ident.clone(), desc));
 
         // return ident
@@ -2295,6 +2296,13 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let mut is_closure = false;
                 let mut param_iter = thir.params.iter_enumerated();
                 if thir.params.len() == params.len() + 1 {
+                    // make sure this is a closure
+                    assert_eq!(
+                        self.tcx.def_kind(self.owner_id.to_def_id()),
+                        DefKind::Closure,
+                        "[invariant] expect closure"
+                    );
+
                     // special case for closure: first parameter must be closure-related
                     let (index0, param0) = param_iter.next().unwrap();
                     assert_eq!(index0.index(), 0, "[invariant] expect parameter index 0");
@@ -2363,6 +2371,16 @@ impl<'tcx> ExecBuilder<'tcx> {
                     // now we are sure that this is a closure
                     is_closure = true;
                 } else {
+                    // make sure this is a function or an associated function
+                    assert!(
+                        matches!(
+                            self.tcx.def_kind(self.owner_id.to_def_id()),
+                            DefKind::Fn | DefKind::AssocFn
+                        ),
+                        "[invariant] expect function or associated function"
+                    );
+
+                    // check that argument count matches
                     assert_eq!(
                         thir.params.len(),
                         params.len(),
