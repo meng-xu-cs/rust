@@ -1,6 +1,6 @@
 // ignore-tidy-filelength
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Debug;
 use std::path::PathBuf;
 
@@ -57,7 +57,7 @@ struct BaseBuilder<'tcx> {
     src_cache: FxHashSet<StableSourceFileId>,
 
     /// a cache of id to identifier mappings
-    id_cache: FxHashMap<DefId, (SolIdent, SolPathDesc)>,
+    id_cache: FxHashMap<DefId, (SolIdent, SolPathDesc, SolSpan)>,
 }
 
 /// A builder for each executable THIR body
@@ -92,6 +92,9 @@ struct ExecBuilder<'tcx> {
     /// local variables
     var_scope: BTreeMap<SolLocalVarIndex, SolLocalVarName>,
 
+    /// expr id and adjusted stmt id set
+    inst_ids: BTreeSet<SolInstIndex>,
+
     /// log stack
     log_stack: LogStack,
 }
@@ -105,7 +108,7 @@ impl<'tcx> BaseBuilder<'tcx> {
     /// Record an identifier (with caching)
     fn mk_ident(&mut self, def_id: DefId) -> SolIdent {
         // check cache first
-        if let Some((ident, _)) = self.id_cache.get(&def_id) {
+        if let Some((ident, _, _)) = self.id_cache.get(&def_id) {
             return ident.clone();
         }
 
@@ -118,7 +121,8 @@ impl<'tcx> BaseBuilder<'tcx> {
 
         // insert into the cache
         let desc = SolPathDesc(util_ident_string(self.tcx, def_id));
-        self.id_cache.insert(def_id, (ident.clone(), desc));
+        let span = self.mk_span(self.tcx.def_span(def_id));
+        self.id_cache.insert(def_id, (ident.clone(), desc, span));
 
         // return ident
         ident
@@ -154,17 +158,21 @@ impl<'tcx> BaseBuilder<'tcx> {
 
         // dump the source content if not yet cached
         if !self.src_cache.contains(&file_id) {
+            let external_src = start_loc.file.external_src.borrow();
             let src_code = start_loc.file.src.as_ref().map_or_else(
-                || bug!("[invariant] visible span has no source code"),
-                |src| src.clone(),
+                || {
+                    external_src
+                        .get_source()
+                        .unwrap_or_else(|| bug!("[invariant] visible span has no source code"))
+                },
+                |src| src.as_str(),
             );
 
             let src_path = self.src_dir.join(format!("{:x}", file_id.0.as_u128()));
             if src_path.exists() {
                 bug!("[invariant] source file {} already exists", src_path.display());
             }
-
-            std::fs::write(&src_path, src_code.as_str()).unwrap_or_else(|e| {
+            std::fs::write(&src_path, src_code).unwrap_or_else(|e| {
                 bug!("[invariant] failed to write source code to file {}: {e}", src_path.display())
             });
             self.src_cache.insert(file_id.clone());
@@ -322,6 +330,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             trait_defs: BTreeMap::new(),
             static_inits: BTreeMap::new(),
             var_scope: BTreeMap::new(),
+            inst_ids: BTreeSet::new(),
             log_stack: LogStack::new(),
         }
     }
@@ -2460,6 +2469,10 @@ impl<'tcx> ExecBuilder<'tcx> {
         let Expr { kind, ty, temp_scope_id: _, span } = &thir.exprs[expr_id];
         self.log_stack.push("Expr", format!("{kind:?}"));
 
+        // record the id
+        let id = SolInstIndex(expr_id.index());
+        assert!(self.inst_ids.insert(id.clone()), "[invariant] duplicate instruction id: {}", id.0);
+
         // record type and span
         let expr_ty = self.mk_type(*ty);
         let expr_span = self.mk_span(*span);
@@ -2828,15 +2841,21 @@ impl<'tcx> ExecBuilder<'tcx> {
         self.log_stack.pop();
 
         // pack the expression
-        SolExpr { ty: expr_ty, span: expr_span, op: Box::new(expr_op) }
+        SolExpr { id, ty: expr_ty, span: expr_span, op: Box::new(expr_op) }
     }
 
     /// Record a THIR statement
     pub(crate) fn mk_stmt(&mut self, thir: &Thir<'tcx>, stmt_id: StmtId) -> SolStmt {
         let Stmt { kind } = &thir.stmts[stmt_id];
-        match kind {
+        self.log_stack.push("Stmt", format!("{kind:?}"));
+
+        // record the id
+        let id = SolInstIndex(stmt_id.index() + thir.exprs.len());
+        assert!(self.inst_ids.insert(id.clone()), "[invariant] duplicate instruction id: {}", id.0);
+
+        let stmt = match kind {
             StmtKind::Expr { scope, expr } => {
-                SolStmt::Expr(self.mk_scope(*scope), self.mk_expr(thir, *expr))
+                SolStmt::Expr(id, self.mk_scope(*scope), self.mk_expr(thir, *expr))
             }
             StmtKind::Let {
                 remainder_scope: _,
@@ -2861,12 +2880,21 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let let_span = self.mk_span(*span);
 
                 // pack the let statement
-                SolStmt::Bind(self.mk_hir(
-                    *hir_id,
-                    SolLetBinding { pat: let_pattern, init: let_init, span: let_span },
-                ))
+                SolStmt::Bind(
+                    id,
+                    self.mk_hir(
+                        *hir_id,
+                        SolLetBinding { pat: let_pattern, init: let_init, span: let_span },
+                    ),
+                )
             }
-        }
+        };
+
+        // pop the log stack
+        self.log_stack.pop();
+
+        // return the statement
+        stmt
     }
 
     /// Record a THIR block
@@ -3101,6 +3129,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             trait_defs,
             static_inits,
             var_scope: _,
+            inst_ids: _,
             log_stack,
         } = exec_builder;
         assert!(log_stack.is_empty(), "[invariant] log stack is not empty");
@@ -3160,10 +3189,10 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
 
     // we sort the values alphabetically by description first, then by id, but after collection
     #[allow(rustc::potential_query_instability)]
-    for (ident, desc) in id_cache.into_values() {
-        id_desc.push((ident, desc));
+    for (ident, desc, span) in id_cache.into_values() {
+        id_desc.push((ident, desc, span));
     }
-    id_desc.sort_by(|(ident_a, desc_a), (ident_b, desc_b)| {
+    id_desc.sort_by(|(ident_a, desc_a, _), (ident_b, desc_b, _)| {
         desc_a.cmp(desc_b).then_with(|| ident_a.cmp(ident_b))
     });
 
@@ -3208,7 +3237,7 @@ pub(crate) struct SolMIR<T: SolIR> {
 pub(crate) struct SolCrate {
     pub(crate) root: SolMIR<SolModule>,
     pub(crate) bundles: Vec<SolBundle>,
-    pub(crate) id_desc: Vec<(SolIdent, SolPathDesc)>,
+    pub(crate) id_desc: Vec<(SolIdent, SolPathDesc, SolSpan)>,
 }
 
 /// A complete execution context
@@ -3521,6 +3550,7 @@ pub(crate) enum SolValue {
 /// An expression in THIR
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolExpr {
+    pub(crate) id: SolInstIndex,
     pub(crate) ty: SolType,
     pub(crate) op: Box<SolOp>,
     pub(crate) span: SolSpan,
@@ -3770,8 +3800,8 @@ pub(crate) struct SolBlock {
 /// A statement in THIR
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolStmt {
-    Expr(SolScope, SolExpr),
-    Bind(SolHIR<SolLetBinding>),
+    Expr(SolInstIndex, SolScope, SolExpr),
+    Bind(SolInstIndex, SolHIR<SolLetBinding>),
 }
 
 /// A scope in THIR
@@ -3865,6 +3895,10 @@ pub(crate) struct SolVariantDiscr(pub(crate) u128);
 /// A scope index
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolScopeIndex(pub(crate) usize);
+
+/// An instruction index
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolInstIndex(pub(crate) usize);
 
 /// A description of a definition path
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
