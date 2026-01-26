@@ -28,6 +28,7 @@ use rustc_middle::thir::{
     LogicalOp, Param, Pat, PatKind, PatRange, PatRangeBoundary, Stmt, StmtId, StmtKind, Thir,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
+use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
 use rustc_middle::ty::util::Discr;
 use rustc_middle::ty::{
     AdtDef, AdtKind, AliasTyKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig,
@@ -3929,13 +3930,7 @@ fn util_debug_symbol<'tcx>(
     def_id: DefId,
     ty_args: GenericArgsRef<'tcx>,
 ) -> String {
-    let path_str = tcx.def_path_str_with_args(def_id, ty_args);
-    if def_id.is_local() {
-        let krate = tcx.crate_name(LOCAL_CRATE).to_ident_string();
-        format!("{krate}::{path_str}")
-    } else {
-        path_str
-    }
+    with_resolve_crate_name!(with_no_trimmed_paths!(tcx.def_path_str_with_args(def_id, ty_args)))
 }
 
 /// helper for unpacking strings
