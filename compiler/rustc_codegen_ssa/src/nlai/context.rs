@@ -116,7 +116,7 @@ impl<'tcx> BaseBuilder<'tcx> {
         };
 
         // insert into the cache
-        let desc = SolPathDesc(self.tcx.def_path_str(def_id));
+        let desc = SolPathDesc(util_ident_string(self.tcx, def_id));
         self.id_cache.insert(def_id, (ident.clone(), desc));
 
         // return ident
@@ -3918,6 +3918,12 @@ impl LogStack {
 
 /// Create a fully qualified path string with crate name
 #[inline]
+fn util_ident_string<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
+    util_debug_symbol(tcx, def_id, &List::empty())
+}
+
+/// Create a fully qualified path string with crate name
+#[inline]
 fn util_debug_symbol<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
@@ -4053,7 +4059,10 @@ fn get_variant_by_discriminant<'tcx>(
         }
     }
     variant_idx_found.unwrap_or_else(|| {
-        bug!("[invariant] no discriminant matches {scalar} for {}", tcx.def_path_str(def.did()));
+        bug!(
+            "[invariant] no discriminant matches {scalar} for {}",
+            util_ident_string(tcx, def.did())
+        );
     })
 }
 
