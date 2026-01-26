@@ -2710,13 +2710,9 @@ impl<'tcx> ExecBuilder<'tcx> {
             },
             ExprKind::Loop { body } => SolOp::Loop(self.mk_expr(thir, *body)),
             ExprKind::Break { label, value } => {
-                // FIXME: handle scope (must be done)
                 SolOp::Break(self.mk_scope(*label), value.map(|e| self.mk_expr(thir, e)))
             }
-            ExprKind::Continue { label } => {
-                // FIXME: handle scope (must be done)
-                SolOp::Continue(self.mk_scope(*label))
-            }
+            ExprKind::Continue { label } => SolOp::Continue(self.mk_scope(*label)),
             ExprKind::Return { value } => SolOp::Return(value.map(|e| self.mk_expr(thir, e))),
 
             // borrow
@@ -3126,7 +3122,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             mut base,
             owner_id: _,
             generics,
-            cp_types,
+            mut cp_types,
             adt_defs,
             trait_defs,
             static_inits,
@@ -3135,6 +3131,22 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             log_stack,
         } = exec_builder;
         assert!(log_stack.is_empty(), "[invariant] log stack is not empty");
+
+        // collect the generic declarations
+        let mut flat_generics = vec![];
+        for param in generics.into_iter() {
+            let param_meta = match param.kind {
+                SolGenericKind::Lifetime => SolGenericMeta::Lifetime,
+                SolGenericKind::Type => SolGenericMeta::Type,
+                SolGenericKind::Const => SolGenericMeta::Const(
+                    cp_types
+                        .remove(&param.ident)
+                        .unwrap_or_else(|| bug!("[invariant] missing const generic type")),
+                ),
+            };
+            flat_generics.push((param.ident, param.name, param_meta));
+        }
+        assert!(cp_types.is_empty(), "[invariant] leftover const param types");
 
         // collect the datatype definitions
         let mut flat_adt_defs = vec![];
@@ -3171,8 +3183,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
         let hir_id = tcx.local_def_id_to_hir_id(owner_id);
         let exec_full = base.mk_mir(owner_id, hir_id, tcx.hir_span_with_body(hir_id), exec);
         bundles.push(SolBundle {
-            generics,
-            cp_types: cp_types.into_iter().collect(),
+            generics: flat_generics,
             adt_defs: flat_adt_defs,
             trait_defs: flat_trait_defs,
             static_inits: flat_static_inits,
@@ -3245,8 +3256,7 @@ pub(crate) struct SolCrate {
 /// A complete execution context
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolBundle {
-    pub(crate) generics: Vec<SolGenericParam>,
-    pub(crate) cp_types: Vec<(SolIdent, SolType)>,
+    pub(crate) generics: Vec<(SolIdent, SolParamName, SolGenericMeta)>,
     pub(crate) adt_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolAdtDef)>,
     pub(crate) trait_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTraitDef)>,
     pub(crate) static_inits: Vec<(SolIdent, SolValue)>,
@@ -3419,6 +3429,14 @@ pub(crate) enum SolProjTerm {
 pub(crate) enum SolGenericKind {
     Lifetime,
     Const,
+    Type,
+}
+
+/// Like `SolGenericKind`, but enhanced with constant type
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolGenericMeta {
+    Lifetime,
+    Const(SolType),
     Type,
 }
 
