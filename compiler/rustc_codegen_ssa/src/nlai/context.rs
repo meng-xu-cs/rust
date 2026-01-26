@@ -33,7 +33,7 @@ use rustc_middle::ty::{
     GenericArg, GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, List,
     OutlivesPredicate, ParamConst, ParamTy, Pattern, PatternKind, PredicatePolarity,
     ProjectionPredicate, ScalarInt, Term, TermKind, TraitDef, TraitPredicate, Ty, TyCtxt,
-    TypingEnv, UpvarArgs, ValTreeKind, Value, VariantDiscr,
+    TypingEnv, UpvarArgs, ValTreeKind, Value, VariantDiscr, Visibility,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
@@ -2353,6 +2353,13 @@ impl<'tcx> ExecBuilder<'tcx> {
                         }
                     }
 
+                    // closure should have only one possible abi
+                    assert_eq!(
+                        parsed_abi,
+                        SolExternAbi::Rust { safety: true },
+                        "[invariant] closure abi mismatch",
+                    );
+
                     // now we are sure that this is a closure
                     is_closure = true;
                 } else {
@@ -2362,6 +2369,17 @@ impl<'tcx> ExecBuilder<'tcx> {
                         "[invariant] parameter count mismatch",
                     );
                 }
+
+                // get the visibility of the function
+                let visibility = if is_closure {
+                    None
+                } else {
+                    let vis = match self.tcx.visibility(self.owner_id.to_def_id()) {
+                        Visibility::Public => SolVisibility::Public,
+                        Visibility::Restricted(id) => SolVisibility::Restricted(self.mk_ident(id)),
+                    };
+                    Some(vis)
+                };
 
                 // declared parameters should match type declarations
                 let mut param_decls = vec![];
@@ -2387,7 +2405,17 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let body = self.mk_expr(thir, expr);
 
                 // pack the information
-                SolExec::Function(SolFnDef { abi: parsed_abi, ret_ty, params: param_decls, body })
+                if is_closure {
+                    SolExec::Closure(SolClosure { ret_ty, params: param_decls, body })
+                } else {
+                    SolExec::Function(SolFnDef {
+                        abi: parsed_abi,
+                        vis: visibility.unwrap(),
+                        ret_ty,
+                        params: param_decls,
+                        body,
+                    })
+                }
             }
             BodyTy::Const(ty) => {
                 // sanity checks
@@ -2402,7 +2430,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let body = self.mk_expr(thir, expr);
 
                 // pack the information
-                SolExec::Constant(SolCEval { ty: const_ty, body })
+                SolExec::ConstEval(SolCEval { ty: const_ty, body })
             }
             BodyTy::GlobalAsm(..) => bug!("[unsupported] global assembly"),
         }
@@ -3205,13 +3233,23 @@ pub(crate) enum SolItem {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolExec {
     Function(SolFnDef),
-    Constant(SolCEval),
+    Closure(SolClosure),
+    ConstEval(SolCEval),
 }
 
 /// THIR of a function
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolFnDef {
     pub(crate) abi: SolExternAbi,
+    pub(crate) vis: SolVisibility,
+    pub(crate) ret_ty: SolType,
+    pub(crate) params: Vec<(SolType, Option<SolPattern>)>,
+    pub(crate) body: SolExpr,
+}
+
+/// THIR of a closure
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolClosure {
     pub(crate) ret_ty: SolType,
     pub(crate) params: Vec<(SolType, Option<SolPattern>)>,
     pub(crate) body: SolExpr,
@@ -3222,6 +3260,13 @@ pub(crate) struct SolFnDef {
 pub(crate) struct SolCEval {
     pub(crate) ty: SolType,
     pub(crate) body: SolExpr,
+}
+
+/// Visibility of a function
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum SolVisibility {
+    Public,
+    Restricted(SolIdent),
 }
 
 /// External ABI of a function
