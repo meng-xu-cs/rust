@@ -2757,7 +2757,7 @@ written to standard error output)"),
     verbose_asm: bool = (false, parse_bool, [TRACKED],
         "add descriptive comments from LLVM to the assembly (may change behavior) (default: no)"),
     #[rustc_lint_opt_deny_field_access("use `Session::verbose_internals` instead of this field")]
-    verbose_internals: bool = (false, parse_bool, [TRACKED_NO_CRATE_HASH],
+    verbose_internals: bool = (true, parse_bool, [TRACKED_NO_CRATE_HASH],
         "in general, enable more debug printouts (default: no)"),
     #[rustc_lint_opt_deny_field_access("use `Session::verify_llvm_ir` instead of this field")]
     verify_llvm_ir: bool = (false, parse_bool, [TRACKED],
