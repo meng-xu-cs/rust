@@ -19,7 +19,7 @@ use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{
     Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, MatchSource, Mod, OwnerId, RangeEnd, Safety,
 };
-use rustc_middle::middle::region::Scope;
+use rustc_middle::middle::region::{Scope, ScopeData};
 use rustc_middle::mir::interpret::{AllocRange, Allocation, GlobalAlloc, Scalar};
 use rustc_middle::mir::{AssignOp, BinOp, BorrowKind, UnOp};
 use rustc_middle::thir::{
@@ -2468,16 +2468,17 @@ impl<'tcx> ExecBuilder<'tcx> {
 
     /// Record a THIR expression
     pub(crate) fn mk_expr(&mut self, thir: &Thir<'tcx>, expr_id: ExprId) -> SolExpr {
-        let Expr { kind, ty, temp_scope_id: _, span } = &thir.exprs[expr_id];
+        let Expr { kind, ty, temp_scope_id, span } = &thir.exprs[expr_id];
         self.log_stack.push("Expr", format!("{kind:?}"));
 
         // record the id
         let id = SolInstIndex(expr_id.index());
         assert!(self.inst_ids.insert(id.clone()), "[invariant] duplicate instruction id: {}", id.0);
 
-        // record type and span
+        // record type, span, and scope
         let expr_ty = self.mk_type(*ty);
         let expr_span = self.mk_span(*span);
+        let expr_scope = self.mk_scope(Scope { local_id: *temp_scope_id, data: ScopeData::Node });
 
         // switch-case on expression kind
         let expr_op = match kind {
@@ -2839,7 +2840,7 @@ impl<'tcx> ExecBuilder<'tcx> {
         self.log_stack.pop();
 
         // pack the expression
-        SolExpr { id, ty: expr_ty, span: expr_span, op: Box::new(expr_op) }
+        SolExpr { id, ty: expr_ty, op: Box::new(expr_op), span: expr_span, scope: expr_scope }
     }
 
     /// Record a THIR statement
@@ -3572,6 +3573,7 @@ pub(crate) struct SolExpr {
     pub(crate) ty: SolType,
     pub(crate) op: Box<SolOp>,
     pub(crate) span: SolSpan,
+    pub(crate) scope: SolScope,
 }
 
 /// Details of the operation in an expression
