@@ -3066,12 +3066,10 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
                 GenericParamDefKind::Lifetime => SolGenericKind::Lifetime,
                 GenericParamDefKind::Type { has_default: _, synthetic: _ } => {
                     // skip injected type parameters in closures
-                    if is_closure
-                        && matches!(
-                            param_symbol.as_str(),
-                            "<closure_kind>" | "<closure_signature>" | "<upvars>"
-                        )
-                    {
+                    if matches!(
+                        param_name.0.as_str(),
+                        "<closure_kind>" | "<closure_signature>" | "<upvars>"
+                    ) {
                         continue;
                     }
                     SolGenericKind::Type
