@@ -3833,9 +3833,9 @@ pub(crate) struct SolScope {
 /// Let binding in a statement in THIR
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolLetBinding {
-    pat: SolPattern,
-    init: Option<(SolExpr, Option<SolBlock>)>,
-    span: SolSpan,
+    pub(crate) pat: SolPattern,
+    pub(crate) init: Option<(SolExpr, Option<SolBlock>)>,
+    pub(crate) span: SolSpan,
 }
 
 /// Base
