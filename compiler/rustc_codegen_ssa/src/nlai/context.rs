@@ -753,15 +753,18 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // function pointer
-            ty::FnDef(def_id, ty_args) => {
-                let (resolved_def_id, resolved_ty_args) = self
-                    .try_resolve_instance(ty)
-                    .map_or_else(|| (*def_id, *ty_args), |i| (i.def.def_id(), i.args));
-                let ident = self.mk_ident(resolved_def_id);
-                let generic_args =
-                    resolved_ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
-                SolType::Function(ident, generic_args)
-            }
+            ty::FnDef(def_id, ty_args) => match self.try_resolve_instance(ty) {
+                None => SolType::FuncSym(
+                    self.mk_ident(*def_id),
+                    ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect(),
+                ),
+                Some(instance) => {
+                    let ident = self.mk_ident(instance.def_id());
+                    let generic_args =
+                        instance.args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+                    SolType::FuncDef(ident, generic_args)
+                }
+            },
             ty::Closure(def_id, ty_args) => {
                 let ident = self.mk_ident(*def_id);
                 let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
@@ -1347,15 +1350,18 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
             }
 
-            ty::FnDef(def_id, ty_args) => {
-                let (resolved_def_id, resolved_ty_args) = self
-                    .try_resolve_instance(ty)
-                    .map_or_else(|| (*def_id, *ty_args), |i| (i.def.def_id(), i.args));
-                let ident = self.mk_ident(resolved_def_id);
-                let generic_args =
-                    resolved_ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
-                SolValue::FuncDef(ident, generic_args)
-            }
+            ty::FnDef(def_id, ty_args) => match self.try_resolve_instance(ty) {
+                None => SolValue::FuncSym(
+                    self.mk_ident(*def_id),
+                    ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect(),
+                ),
+                Some(instance) => {
+                    let ident = self.mk_ident(instance.def_id());
+                    let generic_args =
+                        instance.args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+                    SolValue::FuncDef(ident, generic_args)
+                }
+            },
             ty::Closure(def_id, ty_args) => {
                 let ident = self.mk_ident(*def_id);
                 let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
@@ -2987,7 +2993,8 @@ impl<'tcx> ExecBuilder<'tcx> {
             SolValue::ImmPtrNull(inner_ty, _) => SolType::ImmPtr(Box::new(inner_ty.clone())),
             SolValue::MutPtrNull(inner_ty, _) => SolType::MutPtr(Box::new(inner_ty.clone())),
 
-            SolValue::FuncDef(ident, ty_args) => SolType::Function(ident.clone(), ty_args.clone()),
+            SolValue::FuncDef(ident, ty_args) => SolType::FuncDef(ident.clone(), ty_args.clone()),
+            SolValue::FuncSym(ident, ty_args) => SolType::FuncSym(ident.clone(), ty_args.clone()),
             SolValue::Closure(ident, ty_args) => SolType::Closure(ident.clone(), ty_args.clone()),
             SolValue::FnPtr(fn_sig, _, _) => SolType::FnPtr(fn_sig.clone()),
             SolValue::FnPtrNull(fn_sig) => SolType::FnPtr(fn_sig.clone()),
@@ -3417,7 +3424,8 @@ pub(crate) enum SolType {
     Slice(Box<SolType>),
     Array(Box<SolType>, Box<SolConst>),
     // function pointer
-    Function(SolIdent, Vec<SolGenericArg>),
+    FuncDef(SolIdent, Vec<SolGenericArg>),
+    FuncSym(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
     FnPtr(SolFnSig),
     // dynamic types
@@ -3590,6 +3598,7 @@ pub(crate) enum SolValue {
     MutPtrNull(SolType, usize),
     // function pointers
     FuncDef(SolIdent, Vec<SolGenericArg>),
+    FuncSym(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
     FnPtr(SolFnSig, SolIdent, Vec<SolGenericArg>),
     FnPtrNull(SolFnSig),
