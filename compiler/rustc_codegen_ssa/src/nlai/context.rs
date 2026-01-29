@@ -34,8 +34,8 @@ use rustc_middle::ty::print::{
 use rustc_middle::ty::util::Discr;
 use rustc_middle::ty::{
     AdtDef, AdtKind, AliasTyKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig,
-    GenericArg, GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, List,
-    OutlivesPredicate, ParamConst, ParamTy, Pattern, PatternKind, PredicatePolarity,
+    GenericArg, GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, Instance,
+    List, OutlivesPredicate, ParamConst, ParamTy, Pattern, PatternKind, PredicatePolarity,
     ProjectionPredicate, ScalarInt, Term, TermKind, TraitDef, TraitPredicate, Ty, TyCtxt,
     TypingEnv, UpvarArgs, ValTreeKind, Value, VariantDiscr, Visibility,
 };
@@ -754,8 +754,12 @@ impl<'tcx> ExecBuilder<'tcx> {
 
             // function pointer
             ty::FnDef(def_id, ty_args) => {
-                let ident = self.mk_ident(*def_id);
-                let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+                let (resolved_def_id, resolved_ty_args) = self
+                    .try_resolve_instance(ty)
+                    .map_or_else(|| (*def_id, *ty_args), |i| (i.def.def_id(), i.args));
+                let ident = self.mk_ident(resolved_def_id);
+                let generic_args =
+                    resolved_ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
                 SolType::Function(ident, generic_args)
             }
             ty::Closure(def_id, ty_args) => {
@@ -1344,8 +1348,12 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             ty::FnDef(def_id, ty_args) => {
-                let ident = self.mk_ident(*def_id);
-                let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+                let (resolved_def_id, resolved_ty_args) = self
+                    .try_resolve_instance(ty)
+                    .map_or_else(|| (*def_id, *ty_args), |i| (i.def.def_id(), i.args));
+                let ident = self.mk_ident(resolved_def_id);
+                let generic_args =
+                    resolved_ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
                 SolValue::FuncDef(ident, generic_args)
             }
             ty::Closure(def_id, ty_args) => {
@@ -3006,6 +3014,31 @@ impl<'tcx> ExecBuilder<'tcx> {
                 })
                 .unwrap_or_else(|| bug!("[invariant] generic parameter not found")),
             SolConst::Unevaluated(ty) => ty.clone(),
+        }
+    }
+
+    /// Try to resolve a function instance from a type
+    fn try_resolve_instance(&self, ty: Ty<'tcx>) -> Option<Instance<'tcx>> {
+        // first try to normalize the type
+        let norm_ty = match self.tcx.try_normalize_erasing_regions(self.typing_env, ty) {
+            Ok(n_ty) => n_ty,
+            Err(_) => {
+                // FIXME: not entirely sure why we need this but if normalization fails here,
+                // the subsequent instance resolution will also fail (and panic).
+                // So just return None here for now.
+                return None;
+            }
+        };
+
+        // then try to resolve the instance
+        match norm_ty.kind() {
+            ty::FnDef(def_id, ty_args) => {
+                match Instance::try_resolve(self.tcx, self.typing_env, *def_id, ty_args) {
+                    Ok(resolved) => resolved,
+                    Err(_) => bug!("[invariant] unable to resolve function instance"),
+                }
+            }
+            _ => bug!("[invariant] expected a function definition type after normalization"),
         }
     }
 }
