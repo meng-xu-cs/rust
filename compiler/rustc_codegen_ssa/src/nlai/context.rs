@@ -756,7 +756,9 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::FnDef(_, _) => match self.try_resolve_instance(ty) {
                 ResolvedFunction::FuncDef(ident, generics) => SolType::FuncDef(ident, generics),
                 ResolvedFunction::FuncSym(ident, generics) => SolType::FuncSym(ident, generics),
+                ResolvedFunction::AdtCtor(ident, generics) => SolType::AdtCtor(ident, generics),
                 ResolvedFunction::Virtual(ident, generics) => SolType::Virtual(ident, generics),
+                ResolvedFunction::External(ident, generics) => SolType::External(ident, generics),
                 ResolvedFunction::Intrinsic(ident, generics) => SolType::Intrinsic(ident, generics),
             },
             ty::Closure(def_id, ty_args) => {
@@ -1347,7 +1349,9 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::FnDef(..) => match self.try_resolve_instance(ty) {
                 ResolvedFunction::FuncDef(ident, generics) => SolValue::FuncDef(ident, generics),
                 ResolvedFunction::FuncSym(ident, generics) => SolValue::FuncSym(ident, generics),
+                ResolvedFunction::AdtCtor(ident, generics) => SolValue::AdtCtor(ident, generics),
                 ResolvedFunction::Virtual(ident, generics) => SolValue::Virtual(ident, generics),
+                ResolvedFunction::External(ident, generics) => SolValue::External(ident, generics),
                 ResolvedFunction::Intrinsic(ident, generics) => {
                     SolValue::Intrinsic(ident, generics)
                 }
@@ -2985,7 +2989,9 @@ impl<'tcx> ExecBuilder<'tcx> {
 
             SolValue::FuncDef(ident, ty_args) => SolType::FuncDef(ident.clone(), ty_args.clone()),
             SolValue::FuncSym(ident, ty_args) => SolType::FuncSym(ident.clone(), ty_args.clone()),
+            SolValue::AdtCtor(ident, ty_args) => SolType::AdtCtor(ident.clone(), ty_args.clone()),
             SolValue::Virtual(ident, ty_args) => SolType::Virtual(ident.clone(), ty_args.clone()),
+            SolValue::External(ident, ty_args) => SolType::External(ident.clone(), ty_args.clone()),
             SolValue::Intrinsic(ident, ty_args) => {
                 SolType::Intrinsic(ident.clone(), ty_args.clone())
             }
@@ -3055,10 +3061,19 @@ impl<'tcx> ExecBuilder<'tcx> {
         };
 
         // check on instance types
-        let ident = self.mk_ident(instance.def_id());
+        let def_id = instance.def_id();
+        let ident = self.mk_ident(def_id);
         let generics = instance.args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
         match instance.def {
-            InstanceKind::Item(..) => ResolvedFunction::FuncDef(ident, generics),
+            InstanceKind::Item(..) => {
+                if self.tcx.is_foreign_item(def_id) {
+                    ResolvedFunction::External(ident, generics)
+                } else if self.tcx.is_constructor(def_id) {
+                    ResolvedFunction::AdtCtor(ident, generics)
+                } else {
+                    ResolvedFunction::FuncDef(ident, generics)
+                }
+            }
             InstanceKind::Virtual(..) => ResolvedFunction::Virtual(ident, generics),
             InstanceKind::Intrinsic(..)
             | InstanceKind::FnPtrShim { .. }
@@ -3445,7 +3460,9 @@ pub(crate) enum SolType {
     // function pointer
     FuncDef(SolIdent, Vec<SolGenericArg>),
     FuncSym(SolIdent, Vec<SolGenericArg>),
+    AdtCtor(SolIdent, Vec<SolGenericArg>),
     Virtual(SolIdent, Vec<SolGenericArg>),
+    External(SolIdent, Vec<SolGenericArg>),
     Intrinsic(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
     FnPtr(SolFnSig),
@@ -3620,7 +3637,9 @@ pub(crate) enum SolValue {
     // function pointers
     FuncDef(SolIdent, Vec<SolGenericArg>),
     FuncSym(SolIdent, Vec<SolGenericArg>),
+    AdtCtor(SolIdent, Vec<SolGenericArg>),
     Virtual(SolIdent, Vec<SolGenericArg>),
+    External(SolIdent, Vec<SolGenericArg>),
     Intrinsic(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
     FnPtr(SolFnSig, SolIdent, Vec<SolGenericArg>),
@@ -4005,7 +4024,9 @@ pub(crate) struct SolSpan {
 enum ResolvedFunction {
     FuncDef(SolIdent, Vec<SolGenericArg>),
     FuncSym(SolIdent, Vec<SolGenericArg>),
+    AdtCtor(SolIdent, Vec<SolGenericArg>),
     Virtual(SolIdent, Vec<SolGenericArg>),
+    External(SolIdent, Vec<SolGenericArg>),
     Intrinsic(SolIdent, Vec<SolGenericArg>),
 }
 
