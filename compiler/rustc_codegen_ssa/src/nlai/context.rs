@@ -3094,16 +3094,31 @@ impl<'tcx> ExecBuilder<'tcx> {
             _ => bug!("[invariant] expected a function definition type after normalization"),
         };
 
+        // handle constructors early
+        let def_id = instance.def_id();
+        if self.tcx.is_constructor(def_id) {
+            let adt_ty = self
+                .tcx
+                .fn_sig(def_id)
+                .instantiate(self.tcx, instance.args)
+                .no_bound_vars()
+                .unwrap_or_else(|| bug!("[invariant] unable to instantiate constructor signature"))
+                .output();
+            match self.mk_type(adt_ty) {
+                SolType::Struct(adt_ident, adt_ty_args) | SolType::Enum(adt_ident, adt_ty_args) => {
+                    return ResolvedFunction::AdtCtor(adt_ident, adt_ty_args);
+                }
+                _ => bug!("[invariant] constructor does not return a tuple-like type"),
+            }
+        }
+
         // aggresively mark libcalls before further looking at the instance
         let tcx = self.tcx;
-        let def_id = instance.def_id();
         self.try_resolve_function_favor_stdlib(def_id, instance.args, |ident, generics| {
             match instance.def {
                 InstanceKind::Item(..) => {
                     if tcx.is_foreign_item(def_id) {
                         ResolvedFunction::External(ident, generics)
-                    } else if tcx.is_constructor(def_id) {
-                        ResolvedFunction::AdtCtor(ident, generics)
                     } else {
                         ResolvedFunction::FuncDef(ident, generics)
                     }
