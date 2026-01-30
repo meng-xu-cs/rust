@@ -2315,7 +2315,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                     sig.inputs().iter().map(|input_ty| self.mk_type(*input_ty)).collect();
 
                 // parse parameters
-                let mut is_closure = false;
+                let mut visibility = None;
+                let mut upvar_decl = None;
                 let mut param_iter = thir.params.iter_enumerated();
                 if thir.params.len() == params.len() + 1 {
                     // make sure this is a closure
@@ -2390,8 +2391,33 @@ impl<'tcx> ExecBuilder<'tcx> {
                         "[invariant] closure abi mismatch",
                     );
 
+                    // capture the names and types of the upvars
+                    let upvar_tys: Vec<_> = match closure_ty_args.last().and_then(|t| t.as_type()) {
+                        None => bug!("[invariant] unable to get closure upvar types"),
+                        Some(packed_ty) => match packed_ty.kind() {
+                            ty::Tuple(tys) => tys.iter().map(|t| self.mk_type(t)).collect(),
+                            _ => bug!("[invariant] expect tuple type for closure upvars"),
+                        },
+                    };
+                    let upvar_names =
+                        self.tcx.closure_saved_names_of_captured_variables(closure_id);
+                    assert_eq!(
+                        upvar_names.len(),
+                        upvar_tys.len(),
+                        "[invariant] closure upvar names/types count mismatch",
+                    );
+
+                    let upvar_capture: Vec<_> = upvar_names
+                        .iter_enumerated()
+                        .zip(upvar_tys.into_iter().enumerate())
+                        .map(|((idx, symbol), (i, ty))| {
+                            assert_eq!(idx.index(), i, "[invariant] closure upvar index mismatch",);
+                            (ty, SolLocalVarName(symbol.to_ident_string()))
+                        })
+                        .collect();
+
                     // now we are sure that this is a closure
-                    is_closure = true;
+                    upvar_decl = Some(upvar_capture);
                 } else {
                     // make sure this is a function or an associated function
                     assert!(
@@ -2408,18 +2434,14 @@ impl<'tcx> ExecBuilder<'tcx> {
                         params.len(),
                         "[invariant] parameter count mismatch",
                     );
-                }
 
-                // get the visibility of the function
-                let visibility = if is_closure {
-                    None
-                } else {
+                    // get the visibility of the function
                     let vis = match self.tcx.visibility(self.owner_id.to_def_id()) {
                         Visibility::Public => SolVisibility::Public,
                         Visibility::Restricted(id) => SolVisibility::Restricted(self.mk_ident(id)),
                     };
-                    Some(vis)
-                };
+                    visibility = Some(vis);
+                }
 
                 // declared parameters should match type declarations
                 let mut param_decls = vec![];
@@ -2429,7 +2451,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 ) in params.into_iter().enumerate().zip(param_iter)
                 {
                     assert_eq!(
-                        idx + if is_closure { 1 } else { 0 },
+                        idx + if upvar_decl.is_some() { 1 } else { 0 },
                         param_id.index(),
                         "[invariant] parameter id not sequential"
                     );
@@ -2445,16 +2467,20 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let body = self.mk_expr(thir, expr);
 
                 // pack the information
-                if is_closure {
-                    SolExec::Closure(SolClosure { ret_ty, params: param_decls, body })
-                } else {
-                    SolExec::Function(SolFnDef {
+                match upvar_decl {
+                    None => SolExec::Function(SolFnDef {
                         abi: parsed_abi,
                         vis: visibility.unwrap(),
                         ret_ty,
                         params: param_decls,
                         body,
-                    })
+                    }),
+                    Some(upvar_capture) => SolExec::Closure(SolClosure {
+                        ret_ty,
+                        params: param_decls,
+                        upvars: upvar_capture,
+                        body,
+                    }),
                 }
             }
             BodyTy::Const(ty) => {
@@ -3438,6 +3464,7 @@ pub(crate) struct SolFnDef {
 pub(crate) struct SolClosure {
     pub(crate) ret_ty: SolType,
     pub(crate) params: Vec<(SolType, Option<SolPattern>)>,
+    pub(crate) upvars: Vec<(SolType, SolLocalVarName)>,
     pub(crate) body: SolExpr,
 }
 
