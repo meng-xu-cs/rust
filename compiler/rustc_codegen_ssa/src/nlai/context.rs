@@ -35,9 +35,9 @@ use rustc_middle::ty::util::Discr;
 use rustc_middle::ty::{
     AdtDef, AdtKind, AliasTyKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig,
     GenericArg, GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, Instance,
-    List, OutlivesPredicate, ParamConst, ParamTy, Pattern, PatternKind, PredicatePolarity,
-    ProjectionPredicate, ScalarInt, Term, TermKind, TraitDef, TraitPredicate, Ty, TyCtxt,
-    TypingEnv, UpvarArgs, ValTreeKind, Value, VariantDiscr, Visibility,
+    InstanceKind, List, OutlivesPredicate, ParamConst, ParamTy, Pattern, PatternKind,
+    PredicatePolarity, ProjectionPredicate, ScalarInt, Term, TermKind, TraitDef, TraitPredicate,
+    Ty, TyCtxt, TypingEnv, UpvarArgs, ValTreeKind, Value, VariantDiscr, Visibility,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
@@ -753,17 +753,11 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // function pointer
-            ty::FnDef(def_id, ty_args) => match self.try_resolve_instance(ty) {
-                None => SolType::FuncSym(
-                    self.mk_ident(*def_id),
-                    ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect(),
-                ),
-                Some(instance) => {
-                    let ident = self.mk_ident(instance.def_id());
-                    let generic_args =
-                        instance.args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
-                    SolType::FuncDef(ident, generic_args)
-                }
+            ty::FnDef(_, _) => match self.try_resolve_instance(ty) {
+                ResolvedFunction::FuncDef(ident, generics) => SolType::FuncDef(ident, generics),
+                ResolvedFunction::FuncSym(ident, generics) => SolType::FuncSym(ident, generics),
+                ResolvedFunction::Virtual(ident, generics) => SolType::Virtual(ident, generics),
+                ResolvedFunction::Intrinsic(ident, generics) => SolType::Intrinsic(ident, generics),
             },
             ty::Closure(def_id, ty_args) => {
                 let ident = self.mk_ident(*def_id);
@@ -1350,16 +1344,12 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
             }
 
-            ty::FnDef(def_id, ty_args) => match self.try_resolve_instance(ty) {
-                None => SolValue::FuncSym(
-                    self.mk_ident(*def_id),
-                    ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect(),
-                ),
-                Some(instance) => {
-                    let ident = self.mk_ident(instance.def_id());
-                    let generic_args =
-                        instance.args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
-                    SolValue::FuncDef(ident, generic_args)
+            ty::FnDef(..) => match self.try_resolve_instance(ty) {
+                ResolvedFunction::FuncDef(ident, generics) => SolValue::FuncDef(ident, generics),
+                ResolvedFunction::FuncSym(ident, generics) => SolValue::FuncSym(ident, generics),
+                ResolvedFunction::Virtual(ident, generics) => SolValue::Virtual(ident, generics),
+                ResolvedFunction::Intrinsic(ident, generics) => {
+                    SolValue::Intrinsic(ident, generics)
                 }
             },
             ty::Closure(def_id, ty_args) => {
@@ -2995,6 +2985,10 @@ impl<'tcx> ExecBuilder<'tcx> {
 
             SolValue::FuncDef(ident, ty_args) => SolType::FuncDef(ident.clone(), ty_args.clone()),
             SolValue::FuncSym(ident, ty_args) => SolType::FuncSym(ident.clone(), ty_args.clone()),
+            SolValue::Virtual(ident, ty_args) => SolType::Virtual(ident.clone(), ty_args.clone()),
+            SolValue::Intrinsic(ident, ty_args) => {
+                SolType::Intrinsic(ident.clone(), ty_args.clone())
+            }
             SolValue::Closure(ident, ty_args) => SolType::Closure(ident.clone(), ty_args.clone()),
             SolValue::FnPtr(fn_sig, _, _) => SolType::FnPtr(fn_sig.clone()),
             SolValue::FnPtrNull(fn_sig) => SolType::FnPtr(fn_sig.clone()),
@@ -3025,27 +3019,52 @@ impl<'tcx> ExecBuilder<'tcx> {
     }
 
     /// Try to resolve a function instance from a type
-    fn try_resolve_instance(&self, ty: Ty<'tcx>) -> Option<Instance<'tcx>> {
+    fn try_resolve_instance(&mut self, ty: Ty<'tcx>) -> ResolvedFunction {
         // first try to normalize the type
         let norm_ty = match self.tcx.try_normalize_erasing_regions(self.typing_env, ty) {
             Ok(n_ty) => n_ty,
             Err(_) => {
                 // FIXME: not entirely sure why we need this but if normalization fails here,
-                // the subsequent instance resolution will also fail (and panic).
-                // So just return None here for now.
-                return None;
+                // the subsequent instance resolution will also fail (and even worse, panic).
+                // To avoid the panic, we just return None here for now.
+                match ty.kind() {
+                    ty::FnDef(def_id, ty_args) => {
+                        let ident = self.mk_ident(*def_id);
+                        let generics = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+                        return ResolvedFunction::FuncSym(ident, generics);
+                    }
+                    _ => bug!("[invariant] expect a function definition type for resolution"),
+                }
             }
         };
 
         // then try to resolve the instance
-        match norm_ty.kind() {
+        let instance = match norm_ty.kind() {
             ty::FnDef(def_id, ty_args) => {
                 match Instance::try_resolve(self.tcx, self.typing_env, *def_id, ty_args) {
-                    Ok(resolved) => resolved,
+                    Ok(None) => {
+                        let ident = self.mk_ident(*def_id);
+                        let generics = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+                        return ResolvedFunction::FuncSym(ident, generics);
+                    }
+                    Ok(Some(instance)) => instance,
                     Err(_) => bug!("[invariant] unable to resolve function instance"),
                 }
             }
             _ => bug!("[invariant] expected a function definition type after normalization"),
+        };
+
+        // check on instance types
+        let ident = self.mk_ident(instance.def_id());
+        let generics = instance.args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+        match instance.def {
+            InstanceKind::Item(..) => ResolvedFunction::FuncDef(ident, generics),
+            InstanceKind::Virtual(..) => ResolvedFunction::Virtual(ident, generics),
+            InstanceKind::Intrinsic(..)
+            | InstanceKind::FnPtrShim { .. }
+            | InstanceKind::DropGlue(..)
+            | InstanceKind::CloneShim { .. } => ResolvedFunction::Intrinsic(ident, generics),
+            _ => bug!("[invariant] unexpected instance kind for function resolution: {instance}"),
         }
     }
 }
@@ -3426,6 +3445,8 @@ pub(crate) enum SolType {
     // function pointer
     FuncDef(SolIdent, Vec<SolGenericArg>),
     FuncSym(SolIdent, Vec<SolGenericArg>),
+    Virtual(SolIdent, Vec<SolGenericArg>),
+    Intrinsic(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
     FnPtr(SolFnSig),
     // dynamic types
@@ -3599,6 +3620,8 @@ pub(crate) enum SolValue {
     // function pointers
     FuncDef(SolIdent, Vec<SolGenericArg>),
     FuncSym(SolIdent, Vec<SolGenericArg>),
+    Virtual(SolIdent, Vec<SolGenericArg>),
+    Intrinsic(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
     FnPtr(SolFnSig, SolIdent, Vec<SolGenericArg>),
     FnPtrNull(SolFnSig),
@@ -3977,6 +4000,14 @@ pub(crate) struct SolSpan {
 }
 
 /* --- END OF SYNC --- */
+
+/// Differentiate resolved function kinds
+enum ResolvedFunction {
+    FuncDef(SolIdent, Vec<SolGenericArg>),
+    FuncSym(SolIdent, Vec<SolGenericArg>),
+    Virtual(SolIdent, Vec<SolGenericArg>),
+    Intrinsic(SolIdent, Vec<SolGenericArg>),
+}
 
 /*
  * Utilities
