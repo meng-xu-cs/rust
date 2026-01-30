@@ -758,6 +758,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 ResolvedFunction::FuncSym(ident, generics) => SolType::FuncSym(ident, generics),
                 ResolvedFunction::AdtCtor(ident, generics) => SolType::AdtCtor(ident, generics),
                 ResolvedFunction::Virtual(ident, generics) => SolType::Virtual(ident, generics),
+                ResolvedFunction::Libfunc(ident, generics) => SolType::Libfunc(ident, generics),
                 ResolvedFunction::External(ident, generics) => SolType::External(ident, generics),
                 ResolvedFunction::Intrinsic(ident, generics) => SolType::Intrinsic(ident, generics),
             },
@@ -1351,6 +1352,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 ResolvedFunction::FuncSym(ident, generics) => SolValue::FuncSym(ident, generics),
                 ResolvedFunction::AdtCtor(ident, generics) => SolValue::AdtCtor(ident, generics),
                 ResolvedFunction::Virtual(ident, generics) => SolValue::Virtual(ident, generics),
+                ResolvedFunction::Libfunc(ident, generics) => SolValue::Libfunc(ident, generics),
                 ResolvedFunction::External(ident, generics) => SolValue::External(ident, generics),
                 ResolvedFunction::Intrinsic(ident, generics) => {
                     SolValue::Intrinsic(ident, generics)
@@ -2991,6 +2993,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             SolValue::FuncSym(ident, ty_args) => SolType::FuncSym(ident.clone(), ty_args.clone()),
             SolValue::AdtCtor(ident, ty_args) => SolType::AdtCtor(ident.clone(), ty_args.clone()),
             SolValue::Virtual(ident, ty_args) => SolType::Virtual(ident.clone(), ty_args.clone()),
+            SolValue::Libfunc(ident, ty_args) => SolType::Libfunc(ident.clone(), ty_args.clone()),
             SolValue::External(ident, ty_args) => SolType::External(ident.clone(), ty_args.clone()),
             SolValue::Intrinsic(ident, ty_args) => {
                 SolType::Intrinsic(ident.clone(), ty_args.clone())
@@ -3024,6 +3027,33 @@ impl<'tcx> ExecBuilder<'tcx> {
         }
     }
 
+    /// Try to parse the origin of a function
+    fn try_parse_function_origin(&self, def_id: DefId) -> Option<ResolvedStdlib> {
+        let crate_name = self.tcx.crate_name(def_id.krate);
+        let stdlib = match crate_name.as_str() {
+            "core" => ResolvedStdlib::Core,
+            "alloc" => ResolvedStdlib::Alloc,
+            "std" => ResolvedStdlib::Std,
+            "test" => ResolvedStdlib::Test,
+            _ => return None,
+        };
+        Some(stdlib)
+    }
+
+    fn try_resolve_function_favor_stdlib(
+        &mut self,
+        def_id: DefId,
+        ty_args: GenericArgsRef<'tcx>,
+        default: impl Fn(SolIdent, Vec<SolGenericArg>) -> ResolvedFunction,
+    ) -> ResolvedFunction {
+        let ident = self.mk_ident(def_id);
+        let generics = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+        match self.try_parse_function_origin(def_id) {
+            None => default(ident, generics),
+            Some(_) => ResolvedFunction::Libfunc(ident, generics),
+        }
+    }
+
     /// Try to resolve a function instance from a type
     fn try_resolve_instance(&mut self, ty: Ty<'tcx>) -> ResolvedFunction {
         // first try to normalize the type
@@ -3035,9 +3065,11 @@ impl<'tcx> ExecBuilder<'tcx> {
                 // To avoid the panic, we just return None here for now.
                 match ty.kind() {
                     ty::FnDef(def_id, ty_args) => {
-                        let ident = self.mk_ident(*def_id);
-                        let generics = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
-                        return ResolvedFunction::FuncSym(ident, generics);
+                        return self.try_resolve_function_favor_stdlib(
+                            *def_id,
+                            *ty_args,
+                            ResolvedFunction::FuncSym,
+                        );
                     }
                     _ => bug!("[invariant] expect a function definition type for resolution"),
                 }
@@ -3049,9 +3081,11 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::FnDef(def_id, ty_args) => {
                 match Instance::try_resolve(self.tcx, self.typing_env, *def_id, ty_args) {
                     Ok(None) => {
-                        let ident = self.mk_ident(*def_id);
-                        let generics = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
-                        return ResolvedFunction::FuncSym(ident, generics);
+                        return self.try_resolve_function_favor_stdlib(
+                            *def_id,
+                            *ty_args,
+                            ResolvedFunction::FuncSym,
+                        );
                     }
                     Ok(Some(instance)) => instance,
                     Err(_) => bug!("[invariant] unable to resolve function instance"),
@@ -3060,27 +3094,30 @@ impl<'tcx> ExecBuilder<'tcx> {
             _ => bug!("[invariant] expected a function definition type after normalization"),
         };
 
-        // check on instance types
+        // aggresively mark libcalls before further looking at the instance
+        let tcx = self.tcx;
         let def_id = instance.def_id();
-        let ident = self.mk_ident(def_id);
-        let generics = instance.args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
-        match instance.def {
-            InstanceKind::Item(..) => {
-                if self.tcx.is_foreign_item(def_id) {
-                    ResolvedFunction::External(ident, generics)
-                } else if self.tcx.is_constructor(def_id) {
-                    ResolvedFunction::AdtCtor(ident, generics)
-                } else {
-                    ResolvedFunction::FuncDef(ident, generics)
+        self.try_resolve_function_favor_stdlib(def_id, instance.args, |ident, generics| {
+            match instance.def {
+                InstanceKind::Item(..) => {
+                    if tcx.is_foreign_item(def_id) {
+                        ResolvedFunction::External(ident, generics)
+                    } else if tcx.is_constructor(def_id) {
+                        ResolvedFunction::AdtCtor(ident, generics)
+                    } else {
+                        ResolvedFunction::FuncDef(ident, generics)
+                    }
+                }
+                InstanceKind::Virtual(..) => ResolvedFunction::Virtual(ident, generics),
+                InstanceKind::Intrinsic(..)
+                | InstanceKind::FnPtrShim { .. }
+                | InstanceKind::DropGlue(..)
+                | InstanceKind::CloneShim { .. } => ResolvedFunction::Intrinsic(ident, generics),
+                _ => {
+                    bug!("[invariant] unexpected instance kind for function resolution: {instance}")
                 }
             }
-            InstanceKind::Virtual(..) => ResolvedFunction::Virtual(ident, generics),
-            InstanceKind::Intrinsic(..)
-            | InstanceKind::FnPtrShim { .. }
-            | InstanceKind::DropGlue(..)
-            | InstanceKind::CloneShim { .. } => ResolvedFunction::Intrinsic(ident, generics),
-            _ => bug!("[invariant] unexpected instance kind for function resolution: {instance}"),
-        }
+        })
     }
 }
 
@@ -3462,6 +3499,7 @@ pub(crate) enum SolType {
     FuncSym(SolIdent, Vec<SolGenericArg>),
     AdtCtor(SolIdent, Vec<SolGenericArg>),
     Virtual(SolIdent, Vec<SolGenericArg>),
+    Libfunc(SolIdent, Vec<SolGenericArg>),
     External(SolIdent, Vec<SolGenericArg>),
     Intrinsic(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
@@ -3639,6 +3677,7 @@ pub(crate) enum SolValue {
     FuncSym(SolIdent, Vec<SolGenericArg>),
     AdtCtor(SolIdent, Vec<SolGenericArg>),
     Virtual(SolIdent, Vec<SolGenericArg>),
+    Libfunc(SolIdent, Vec<SolGenericArg>),
     External(SolIdent, Vec<SolGenericArg>),
     Intrinsic(SolIdent, Vec<SolGenericArg>),
     Closure(SolIdent, Vec<SolGenericArg>),
@@ -3922,7 +3961,7 @@ pub(crate) struct SolLetBinding {
     pub(crate) span: SolSpan,
 }
 
-/// Base
+/// Base for ADT construction
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum SolAdtBase {
     None,
@@ -4020,12 +4059,21 @@ pub(crate) struct SolSpan {
 
 /* --- END OF SYNC --- */
 
+/// Known crates in the rust standard library
+enum ResolvedStdlib {
+    Core,
+    Alloc,
+    Std,
+    Test,
+}
+
 /// Differentiate resolved function kinds
 enum ResolvedFunction {
     FuncDef(SolIdent, Vec<SolGenericArg>),
     FuncSym(SolIdent, Vec<SolGenericArg>),
     AdtCtor(SolIdent, Vec<SolGenericArg>),
     Virtual(SolIdent, Vec<SolGenericArg>),
+    Libfunc(SolIdent, Vec<SolGenericArg>),
     External(SolIdent, Vec<SolGenericArg>),
     Intrinsic(SolIdent, Vec<SolGenericArg>),
 }
