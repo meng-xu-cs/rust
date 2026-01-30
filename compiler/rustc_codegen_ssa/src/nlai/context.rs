@@ -3034,6 +3034,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             "core" => ResolvedStdlib::Core,
             "alloc" => ResolvedStdlib::Alloc,
             "std" => ResolvedStdlib::Std,
+            "proc_macro" => ResolvedStdlib::ProcMacro,
             "test" => ResolvedStdlib::Test,
             _ => return None,
         };
@@ -4079,6 +4080,7 @@ enum ResolvedStdlib {
     Core,
     Alloc,
     Std,
+    ProcMacro,
     Test,
 }
 
