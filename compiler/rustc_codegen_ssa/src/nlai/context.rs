@@ -23,9 +23,9 @@ use rustc_middle::middle::region::{Scope, ScopeData};
 use rustc_middle::mir::interpret::{AllocRange, Allocation, GlobalAlloc, Scalar};
 use rustc_middle::mir::{AssignOp, BinOp, BorrowKind, UnOp};
 use rustc_middle::thir::{
-    AdtExpr, AdtExprBase, Arm, Block, BlockId, BlockSafety, BodyTy, ClosureExpr,
-    DerefPatBorrowMode, Expr, ExprId, ExprKind, FieldExpr, FieldPat, FruInfo, LocalVarId,
-    LogicalOp, Param, Pat, PatKind, PatRange, PatRangeBoundary, Stmt, StmtId, StmtKind, Thir,
+    AdtExpr, AdtExprBase, Arm, Block, BlockId, BlockSafety, BodyTy, ClosureExpr, Expr, ExprId,
+    ExprKind, FieldExpr, FieldPat, FruInfo, LocalVarId, LogicalOp, Param, Pat, PatKind, PatRange,
+    PatRangeBoundary, Stmt, StmtId, StmtKind, Thir,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::print::{
@@ -962,14 +962,6 @@ impl<'tcx> ExecBuilder<'tcx> {
             PatKind::Deref { pin: _, subpattern } => {
                 SolPatRule::Deref(Box::new(self.mk_pat(subpattern)))
             }
-            PatKind::DerefPattern { subpattern, borrow } => {
-                let sub_pat = Box::new(self.mk_pat(subpattern));
-                match borrow {
-                    DerefPatBorrowMode::Box => SolPatRule::DerefBox(sub_pat),
-                    DerefPatBorrowMode::Borrow(Mutability::Not) => SolPatRule::DerefImm(sub_pat),
-                    DerefPatBorrowMode::Borrow(Mutability::Mut) => SolPatRule::DerefMut(sub_pat),
-                }
-            }
 
             PatKind::Range(pat_range) => {
                 let PatRange { lo, hi, end, ty } = pat_range.as_ref();
@@ -997,6 +989,9 @@ impl<'tcx> ExecBuilder<'tcx> {
             PatKind::Or { box pats } => {
                 SolPatRule::Or(pats.iter().map(|sub_pat| self.mk_pat(sub_pat)).collect())
             }
+
+            // unsupported
+            PatKind::DerefPattern { .. } => bug!("[unsupported] deref pattern"),
 
             // unreachable
             PatKind::Error(..) => bug!("[invariant] unreachable pattern {kind:?}"),
@@ -3940,9 +3935,6 @@ pub(crate) enum SolPatRule {
         suffix: Vec<SolPattern>,
     },
     Deref(Box<SolPattern>),
-    DerefBox(Box<SolPattern>),
-    DerefImm(Box<SolPattern>),
-    DerefMut(Box<SolPattern>),
     Range {
         lo: Option<SolValue>,
         hi: Option<SolValue>,
