@@ -898,8 +898,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                     (ByRef::No, Mutability::Not) => SolBindMode::ImmByValue,
                     (ByRef::No, Mutability::Mut) => SolBindMode::MutByValue,
                     (ByRef::Yes(_, Mutability::Not), Mutability::Not) => SolBindMode::ImmByImmRef,
-                    (ByRef::Yes(_, Mutability::Not), Mutability::Mut) => SolBindMode::ImmByMutRef,
-                    (ByRef::Yes(_, Mutability::Mut), Mutability::Not) => SolBindMode::MutByImmRef,
+                    (ByRef::Yes(_, Mutability::Not), Mutability::Mut) => SolBindMode::MutByImmRef,
+                    (ByRef::Yes(_, Mutability::Mut), Mutability::Not) => SolBindMode::ImmByMutRef,
                     (ByRef::Yes(_, Mutability::Mut), Mutability::Mut) => SolBindMode::MutByMutRef,
                 };
 
