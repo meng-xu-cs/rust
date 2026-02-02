@@ -91,6 +91,9 @@ struct ExecBuilder<'tcx> {
     /// static initializers
     static_inits: BTreeMap<SolIdent, Option<SolValue>>,
 
+    /// upvar declarations
+    upvar_decls: BTreeMap<SolLocalVarIndex, (SolLocalVarName, Option<SolType>)>,
+
     /// local variables
     var_scope: BTreeMap<SolLocalVarIndex, SolLocalVarName>,
 
@@ -331,6 +334,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             adt_defs: BTreeMap::new(),
             trait_defs: BTreeMap::new(),
             static_inits: BTreeMap::new(),
+            upvar_decls: BTreeMap::new(),
             var_scope: BTreeMap::new(),
             inst_ids: BTreeSet::new(),
             log_stack: LogStack::new(),
@@ -2311,7 +2315,6 @@ impl<'tcx> ExecBuilder<'tcx> {
 
                 // parse parameters
                 let mut visibility = None;
-                let mut upvar_decl = None;
                 let mut param_iter = thir.params.iter_enumerated();
                 if thir.params.len() == params.len() + 1 {
                     // make sure this is a closure
@@ -2386,7 +2389,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                         "[invariant] closure abi mismatch",
                     );
 
-                    // capture the names and types of the upvars
+                    // check the names and types of the upvars
                     let upvar_tys: Vec<_> = match closure_ty_args.last().and_then(|t| t.as_type()) {
                         None => bug!("[invariant] unable to get closure upvar types"),
                         Some(packed_ty) => match packed_ty.kind() {
@@ -2402,17 +2405,50 @@ impl<'tcx> ExecBuilder<'tcx> {
                         "[invariant] closure upvar names/types count mismatch",
                     );
 
-                    let upvar_capture: Vec<_> = upvar_names
+                    let upvar_mention =
+                        self.tcx.upvars_mentioned(closure_id).cloned().unwrap_or_default();
+
+                    // collect the upvars used from the perspective of the compiler after feature "disjoint capture in closures"
+                    // FIXME: right now we are not using them, instead this is just for sanity check
+                    let _upvar_origins: Vec<_> = upvar_names
                         .iter_enumerated()
                         .zip(upvar_tys.into_iter().enumerate())
                         .map(|((idx, symbol), (i, ty))| {
-                            assert_eq!(idx.index(), i, "[invariant] closure upvar index mismatch",);
-                            (ty, SolLocalVarName(symbol.to_ident_string()))
+                            assert_eq!(idx.index(), i, "[invariant] closure upvar index mismatch");
+
+                            // look for variable id
+                            let upvar_name = symbol.to_ident_string();
+                            let upvar_name_no_ref = upvar_name.trim_start_matches("_ref__");
+                            let upvar_name_no_ref_and_fields = upvar_name_no_ref
+                                .split_once("__")
+                                .map(|(v, _)| v)
+                                .unwrap_or(upvar_name_no_ref);
+
+                            let var_id = upvar_mention
+                                .keys()
+                                .find(|&hir_id| {
+                                    self.tcx
+                                        .hir_name(*hir_id)
+                                        .to_ident_string()
+                                        .starts_with(upvar_name_no_ref_and_fields)
+                                })
+                                .map(|i| self.mk_local_var_id(LocalVarId(*i)))
+                                .unwrap_or_else(|| {
+                                    bug!("[invariant] unable to find upvar id for {symbol}",)
+                                });
+
+                            (var_id, ty, SolLocalVarName(upvar_name))
                         })
                         .collect();
 
-                    // now we are sure that this is a closure
-                    upvar_decl = Some(upvar_capture);
+                    // collect the upvars that will actually appear in the closure definition
+                    for &hir_id in upvar_mention.keys() {
+                        let var_id = self.mk_local_var_id(LocalVarId(hir_id));
+                        self.upvar_decls.insert(
+                            var_id,
+                            (SolLocalVarName(self.tcx.hir_name(hir_id).to_ident_string()), None),
+                        );
+                    }
                 } else {
                     // make sure this is a function or an associated function
                     assert!(
@@ -2446,7 +2482,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 ) in params.into_iter().enumerate().zip(param_iter)
                 {
                     assert_eq!(
-                        idx + if upvar_decl.is_some() { 1 } else { 0 },
+                        idx + if visibility.is_none() { 1 } else { 0 },
                         param_id.index(),
                         "[invariant] parameter id not sequential"
                     );
@@ -2462,20 +2498,35 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let body = self.mk_expr(thir, expr);
 
                 // pack the information
-                match upvar_decl {
-                    None => SolExec::Function(SolFnDef {
-                        abi: parsed_abi,
-                        vis: visibility.unwrap(),
-                        ret_ty,
-                        params: param_decls,
-                        body,
-                    }),
-                    Some(upvar_capture) => SolExec::Closure(SolClosure {
-                        ret_ty,
-                        params: param_decls,
-                        upvars: upvar_capture,
-                        body,
-                    }),
+                match visibility {
+                    None => {
+                        // unpack the upvars for closures
+                        let upvars = self
+                            .upvar_decls
+                            .iter()
+                            .map(|(var_id, (name, ty_opt))| {
+                                let var_ty = ty_opt.clone().unwrap_or_else(|| {
+                                    bug!("[invariant] upvar type not recorded for {}", name.0);
+                                });
+                                (var_id.clone(), var_ty, name.clone())
+                            })
+                            .collect();
+                        SolExec::Closure(SolClosure { ret_ty, params: param_decls, upvars, body })
+                    }
+                    Some(vis) => {
+                        // function should not have upvars
+                        assert!(
+                            self.upvar_decls.is_empty(),
+                            "[invariant] function should not have upvars"
+                        );
+                        SolExec::Function(SolFnDef {
+                            abi: parsed_abi,
+                            vis,
+                            ret_ty,
+                            params: param_decls,
+                            body,
+                        })
+                    }
                 }
             }
             BodyTy::Const(ty) => {
@@ -2540,12 +2591,32 @@ impl<'tcx> ExecBuilder<'tcx> {
                     &self.owner_id.to_def_id(),
                     "[invariant] closure def_id mismatch"
                 );
+                assert_ne!(
+                    var_hir_id.0.owner, self.owner_id,
+                    "[invariant] upvar cannot belong to local closure"
+                );
 
+                // ensure that the current variable scope does not contain the upvar
                 let var_id = self.mk_local_var_id(*var_hir_id);
                 assert!(
                     !self.var_scope.contains_key(&var_id),
                     "[invariant] upvar refers to a declared local variable {var_hir_id:?}"
                 );
+
+                // update the var declaration type if not yet recorded
+                let (_, upvar_ty) = self
+                    .upvar_decls
+                    .get_mut(&var_id)
+                    .unwrap_or_else(|| bug!("[invariant] upvar not declared"));
+                if let Some(existing_ty) = upvar_ty {
+                    assert_eq!(
+                        *existing_ty, expr_ty,
+                        "[invariant] upvar type mismatch for {var_hir_id:?}"
+                    );
+                } else {
+                    *upvar_ty = Some(expr_ty.clone());
+                }
+
                 SolOp::UpVar(var_id)
             }
             ExprKind::ConstParam { param: ParamConst { index, name }, def_id } => {
@@ -3273,6 +3344,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             adt_defs,
             trait_defs,
             static_inits,
+            upvar_decls: _,
             var_scope: _,
             inst_ids: _,
             log_stack,
@@ -3459,7 +3531,7 @@ pub(crate) struct SolFnDef {
 pub(crate) struct SolClosure {
     pub(crate) ret_ty: SolType,
     pub(crate) params: Vec<(SolType, Option<SolPattern>)>,
-    pub(crate) upvars: Vec<(SolType, SolLocalVarName)>,
+    pub(crate) upvars: Vec<(SolLocalVarIndex, SolType, SolLocalVarName)>,
     pub(crate) body: SolExpr,
 }
 
