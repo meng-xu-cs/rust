@@ -912,13 +912,22 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let var_type = self.mk_type(*ty);
                 let var_subpat = subpattern.as_ref().map(|sub_pat| Box::new(self.mk_pat(sub_pat)));
 
-                // record the binding if primary
+                // record the binding if primary, check consistency otherwise
+                let var_hir_id = var.0;
                 if *is_primary {
                     let existing = self.var_scope.insert(var_index.clone(), var_name.clone());
                     assert!(
                         existing.is_none(),
-                        "[invariant] local variable {name} (with id: {}) is already defined",
-                        var.0
+                        "[invariant] local variable {name} (with id: {var_hir_id}) is already defined"
+                    );
+                } else {
+                    let existing = self.var_scope.get(&var_index).unwrap_or_else(|| panic!(
+                        "[invariant] non-primary local variable {name} (with id: {var_hir_id}) is not defined yet"
+                    ));
+                    assert_eq!(
+                        &var_name, existing,
+                        "[invariant] non-primary local variable (with id: {var_hir_id}) name mismatch: {} vs {}",
+                        existing.0, var_name.0
                     );
                 }
 
@@ -2658,23 +2667,15 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let rhs_expr = self.mk_expr(thir, *rhs);
                 match op {
                     BinOp::Add => SolOp::Add(lhs_expr, rhs_expr),
-                    BinOp::AddUnchecked => SolOp::AddUnchecked(lhs_expr, rhs_expr),
-                    BinOp::AddWithOverflow => SolOp::AddWithOverflow(lhs_expr, rhs_expr),
                     BinOp::Sub => SolOp::Sub(lhs_expr, rhs_expr),
-                    BinOp::SubUnchecked => SolOp::SubUnchecked(lhs_expr, rhs_expr),
-                    BinOp::SubWithOverflow => SolOp::SubWithOverflow(lhs_expr, rhs_expr),
                     BinOp::Mul => SolOp::Mul(lhs_expr, rhs_expr),
-                    BinOp::MulUnchecked => SolOp::MulUnchecked(lhs_expr, rhs_expr),
-                    BinOp::MulWithOverflow => SolOp::MulWithOverflow(lhs_expr, rhs_expr),
                     BinOp::Div => SolOp::Div(lhs_expr, rhs_expr),
                     BinOp::Rem => SolOp::Rem(lhs_expr, rhs_expr),
                     BinOp::BitXor => SolOp::BitXor(lhs_expr, rhs_expr),
                     BinOp::BitAnd => SolOp::BitAnd(lhs_expr, rhs_expr),
                     BinOp::BitOr => SolOp::BitOr(lhs_expr, rhs_expr),
                     BinOp::Shl => SolOp::Shl(lhs_expr, rhs_expr),
-                    BinOp::ShlUnchecked => SolOp::ShlUnchecked(lhs_expr, rhs_expr),
                     BinOp::Shr => SolOp::Shr(lhs_expr, rhs_expr),
-                    BinOp::ShrUnchecked => SolOp::ShrUnchecked(lhs_expr, rhs_expr),
                     BinOp::Eq => SolOp::Eq(lhs_expr, rhs_expr),
                     BinOp::Ne => SolOp::Ne(lhs_expr, rhs_expr),
                     BinOp::Lt => SolOp::Lt(lhs_expr, rhs_expr),
@@ -2682,6 +2683,17 @@ impl<'tcx> ExecBuilder<'tcx> {
                     BinOp::Gt => SolOp::Gt(lhs_expr, rhs_expr),
                     BinOp::Ge => SolOp::Ge(lhs_expr, rhs_expr),
                     BinOp::Cmp => SolOp::Cmp(lhs_expr, rhs_expr),
+                    // unexpected
+                    BinOp::AddUnchecked
+                    | BinOp::AddWithOverflow
+                    | BinOp::SubUnchecked
+                    | BinOp::SubWithOverflow
+                    | BinOp::MulUnchecked
+                    | BinOp::MulWithOverflow
+                    | BinOp::ShlUnchecked
+                    | BinOp::ShrUnchecked => {
+                        bug!("[invariant] unexpected overflow-related operation")
+                    }
                     BinOp::Offset => bug!("[unsupported] offset binary op in THIR"),
                 }
             }
@@ -2824,7 +2836,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 match borrow_kind {
                     BorrowKind::Shared => SolOp::ImmBorrow(borrowed),
                     BorrowKind::Mut { kind: _ } => SolOp::MutBorrow(borrowed),
-                    BorrowKind::Fake(..) => bug!("[unsupported] fake borrow in THIR"),
+                    BorrowKind::Fake(..) => bug!("[invariant] unexpected fake borrow in THIR"),
                 }
             }
             ExprKind::RawBorrow { mutability, arg } => {
@@ -3829,23 +3841,15 @@ pub(crate) enum SolOp {
     Not(SolExpr),
     Neg(SolExpr),
     Add(SolExpr, SolExpr),
-    AddUnchecked(SolExpr, SolExpr),
-    AddWithOverflow(SolExpr, SolExpr),
     Sub(SolExpr, SolExpr),
-    SubUnchecked(SolExpr, SolExpr),
-    SubWithOverflow(SolExpr, SolExpr),
     Mul(SolExpr, SolExpr),
-    MulUnchecked(SolExpr, SolExpr),
-    MulWithOverflow(SolExpr, SolExpr),
     Div(SolExpr, SolExpr),
     Rem(SolExpr, SolExpr),
     BitXor(SolExpr, SolExpr),
     BitAnd(SolExpr, SolExpr),
     BitOr(SolExpr, SolExpr),
     Shl(SolExpr, SolExpr),
-    ShlUnchecked(SolExpr, SolExpr),
     Shr(SolExpr, SolExpr),
-    ShrUnchecked(SolExpr, SolExpr),
     Eq(SolExpr, SolExpr),
     Ne(SolExpr, SolExpr),
     Lt(SolExpr, SolExpr),
