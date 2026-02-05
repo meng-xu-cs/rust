@@ -33,11 +33,12 @@ use rustc_middle::ty::print::{
 };
 use rustc_middle::ty::util::Discr;
 use rustc_middle::ty::{
-    AdtDef, AdtKind, AliasTyKind, Clause, ClauseKind, Const, ConstKind, FnHeader, FnSig,
-    GenericArg, GenericArgKind, GenericArgsRef, GenericParamDef, GenericParamDefKind, Instance,
-    InstanceKind, List, OutlivesPredicate, ParamConst, ParamTy, Pattern, PatternKind,
-    PredicatePolarity, ProjectionPredicate, ScalarInt, Term, TermKind, TraitDef, TraitPredicate,
-    Ty, TyCtxt, TypingEnv, UpvarArgs, ValTreeKind, Value, VariantDiscr, Visibility,
+    AdtDef, AdtKind, AliasTyKind, BoundTy, BoundTyKind, BoundVar, Clause, ClauseKind, Const,
+    ConstKind, FnHeader, FnSig, GenericArg, GenericArgKind, GenericArgsRef, GenericParamDef,
+    GenericParamDefKind, Instance, InstanceKind, List, OutlivesPredicate, ParamConst, ParamTy,
+    Pattern, PatternKind, PredicatePolarity, ProjectionPredicate, ScalarInt, Term, TermKind,
+    TraitDef, TraitPredicate, Ty, TyCtxt, TypingEnv, UniverseIndex, UpvarArgs, ValTreeKind, Value,
+    VariantDiscr, Visibility,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
@@ -87,6 +88,9 @@ struct ExecBuilder<'tcx> {
 
     /// collected definitions of traits
     trait_defs: BTreeMap<SolIdent, BTreeMap<Vec<SolGenericArg>, Option<SolTraitDef>>>,
+
+    /// dynamic types and their associated clauses
+    dyn_types: BTreeMap<SolDynTypeIndex, (Ty<'tcx>, DynTypeStatus)>,
 
     /// static initializers
     static_inits: BTreeMap<SolIdent, Option<SolValue>>,
@@ -333,6 +337,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             cp_types: BTreeMap::new(),
             adt_defs: BTreeMap::new(),
             trait_defs: BTreeMap::new(),
+            dyn_types: BTreeMap::new(),
             static_inits: BTreeMap::new(),
             upvar_decls: BTreeMap::new(),
             var_scope: BTreeMap::new(),
@@ -786,14 +791,65 @@ impl<'tcx> ExecBuilder<'tcx> {
                 if !(region.is_erased() || region.is_static()) {
                     bug!("[invariant] regions should be erased or static in THIR: {region}");
                 }
-                let clauses = predicates
+
+                // re-used the index of a previously processed dynamic type
+                match self
+                    .dyn_types
                     .iter()
-                    .map(|pred|
-                        // NOTE: we use the dynamic type itself as the self type
-                        // so that we can instantiate the clauses properly
-                        self.mk_clause(pred.with_self_ty(self.tcx, ty)))
-                    .collect();
-                SolType::Dynamic(clauses)
+                    .find(|(_, (t, s))| *t == ty && matches!(s, DynTypeStatus::Processed(_)))
+                {
+                    Some((dyn_idx, _)) => SolType::Dynamic(dyn_idx.clone()),
+                    None => {
+                        // create a placeholder Self type for the trait object
+                        let var_idx = self.dyn_types.len();
+                        let universe = self
+                            .tcx
+                            .infer_ctxt()
+                            .build(self.typing_env.typing_mode)
+                            .create_next_universe();
+                        let self_ty = Ty::new_placeholder(
+                            self.tcx,
+                            ty::PlaceholderType::new(
+                                universe,
+                                BoundTy {
+                                    var: BoundVar::from_usize(var_idx),
+                                    kind: BoundTyKind::Anon,
+                                },
+                            ),
+                        );
+
+                        // mark the beginning of clause collection
+                        let dyn_idx = SolDynTypeIndex(var_idx);
+                        self.dyn_types
+                            .insert(dyn_idx.clone(), (ty, DynTypeStatus::Resolving(universe)));
+
+                        // resolve the predicates with Self type
+                        let clauses = predicates
+                            .iter()
+                            .map(|pred| self.mk_clause(pred.with_self_ty(self.tcx, self_ty)))
+                            .collect();
+
+                        // update the collected clauses
+                        let (_, status) = self.dyn_types.get_mut(&dyn_idx).unwrap();
+                        *status = DynTypeStatus::Processed(clauses);
+
+                        // the type will be returned as the index only
+                        SolType::Dynamic(dyn_idx)
+                    }
+                }
+            }
+            ty::Placeholder(holder) => {
+                // NOTE: under normal THIR, there should be no placeholder types at all. Hence, the only reason
+                // why we can see a placeholder type here is when we are creating a Self type for a trait object
+                // which is used in resolving the dynamic type's predicates (see above handling of ty::Dynamic).
+                assert!(matches!(holder.bound.kind, BoundTyKind::Anon));
+                let dyn_idx = SolDynTypeIndex(holder.bound.var.index());
+                assert!(
+                    self.dyn_types
+                        .get(&dyn_idx)
+                        .map_or(false, |(_, status)| matches!(status, DynTypeStatus::Resolving(ui) if *ui == holder.universe)),
+                );
+                SolType::Dynamic(dyn_idx)
             }
 
             // alias
@@ -807,10 +863,6 @@ impl<'tcx> ExecBuilder<'tcx> {
                         // It is possible that normalization does not change the type, for example,
                         // when the projection comes from a type parameter (which implements a trait),
                         // e.g., <P as Foo>::T, where P is the type parameter of the THIR definition.
-                        //
-                        // Another possiblility is that we treat the `dyn Trait` it itself as Self,
-                        // and the projection is from the trait object, e.g., `<dyn Foo as Foo>::T`.
-                        // We can't further normalize the `dyn Foo` here.
                         let (trait_ref, own_ty_args) = alias_ty.trait_ref_and_own_args(self.tcx);
                         let (trait_ident, trait_ty_args) =
                             self.mk_trait(self.tcx.trait_def(trait_ref.def_id), trait_ref.args);
@@ -856,7 +908,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // unexpected
-            ty::Infer(..) | ty::Bound(..) | ty::Placeholder(..) | ty::Error(..) => {
+            ty::Infer(..) | ty::Bound(..) | ty::Error(..) => {
                 bug!("[invariant] unexpected type: {ty}")
             }
         };
@@ -2318,9 +2370,8 @@ impl<'tcx> ExecBuilder<'tcx> {
 
                 // parse function signature
                 let parsed_abi = self.mk_abi(abi, c_variadic, safety);
-                let ret_ty = self.mk_type(sig.output());
-                let params: Vec<_> =
-                    sig.inputs().iter().map(|input_ty| self.mk_type(*input_ty)).collect();
+                let ret_ty = sig.output();
+                let params = sig.inputs();
 
                 // parse parameters
                 let mut visibility = None;
@@ -2488,20 +2539,22 @@ impl<'tcx> ExecBuilder<'tcx> {
                 for (
                     (idx, param_ty),
                     (param_id, Param { pat, ty, ty_span: _, self_kind: _, hir_id: _ }),
-                ) in params.into_iter().enumerate().zip(param_iter)
+                ) in params.iter().enumerate().zip(param_iter)
                 {
                     assert_eq!(
                         idx + if visibility.is_none() { 1 } else { 0 },
                         param_id.index(),
                         "[invariant] parameter id not sequential"
                     );
+                    assert_eq!(param_ty, ty, "[invariant] parameter type mismatch");
 
                     let decl_ty = self.mk_type(*ty);
-                    assert_eq!(param_ty, decl_ty, "[invariant] parameter type mismatch");
-
                     let decl_pat = pat.as_ref().map(|p| self.mk_pat(p));
                     param_decls.push((decl_ty, decl_pat));
                 }
+
+                // record return type
+                let ret_ty_decl = self.mk_type(ret_ty);
 
                 // parse the body expression
                 let body = self.mk_expr(thir, expr);
@@ -2520,7 +2573,12 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 (var_id.clone(), var_ty, name.clone())
                             })
                             .collect();
-                        SolExec::Closure(SolClosure { ret_ty, params: param_decls, upvars, body })
+                        SolExec::Closure(SolClosure {
+                            ret_ty: ret_ty_decl,
+                            params: param_decls,
+                            upvars,
+                            body,
+                        })
                     }
                     Some(vis) => {
                         // function should not have upvars
@@ -2531,7 +2589,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                         SolExec::Function(SolFnDef {
                             abi: parsed_abi,
                             vis,
-                            ret_ty,
+                            ret_ty: ret_ty_decl,
                             params: param_decls,
                             body,
                         })
@@ -3355,6 +3413,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             mut cp_types,
             adt_defs,
             trait_defs,
+            dyn_types,
             static_inits,
             upvar_decls: _,
             var_scope: _,
@@ -3401,6 +3460,17 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             }
         }
 
+        // collect the dynamic types
+        let mut flat_dyn_types = vec![];
+        for (ident, (_, dyn_ty)) in dyn_types.into_iter() {
+            match dyn_ty {
+                DynTypeStatus::Resolving(_) => bug!("[invariant] missing dynamic type clauses"),
+                DynTypeStatus::Processed(clauses) => {
+                    flat_dyn_types.push((ident, clauses));
+                }
+            }
+        }
+
         // collect static initializers
         let mut flat_static_inits = vec![];
         for (ident, init) in static_inits.into_iter() {
@@ -3417,6 +3487,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             generics: flat_generics,
             adt_defs: flat_adt_defs,
             trait_defs: flat_trait_defs,
+            dyn_types: flat_dyn_types,
             static_inits: flat_static_inits,
             executable: exec_full,
         });
@@ -3490,6 +3561,7 @@ pub(crate) struct SolBundle {
     pub(crate) generics: Vec<(SolIdent, SolParamName, SolGenericMeta)>,
     pub(crate) adt_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolAdtDef)>,
     pub(crate) trait_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTraitDef)>,
+    pub(crate) dyn_types: Vec<(SolDynTypeIndex, Vec<SolClause>)>,
     pub(crate) static_inits: Vec<(SolIdent, SolValue)>,
     pub(crate) executable: SolMIR<SolExec>,
 }
@@ -3627,7 +3699,7 @@ pub(crate) enum SolType {
     Closure(SolIdent, Vec<SolGenericArg>),
     FnPtr(SolFnSig),
     // dynamic types
-    Dynamic(Vec<SolClause>),
+    Dynamic(SolDynTypeIndex),
     Assoc {
         trait_ident: SolIdent,
         trait_ty_args: Vec<SolGenericArg>,
@@ -4118,6 +4190,10 @@ pub(crate) struct SolModuleName(pub(crate) String);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolParamName(pub(crate) String);
 
+/// A uniquely identifier for a dynamic type
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SolDynTypeIndex(pub(crate) usize);
+
 /// A name to a local variable
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SolLocalVarName(pub(crate) String);
@@ -4169,6 +4245,12 @@ pub(crate) struct SolSpan {
 }
 
 /* --- END OF SYNC --- */
+
+/// Status of a dyn type
+enum DynTypeStatus {
+    Resolving(UniverseIndex),
+    Processed(Vec<SolClause>),
+}
 
 /// Known crates in the rust standard library
 enum ResolvedStdlib {
