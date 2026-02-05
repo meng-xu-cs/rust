@@ -1595,8 +1595,8 @@ impl<'tcx> ExecBuilder<'tcx> {
         self.static_inits.insert(ident.clone(), None);
 
         // externally defined statics are unsupported
-        if !self.tcx.is_ctfe_mir_available(def_id) {
-            bug!("[unsupported] static without CTFE mir");
+        if !self.tcx.is_mir_available(def_id) {
+            bug!("[unsupported] static without MIR");
         }
 
         // evaluate the static initializer
