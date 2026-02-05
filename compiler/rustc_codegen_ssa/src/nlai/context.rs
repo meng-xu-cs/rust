@@ -579,8 +579,7 @@ impl<'tcx> ExecBuilder<'tcx> {
 
         // locate the key of the definition
         let ident = self.mk_ident(def_id);
-        // NOTE: skip the first generic arg which is Self type
-        let generic_args = ty_args.iter().skip(1).map(|arg| self.mk_generic_arg(arg)).collect();
+        let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
 
         // if already defined or is being defined, return the key
         if self.trait_defs.get(&ident).map_or(false, |inner| inner.contains_key(&generic_args)) {
@@ -793,11 +792,13 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
 
                 // re-used the index of a previously processed dynamic type
-                match self
-                    .dyn_types
-                    .iter()
-                    .find(|(_, (t, s))| *t == ty && matches!(s, DynTypeStatus::Processed(_)))
-                {
+                match self.dyn_types.iter().find(|(_, (t, s))| {
+                    *t == ty
+                        && match s {
+                            DynTypeStatus::Processed(_) => true,
+                            DynTypeStatus::Resolving(_) => bug!("[unsupported] recursive dyn type"),
+                        }
+                }) {
                     Some((dyn_idx, _)) => SolType::Dynamic(dyn_idx.clone()),
                     None => {
                         // create a placeholder Self type for the trait object
