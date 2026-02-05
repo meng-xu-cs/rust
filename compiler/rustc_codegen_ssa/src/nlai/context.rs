@@ -1095,15 +1095,16 @@ impl<'tcx> ExecBuilder<'tcx> {
                         self.mk_const(evaluated)
                     }
                     Err(EvaluateConstErr::HasGenericsOrInfers) => {
-                        // very likey we hit an associated item that can't be evaluated now
+                        // we hit an associated item that can't be evaluated now
                         let const_ty = self.tcx.normalize_erasing_regions(
                             self.typing_env,
                             self.tcx.type_of(uneval.def).instantiate(self.tcx, uneval.args),
                         );
-
-                        // FIXME: also record the def_id and generic_args, currently we are not
-                        // recording it because we don't know how to eliminate the Self type reliably.
-                        SolConst::Unevaluated(self.mk_type(const_ty))
+                        SolConst::Unevaluated(
+                            self.mk_type(const_ty),
+                            self.mk_ident(uneval.def),
+                            uneval.args.iter().map(|arg| self.mk_generic_arg(arg)).collect(),
+                        )
                     }
                     Err(_) => bug!("[invariant] failed to evaluate const {cval}"),
                 }
@@ -2687,6 +2688,8 @@ impl<'tcx> ExecBuilder<'tcx> {
 
                 SolOp::UpVar(var_id)
             }
+
+            // constant
             ExprKind::ConstParam { param: ParamConst { index, name }, def_id } => {
                 let param_ident = self.get_param(*index, *name, SolGenericKind::Const);
                 let const_ident = self.mk_ident(*def_id);
@@ -2697,8 +2700,12 @@ impl<'tcx> ExecBuilder<'tcx> {
                 // MAYFIX: maybe record user type annotation as well?
                 let const_ident = self.mk_ident(*def_id);
                 let generic_args = args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
-                SolOp::ConstValue(const_ident, generic_args)
+                SolOp::NamedConst(const_ident, generic_args)
             }
+            ExprKind::ConstBlock { did, args } => SolOp::ConstBlock(
+                self.mk_ident(*did),
+                args.iter().map(|arg| self.mk_generic_arg(arg)).collect(),
+            ),
             ExprKind::StaticRef { alloc_id, ty: ref_ty, def_id } => {
                 // sanity check
                 match self.tcx.global_alloc(*alloc_id) {
@@ -2912,10 +2919,6 @@ impl<'tcx> ExecBuilder<'tcx> {
                 callee: self.mk_expr(thir, *fun),
                 args: args.iter().map(|arg| self.mk_expr(thir, *arg)).collect(),
             },
-            ExprKind::ConstBlock { did, args } => SolOp::ConstBlock(
-                self.mk_ident(*did),
-                args.iter().map(|arg| self.mk_generic_arg(arg)).collect(),
-            ),
 
             // pattern
             ExprKind::Let { expr, pat } => SolOp::Let(self.mk_expr(thir, *expr), self.mk_pat(pat)),
@@ -3186,7 +3189,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                     SolGenericKind::Lifetime => bug!("[invariant] lifetime generic used as const"),
                 })
                 .unwrap_or_else(|| bug!("[invariant] generic parameter not found")),
-            SolConst::Unevaluated(ty) => ty.clone(),
+            SolConst::Unevaluated(ty, _, _) => ty.clone(),
         }
     }
 
@@ -3226,7 +3229,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             Err(_) => {
                 // FIXME: not entirely sure why we need this but if normalization fails here,
                 // the subsequent instance resolution will also fail (and even worse, panic).
-                // To avoid the panic, we just return None here for now.
+                // To avoid the panic, we just mark it as a symbolic function here for now.
                 match ty.kind() {
                     ty::FnDef(def_id, ty_args) => {
                         return self.try_resolve_function_favor_stdlib(
@@ -3820,7 +3823,7 @@ pub(crate) enum SolClause {
 pub(crate) enum SolConst {
     Param(SolIdent),
     Value(SolValue),
-    Unevaluated(SolType),
+    Unevaluated(SolType, SolIdent, Vec<SolGenericArg>),
 }
 
 /// A constant with concrete value and type
@@ -3905,7 +3908,8 @@ pub(crate) enum SolOp {
     LocalVar(SolLocalVarIndex),
     UpVar(SolLocalVarIndex),
     ConstParam(SolIdent),
-    ConstValue(SolIdent, Vec<SolGenericArg>),
+    ConstBlock(SolIdent, Vec<SolGenericArg>),
+    NamedConst(SolIdent, Vec<SolGenericArg>),
     StaticRef(SolIdent),
     // intrisics
     Box(SolExpr),
@@ -4029,7 +4033,6 @@ pub(crate) enum SolOp {
         callee: SolExpr,
         args: Vec<SolExpr>,
     },
-    ConstBlock(SolIdent, Vec<SolGenericArg>),
     // pattern
     Let(SolExpr, SolPattern),
     Match(SolExpr, Vec<SolHIR<SolMatchArm>>),
