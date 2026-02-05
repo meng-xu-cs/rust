@@ -2019,8 +2019,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                             .unwrap_or_else(|e| {
                                 bug!("[invariant] failed to read bytes for string memory: {e:?}");
                             });
-                        SolValue::Str(String::from_utf8(bytes.to_vec()).unwrap_or_else(|e| {
-                            bug!("[invariant] non utf-8 string memory: {e}");
+                        SolValue::Str(String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| {
+                            bug!("[unsupported] non utf-8 string");
                         }))
                     }
                     _ => bug!("[invariant] expect an array field for str type"),
@@ -4341,7 +4341,7 @@ fn util_values_to_string(bytes: &[SolConst]) -> String {
             })
             .collect(),
     )
-    .unwrap_or_else(|_| bug!("[invariant] invalid utf-8 string"))
+    .unwrap_or_else(|_| bug!("[unsupported] non utf-8 string"))
 }
 
 /// Check whether a type has any feasible value
