@@ -1180,6 +1180,9 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
             }
 
+            // pattern type: delegate to base type
+            ty::Pat(base_ty, _) => self.mk_value_from_scalar(*base_ty, scalar),
+
             // unexpected
             _ => bug!("[invariant] unhandled scalar value {scalar} for type {ty}"),
         }
@@ -1639,6 +1642,9 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
                 assert_ne!(norm_ty, ty, "[invariant] alias type should be normalized");
                 return self.read_const_from_memory_and_layout(memory, offset, norm_ty);
+            }
+            ty::Pat(base_ty, _) => {
+                return self.read_const_from_memory_and_layout(memory, offset, *base_ty);
             }
             // all other types, continue to layout-based reading
             _ => (),
