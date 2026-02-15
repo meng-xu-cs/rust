@@ -4369,6 +4369,7 @@ fn has_feasible_value<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
         | ty::FnPtr(..) => true,
 
         // conditional
+        ty::Pat(base_ty, _) => has_feasible_value(tcx, *base_ty),
         ty::Tuple(elems) => elems.iter().all(|e| has_feasible_value(tcx, e)),
         ty::Adt(adt_def, generics) => match adt_def.adt_kind() {
             AdtKind::Struct => adt_def
@@ -4385,11 +4386,7 @@ fn has_feasible_value<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
                 variant.fields.iter().all(|f| has_feasible_value(tcx, f.ty(tcx, generics)))
             }),
         },
-
-        // inner-type
-        ty::Array(sub, _) | ty::Slice(sub) | ty::Ref(_, sub, _) | ty::RawPtr(sub, _) => {
-            has_feasible_value(tcx, *sub)
-        }
+        ty::Array(sub, _) | ty::Slice(sub) => has_feasible_value(tcx, *sub),
 
         // unsupported
         ty::Dynamic(..) => bug!("[unsupported] feasibility query for dynamic type"),
