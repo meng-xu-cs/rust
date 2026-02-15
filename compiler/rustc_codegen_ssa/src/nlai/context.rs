@@ -2014,7 +2014,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
                 match &layout.fields {
                     FieldsShape::Array { stride, count } => {
-                        let range = AllocRange { start: Size::ZERO, size: *stride * *count };
+                        let range = AllocRange { start: offset, size: *stride * *count };
                         let num_prov = memory.provenance().get_range(range, &self.tcx).count();
                         if num_prov != 0 {
                             bug!("[invariant] string memory contains provenance");
