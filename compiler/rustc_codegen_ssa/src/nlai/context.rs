@@ -2730,7 +2730,6 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // intrinsics
-            ExprKind::Box { value } => SolOp::Box(self.mk_expr(thir, *value)),
             ExprKind::Deref { arg } => SolOp::Deref(self.mk_expr(thir, *arg)),
 
             // operators
@@ -3918,7 +3917,6 @@ pub(crate) enum SolOp {
     NamedConst(SolIdent, Vec<SolGenericArg>),
     StaticRef(SolIdent),
     // intrisics
-    Box(SolExpr),
     Deref(SolExpr),
     // operators
     Not(SolExpr),
