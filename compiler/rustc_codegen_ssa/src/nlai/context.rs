@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Debug;
+use std::hash::Hash;
 use std::path::PathBuf;
 
 use rustc_abi::{
@@ -3528,14 +3529,14 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
 
 /// A trait alias for all sorts IR elements
 pub(crate) trait SolIR =
-    Debug + Clone + PartialEq + Eq + PartialOrd + Ord + Serialize + DeserializeOwned;
+    Debug + Clone + PartialEq + Eq + PartialOrd + Ord + Hash + Serialize + DeserializeOwned;
 
 /*
 * Common
  */
 
 /// The base information associated with anything that has an hir_id, span, but no def_id
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(bound = "T: Serialize + DeserializeOwned")]
 pub(crate) struct SolHIR<T: SolIR> {
     pub(crate) doc_comments: Vec<SolDocComment>,
@@ -3543,7 +3544,7 @@ pub(crate) struct SolHIR<T: SolIR> {
 }
 
 /// The base information associated with anything that has a def_id, span, and maybe hir_id
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(bound = "T: Serialize + DeserializeOwned")]
 pub(crate) struct SolMIR<T: SolIR> {
     pub(crate) ident: SolIdent,
@@ -3557,7 +3558,7 @@ pub(crate) struct SolMIR<T: SolIR> {
  */
 
 /// A complete crate
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolCrate {
     pub(crate) root: SolMIR<SolModule>,
     pub(crate) bundles: Vec<SolBundle>,
@@ -3565,7 +3566,7 @@ pub(crate) struct SolCrate {
 }
 
 /// A complete execution context
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolBundle {
     pub(crate) generics: Vec<(SolIdent, SolParamName, SolGenericMeta)>,
     pub(crate) adt_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolAdtDef)>,
@@ -3580,7 +3581,7 @@ pub(crate) struct SolBundle {
  */
 
 /// A module
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolModule {
     pub(crate) name: SolModuleName,
     pub(crate) scope: SolSpan,
@@ -3592,7 +3593,7 @@ pub(crate) struct SolModule {
  */
 
 /// Details associated with an item
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolItem {
     Module(SolModule),
 }
@@ -3602,7 +3603,7 @@ pub(crate) enum SolItem {
  */
 
 /// The main body of a THIR (e.g., a function or a constant)
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolExec {
     Function(SolFnDef),
     Closure(SolClosure),
@@ -3610,7 +3611,7 @@ pub(crate) enum SolExec {
 }
 
 /// THIR of a function
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolFnDef {
     pub(crate) abi: SolExternAbi,
     pub(crate) vis: SolVisibility,
@@ -3620,7 +3621,7 @@ pub(crate) struct SolFnDef {
 }
 
 /// THIR of a closure
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolClosure {
     pub(crate) ret_ty: SolType,
     pub(crate) params: Vec<(SolType, Option<SolPattern>)>,
@@ -3629,21 +3630,21 @@ pub(crate) struct SolClosure {
 }
 
 /// THIR of a constant evaluation
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolCEval {
     pub(crate) ty: SolType,
     pub(crate) body: SolExpr,
 }
 
 /// Visibility of a function
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolVisibility {
     Public,
     Restricted(SolIdent),
 }
 
 /// External ABI of a function
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolExternAbi {
     C { variadic: bool },
     Rust { safety: bool },
@@ -3654,7 +3655,7 @@ pub(crate) enum SolExternAbi {
  * Typing
  */
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolType {
     // baseline
     Never,
@@ -3721,7 +3722,7 @@ pub(crate) enum SolType {
 }
 
 /// A function signature
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolFnSig {
     pub(crate) abi: SolExternAbi,
     pub(crate) param_tys: Vec<SolType>,
@@ -3729,7 +3730,7 @@ pub(crate) struct SolFnSig {
 }
 
 /// A pattern type
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolTyPat {
     NotNull,
     Range(SolConst, SolConst),
@@ -3737,14 +3738,14 @@ pub(crate) enum SolTyPat {
 }
 
 /// A projection term
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolProjTerm {
     Type(SolType),
     Const(SolConst),
 }
 
 /// Differentiate kinds of generics
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolGenericKind {
     Lifetime,
     Const,
@@ -3752,14 +3753,14 @@ pub(crate) enum SolGenericKind {
 }
 
 /// Like `SolGenericKind`, but enhanced with constant type
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolGenericMeta {
     Lifetime,
     Const(SolType),
     Type,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolGenericParam {
     pub(crate) ident: SolIdent,
     pub(crate) name: SolParamName,
@@ -3767,7 +3768,7 @@ pub(crate) struct SolGenericParam {
 }
 
 /// A generic argument
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolGenericArg {
     Type(SolType),
     Const(SolConst),
@@ -3775,7 +3776,7 @@ pub(crate) enum SolGenericArg {
 }
 
 /// User-defined type, i.e., an algebraic data type (ADT)
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolAdtDef {
     Struct { fields: Vec<SolField> },
     Union { fields: Vec<SolField> },
@@ -3783,7 +3784,7 @@ pub(crate) enum SolAdtDef {
 }
 
 /// A field definition in an ADT
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolField {
     pub(crate) index: SolFieldIndex,
     pub(crate) name: SolFieldName,
@@ -3792,7 +3793,7 @@ pub(crate) struct SolField {
 }
 
 /// A field definition in an ADT
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolVariant {
     pub(crate) index: SolVariantIndex,
     pub(crate) name: SolVariantName,
@@ -3801,13 +3802,13 @@ pub(crate) struct SolVariant {
 }
 
 /// Trait definition
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolTraitDef {
     pub(crate) clauses: Vec<SolClause>,
 }
 
 /// A clause in a predicate
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolClause {
     TraitImpl(SolIdent, Vec<SolGenericArg>),
     TraitNotImpl(SolIdent, Vec<SolGenericArg>),
@@ -3824,7 +3825,7 @@ pub(crate) enum SolClause {
  */
 
 /// A compile-time constant
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolConst {
     Param(SolIdent),
     Value(SolValue),
@@ -3832,7 +3833,7 @@ pub(crate) enum SolConst {
 }
 
 /// A constant with concrete value and type
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolValue {
     // primitives
     Bool(bool),
@@ -3893,7 +3894,7 @@ pub(crate) enum SolValue {
  */
 
 /// An expression in THIR
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolExpr {
     pub(crate) id: SolInstIndex,
     pub(crate) ty: SolType,
@@ -3903,7 +3904,7 @@ pub(crate) struct SolExpr {
 }
 
 /// Details of the operation in an expression
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolOp {
     // markers
     Scope(SolHIR<SolExpr>, SolScope),
@@ -4051,7 +4052,7 @@ pub(crate) enum SolOp {
 }
 
 /// A pattern matcher in THIR
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolPattern {
     pub(crate) ty: SolType,
     pub(crate) rule: SolPatRule,
@@ -4059,7 +4060,7 @@ pub(crate) struct SolPattern {
 }
 
 /// A pattern matching rule in THIR
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolPatRule {
     Missing,
     Wild,
@@ -4101,7 +4102,7 @@ pub(crate) enum SolPatRule {
 }
 
 /// Binding mode
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolBindMode {
     ImmByValue,
     MutByValue,
@@ -4112,7 +4113,7 @@ pub(crate) enum SolBindMode {
 }
 
 /// A match arm in THIR
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolMatchArm {
     pub(crate) scope: SolScope,
     pub(crate) pat: SolPattern,
@@ -4122,7 +4123,7 @@ pub(crate) struct SolMatchArm {
 }
 
 /// A block of expressiosn in THIR
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolBlock {
     pub(crate) scope: SolScope,
     pub(crate) safety: bool,
@@ -4132,20 +4133,20 @@ pub(crate) struct SolBlock {
 }
 
 /// A statement in THIR
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolStmt {
     Expr(SolInstIndex, SolScope, SolExpr),
     Bind(SolInstIndex, SolHIR<SolLetBinding>),
 }
 
 /// A scope in THIR
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolScope {
     pub(crate) index: SolScopeIndex,
 }
 
 /// Let binding in a statement in THIR
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolLetBinding {
     pub(crate) pat: SolPattern,
     pub(crate) init: Option<(SolExpr, Option<SolBlock>)>,
@@ -4153,7 +4154,7 @@ pub(crate) struct SolLetBinding {
 }
 
 /// Base for ADT construction
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolAdtBase {
     None,
     Overlay(SolExpr, Vec<SolType>),
@@ -4165,7 +4166,7 @@ pub(crate) enum SolAdtBase {
  */
 
 /// A documentation comment
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum SolDocComment {
     Outer(String),
     Inner(String),
@@ -4176,74 +4177,74 @@ pub(crate) enum SolDocComment {
  */
 
 /// An identifier in the crate
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolIdent {
     pub(crate) krate: SolHash64,
     pub(crate) local: SolHash64,
 }
 
 /// A 64-bit hash
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolHash64(pub(crate) u64);
 
 /// A 128-bit hash
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolHash128(pub(crate) u128);
 
 /// A parameter name
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolModuleName(pub(crate) String);
 
 /// A parameter name
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolParamName(pub(crate) String);
 
 /// A uniquely identifier for a dynamic type
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolDynTypeIndex(pub(crate) usize);
 
 /// A name to a local variable
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolLocalVarName(pub(crate) String);
 
 /// A index to a local variable
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolLocalVarIndex(pub(crate) usize, pub(crate) usize);
 
 /// A field name
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolFieldName(pub(crate) String);
 
 /// A field index
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolFieldIndex(pub(crate) usize);
 
 /// A variant name
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolVariantName(pub(crate) String);
 
 /// A variant index
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolVariantIndex(pub(crate) usize);
 
 /// A variant discrimanant
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolVariantDiscr(pub(crate) u128);
 
 /// A scope index
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolScopeIndex(pub(crate) usize);
 
 /// An instruction index
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolInstIndex(pub(crate) usize);
 
 /// A description of a definition path
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolPathDesc(pub(crate) String);
 
 /// A span description
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolSpan {
     pub(crate) file_id: SolHash128,
     pub(crate) start_line: u32,
