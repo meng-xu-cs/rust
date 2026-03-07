@@ -1132,10 +1132,13 @@ impl<'tcx> ExecBuilder<'tcx> {
         let Value { ty, valtree } = val;
         match *valtree {
             ValTreeKind::Leaf(leaf) => self.mk_value_from_scalar(val.ty, *leaf),
-            ValTreeKind::Branch(box []) => self.mk_value_from_zst(ty),
-            ValTreeKind::Branch(box branches) => {
-                let consts: Vec<_> = branches.iter().map(|cval| self.mk_const(*cval)).collect();
-                self.mk_value_from_branch_consts(ty, consts)
+            ValTreeKind::Branch(branches) => {
+                if branches.is_empty() {
+                    self.mk_value_from_zst(ty)
+                } else {
+                    let consts: Vec<_> = branches.iter().map(|cval| self.mk_const(cval)).collect();
+                    self.mk_value_from_branch_consts(ty, consts)
+                }
             }
         }
     }
