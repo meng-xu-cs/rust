@@ -1,0 +1,23 @@
+compiler/rustc_codegen_ssa/src/nlai/context.rs
+  04f85b5dc3e29e0d 810,858-882,886-893,895-904,1091
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "b8560bab26ca4dde2a12b0846564b4a8b2feee78",
+  "prompts": {
+    "04f85b5dc3e29e0d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d798b-0e43-7923-987f-d351ebbf5704",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Meng Xu",
+      "messages": [],
+      "total_additions": 46,
+      "total_deletions": 44,
+      "accepted_lines": 45,
+      "overriden_lines": 1
+    }
+  }
+}
