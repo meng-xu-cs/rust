@@ -807,7 +807,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                         let universe = self
                             .tcx
                             .infer_ctxt()
-                            .build(self.typing_env.typing_mode)
+                            .build(self.typing_env.typing_mode())
                             .create_next_universe();
                         let self_ty = Ty::new_placeholder(
                             self.tcx,
@@ -855,51 +855,53 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // alias
-            ty::Alias(AliasTyKind::Projection, alias_ty) => {
-                match self.tcx.try_normalize_erasing_regions(self.typing_env, ty) {
-                    Ok(norm_ty) if norm_ty != ty => {
-                        // MAYFIX: keep track of projection types separately, i.e., SolType::Proj(..)?
-                        self.mk_type(norm_ty)
-                    }
-                    _ => {
-                        // It is possible that normalization does not change the type, for example,
-                        // when the projection comes from a type parameter (which implements a trait),
-                        // e.g., <P as Foo>::T, where P is the type parameter of the THIR definition.
-                        let (trait_ref, own_ty_args) = alias_ty.trait_ref_and_own_args(self.tcx);
-                        let (trait_ident, trait_ty_args) =
-                            self.mk_trait(self.tcx.trait_def(trait_ref.def_id), trait_ref.args);
-                        let item_ty_args =
-                            own_ty_args.iter().map(|arg| self.mk_generic_arg(*arg)).collect();
+            ty::Alias(alias_ty) => match alias_ty.kind {
+                AliasTyKind::Projection { .. } => {
+                    match self.tcx.try_normalize_erasing_regions(self.typing_env, ty) {
+                        Ok(norm_ty) if norm_ty != ty => {
+                            // MAYFIX: keep track of projection types separately, i.e., SolType::Proj(..)?
+                            self.mk_type(norm_ty)
+                        }
+                        _ => {
+                            // It is possible that normalization does not change the type, for example,
+                            // when the projection comes from a type parameter (which implements a trait),
+                            // e.g., <P as Foo>::T, where P is the type parameter of the THIR definition.
+                            let (trait_ref, own_ty_args) =
+                                alias_ty.trait_ref_and_own_args(self.tcx);
+                            let (trait_ident, trait_ty_args) =
+                                self.mk_trait(self.tcx.trait_def(trait_ref.def_id), trait_ref.args);
+                            let item_ty_args =
+                                own_ty_args.iter().map(|arg| self.mk_generic_arg(*arg)).collect();
 
-                        // construct the associated type
-                        SolType::Assoc {
-                            trait_ident,
-                            trait_ty_args,
-                            item_ident: self.mk_ident(alias_ty.def_id),
-                            item_ty_args,
+                            // construct the associated type
+                            SolType::Assoc {
+                                trait_ident,
+                                trait_ty_args,
+                                item_ident: self.mk_ident(alias_ty.kind.def_id()),
+                                item_ty_args,
+                            }
                         }
                     }
                 }
-            }
-            ty::Alias(AliasTyKind::Inherent, _) => {
-                let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
-                assert_ne!(norm_ty, ty, "[invariant] inherent alias type should be normalized");
-                // MAYFIX: keep track of inherent alias types separately, i.e., SolType::Alias(..)?
-                self.mk_type(norm_ty)
-            }
-            ty::Alias(AliasTyKind::Opaque, alias_ty) => {
-                let norm_ty =
-                    self.tcx.type_of(alias_ty.def_id).instantiate(self.tcx, alias_ty.args);
-                assert_ne!(norm_ty, ty, "[invariant] opaque alias type should be normalized");
-                // MAYFIX: keep track of opaque alias types separately, i.e., SolType::Opaque(..)?
-                self.mk_type(norm_ty)
-            }
-            ty::Alias(AliasTyKind::Free, _) => {
-                let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
-                assert_ne!(norm_ty, ty, "[invariant] free alias type should be normalized");
-                // MAYFIX: keep track of free alias types separately, i.e., SolType::Alias(..)?
-                self.mk_type(norm_ty)
-            }
+                AliasTyKind::Inherent { .. } => {
+                    let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
+                    assert_ne!(norm_ty, ty, "[invariant] inherent alias type should be normalized");
+                    // MAYFIX: keep track of inherent alias types separately, i.e., SolType::Alias(..)?
+                    self.mk_type(norm_ty)
+                }
+                AliasTyKind::Opaque { def_id } => {
+                    let norm_ty = self.tcx.type_of(def_id).instantiate(self.tcx, alias_ty.args);
+                    assert_ne!(norm_ty, ty, "[invariant] opaque alias type should be instantiated");
+                    // MAYFIX: keep track of opaque alias types separately, i.e., SolType::Opaque(..)?
+                    self.mk_type(norm_ty)
+                }
+                AliasTyKind::Free { .. } => {
+                    let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
+                    assert_ne!(norm_ty, ty, "[invariant] free alias type should be normalized");
+                    // MAYFIX: keep track of free alias types separately, i.e., SolType::Alias(..)?
+                    self.mk_type(norm_ty)
+                }
+            },
 
             // unsupported
             ty::Coroutine(..) | ty::CoroutineClosure(..) | ty::CoroutineWitness(..) => {
@@ -1058,6 +1060,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // unsupported
+            PatKind::Guard { .. } => bug!("[unsupported] guard pattern"),
             PatKind::DerefPattern { .. } => bug!("[unsupported] deref pattern"),
 
             // unreachable
@@ -1085,7 +1088,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             ConstKind::Unevaluated(uneval) => {
                 // evaluate it with an inference context
                 match traits::try_evaluate_const(
-                    &self.tcx.infer_ctxt().build(self.typing_env.typing_mode),
+                    &self.tcx.infer_ctxt().build(self.typing_env.typing_mode()),
                     cval,
                     self.typing_env.param_env,
                 ) {
