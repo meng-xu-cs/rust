@@ -1634,7 +1634,7 @@ impl<'tcx> ExecBuilder<'tcx> {
         memory: &Allocation,
         offset: Size,
         ty: Ty<'tcx>,
-        metadata: Option<usize>,
+        mut metadata: Option<usize>,
     ) -> (Size, SolValue) {
         // utility
         let read_primitive = |tcx: TyCtxt<'tcx>, start, size: Size, is_provenane: bool| {
@@ -2055,15 +2055,23 @@ impl<'tcx> ExecBuilder<'tcx> {
 
                         let mut elements = vec![];
                         for (i, elem_ty) in elem_tys.iter().enumerate() {
-                            let field_idx = FieldIdx::from_usize(i);
-                            let field_offset = *offsets.get(field_idx).unwrap_or_else(|| {
+                            let elem_idx = FieldIdx::from_usize(i);
+                            let elem_offset = *offsets.get(elem_idx).unwrap_or_else(|| {
                                 bug!("[invariant] no offset for field {i} in {ty}");
                             });
-                            let elem_metadata =
-                                metadata.filter(|_| !elem_ty.is_sized(self.tcx, self.typing_env));
+                            let elem_metadata = if elem_ty.is_sized(self.tcx, self.typing_env) {
+                                None
+                            } else {
+                                let size = metadata.take();
+                                assert!(
+                                    size.is_some(),
+                                    "[invariant] expect metadata for unsized tuple element {i} in {ty}"
+                                );
+                                size
+                            };
                             let (_, elem) = self.read_const_from_memory_and_layout(
                                 memory,
-                                offset + field_offset,
+                                offset + elem_offset,
                                 elem_ty,
                                 elem_metadata,
                             );
@@ -2101,17 +2109,27 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 let mut elements = vec![];
                                 for (field_idx, field_name, field_ty) in field_details {
                                     let field_offset = *offsets.get(field_idx).unwrap_or_else(|| {
-                                    bug!("[invariant] no offset for field {field_name} in struct {ty}");
-                                });
-                                    let field_metadata = metadata
-                                        .filter(|_| !field_ty.is_sized(self.tcx, self.typing_env));
-                                    let (_, elem) = self
-                                        .read_const_from_memory_and_layout_with_metadata(
-                                            memory,
-                                            offset + field_offset,
-                                            field_ty,
-                                            field_metadata,
+                                        bug!("[invariant] no offset for field {field_name} in struct {ty}");
+                                    });
+
+                                    let field_metadata = if field_ty
+                                        .is_sized(self.tcx, self.typing_env)
+                                    {
+                                        None
+                                    } else {
+                                        let size = metadata.take();
+                                        assert!(
+                                            size.is_some(),
+                                            "[invariant] expect metadata for unsized field {field_name} in {ty}"
                                         );
+                                        size
+                                    };
+                                    let (_, elem) = self.read_const_from_memory_and_layout(
+                                        memory,
+                                        offset + field_offset,
+                                        field_ty,
+                                        field_metadata,
+                                    );
                                     elements.push((
                                         SolFieldIndex(field_idx.index()),
                                         SolConst::Value(elem),
