@@ -38,8 +38,8 @@ use rustc_middle::ty::{
     ConstKind, FieldDef, GenericArg, GenericArgKind, GenericArgsRef, GenericParamDef,
     GenericParamDefKind, Instance, InstanceKind, List, OutlivesPredicate, ParamConst, ParamTy,
     Pattern, PatternKind, PredicatePolarity, ProjectionPredicate, ScalarInt, Term, TermKind,
-    TraitDef, TraitPredicate, Ty, TyCtxt, TypingEnv, UniverseIndex, UpvarArgs, ValTreeKind, Value,
-    VariantDiscr, Visibility,
+    TraitDef, TraitPredicate, Ty, TyCtxt, TypeFoldable, TypingEnv, UniverseIndex, Unnormalized,
+    UpvarArgs, ValTreeKind, Value, VariantDiscr, Visibility,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
@@ -329,9 +329,10 @@ impl<'tcx> ExecBuilder<'tcx> {
         generics: Vec<SolGenericParam>,
     ) -> Self {
         let tcx = base.tcx;
+        let typing_env = tcx.typing_env_normalized_for_post_analysis(owner_id);
         Self {
             tcx,
-            typing_env: TypingEnv::post_analysis(tcx, owner_id).with_post_analysis_normalized(tcx),
+            typing_env,
             base,
             owner_id,
             generics,
@@ -345,6 +346,21 @@ impl<'tcx> ExecBuilder<'tcx> {
             inst_ids: BTreeSet::new(),
             log_stack: LogStack::new(),
         }
+    }
+
+    /// Utility to normalize a type foldable value by erasing regions and applying type normalization
+    #[inline]
+    fn tcx_normalize<T>(&self, value: Unnormalized<'tcx, T>) -> T
+    where
+        T: TypeFoldable<TyCtxt<'tcx>>,
+    {
+        self.tcx.normalize_erasing_regions(self.typing_env, value)
+    }
+
+    /// Utility to get the type of a field by normalizing the field type after instantiating it with the generic arguments
+    #[inline]
+    fn tcx_field_ty(&self, field: &FieldDef, ty_args: GenericArgsRef<'tcx>) -> Ty<'tcx> {
+        self.tcx_normalize(field.ty(self.tcx, ty_args))
     }
 
     /// Get a generic parameter by index with cross-checking on name and kind
@@ -380,11 +396,13 @@ impl<'tcx> ExecBuilder<'tcx> {
     }
 
     /// Record the doc comments associated with a hir_id
+    #[inline]
     fn mk_doc_comments(&self, hir_id: HirId) -> Vec<SolDocComment> {
         self.base.mk_doc_comments(hir_id)
     }
 
     /// Record a HIR node in the THIR body with its metadata
+    #[inline]
     fn mk_hir<T: SolIR>(&mut self, hir_id: HirId, data: T) -> SolHIR<T> {
         if hir_id.is_owner() {
             bug!("[invariant] expected non-owner HirId, found owner: {:?}", hir_id);
@@ -434,25 +452,10 @@ impl<'tcx> ExecBuilder<'tcx> {
         }
     }
 
-    /// Record a projection term in the type system
-    pub(crate) fn mk_projection_term(&mut self, term: Term<'tcx>) -> SolProjTerm {
-        match term.kind() {
-            TermKind::Ty(ty) => SolProjTerm::Type(self.mk_type(ty)),
-            TermKind::Const(cval) => SolProjTerm::Const(self.mk_const(cval)),
-        }
-    }
-
-    /// Record a pattern type
-    pub(crate) fn mk_ty_pat(&mut self, pat: Pattern<'tcx>) -> SolTyPat {
-        match *pat {
-            PatternKind::NotNull => SolTyPat::NotNull,
-            PatternKind::Range { start, end } => {
-                SolTyPat::Range(self.mk_const(start), self.mk_const(end))
-            }
-            PatternKind::Or(patterns) => {
-                SolTyPat::Or(patterns.iter().map(|sub_pat| self.mk_ty_pat(sub_pat)).collect())
-            }
-        }
+    /// Record a vector of generic arguments
+    #[inline]
+    pub(crate) fn mk_generic_args(&mut self, ty_args: GenericArgsRef<'tcx>) -> Vec<SolGenericArg> {
+        ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect()
     }
 
     /// Record the details of an ADT field
@@ -465,10 +468,7 @@ impl<'tcx> ExecBuilder<'tcx> {
         SolField {
             index: SolFieldIndex(field_idx.index()),
             name: SolFieldName(field_def.name.to_ident_string()),
-            ty: self.mk_type(
-                self.tcx
-                    .normalize_erasing_regions(self.typing_env, field_def.ty(self.tcx, ty_args)),
-            ),
+            ty: self.mk_type(self.tcx_field_ty(field_def, ty_args)),
             default: field_def.value.map(|did| self.mk_ident(did)),
         }
     }
@@ -483,7 +483,7 @@ impl<'tcx> ExecBuilder<'tcx> {
 
         // locate the key of the definition
         let ident = self.mk_ident(def_id);
-        let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+        let generic_args = self.mk_generic_args(ty_args);
 
         // if already defined or is being defined, return the key
         if self.adt_defs.get(&ident).map_or(false, |inner| inner.contains_key(&generic_args)) {
@@ -585,7 +585,7 @@ impl<'tcx> ExecBuilder<'tcx> {
 
         // locate the key of the definition
         let ident = self.mk_ident(def_id);
-        let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+        let generic_args = self.mk_generic_args(ty_args);
 
         // if already defined or is being defined, return the key
         if self.trait_defs.get(&ident).map_or(false, |inner| inner.contains_key(&generic_args)) {
@@ -604,8 +604,7 @@ impl<'tcx> ExecBuilder<'tcx> {
         for (clause, _) in
             self.tcx.explicit_predicates_of(def_id).instantiate(self.tcx, ty_args).into_iter()
         {
-            parsed_clauses
-                .push(self.mk_clause(self.tcx.normalize_erasing_regions(self.typing_env, clause)));
+            parsed_clauses.push(self.mk_clause(self.tcx_normalize(clause)));
         }
 
         // FIXME: check `TyCtxt::trait_explicit_predicates_and_bounds`,
@@ -669,18 +668,24 @@ impl<'tcx> ExecBuilder<'tcx> {
             ClauseKind::ConstEvaluatable(cval) => SolClause::ConstEvaluatable(self.mk_const(cval)),
 
             // unsupported
-            ClauseKind::HostEffect(..) => {
-                bug!("[unsupported] clause");
-            }
+            ClauseKind::HostEffect(..) => bug!("[unsupported] host effect clause"),
 
             // unexpected
             ClauseKind::UnstableFeature(..) => {
-                bug!("[invariant] unexpected unstable feature clause: {clause}");
+                bug!("[invariant] unexpected unstable feature clause: {clause}")
             }
         };
 
         self.log_stack.pop();
         parsed
+    }
+
+    /// Record a projection term in the type system
+    pub(crate) fn mk_projection_term(&mut self, term: Term<'tcx>) -> SolProjTerm {
+        match term.kind() {
+            TermKind::Ty(ty) => SolProjTerm::Type(self.mk_type(ty)),
+            TermKind::Const(cval) => SolProjTerm::Const(self.mk_const(cval)),
+        }
     }
 
     /// Record a type in MIR/THIR context
@@ -779,15 +784,14 @@ impl<'tcx> ExecBuilder<'tcx> {
             },
             ty::Closure(def_id, ty_args) => {
                 let ident = self.mk_ident(*def_id);
-                let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+                let generic_args = self.mk_generic_args(*ty_args);
                 SolType::Closure(ident, generic_args)
             }
             ty::FnPtr(sig_binder, header) => {
                 let sig = self.tcx.instantiate_bound_regions_with_erased(*sig_binder);
                 let abi = self.mk_abi(header.abi(), header.c_variadic(), header.safety());
                 let ret_ty = self.mk_type(sig.output());
-                let params: Vec<_> =
-                    sig.inputs().iter().map(|input_ty| self.mk_type(*input_ty)).collect();
+                let params = sig.inputs().iter().map(|input_ty| self.mk_type(*input_ty)).collect();
                 SolType::FnPtr(SolFnSig { abi, param_tys: params, output_ty: Box::new(ret_ty) })
             }
 
@@ -879,14 +883,18 @@ impl<'tcx> ExecBuilder<'tcx> {
                         item_ty_args,
                     }
                 }
+                /* TODO: remove this
                 AliasTyKind::Opaque { def_id } => {
-                    let norm_ty = self.tcx.normalize_erasing_regions(
-                        self.typing_env,
+                    let norm_ty = self.tcx_normalize(
                         self.tcx.type_of(def_id).instantiate(self.tcx, alias_ty.args),
                     );
-                    assert_ne!(norm_ty, ty, "[invariant] opaque alias type should be instantiated");
+                    assert_ne!(norm_ty, ty, "[invariant] opaque alias type should be normalized");
                     // MAYFIX: keep track of opaque alias types separately, i.e., SolType::Opaque(..)?
                     self.mk_type(norm_ty)
+                }
+                 */
+                AliasTyKind::Opaque { .. } => {
+                    bug!("[invariant] opaque alias type should be normalized")
                 }
                 AliasTyKind::Inherent { .. } => {
                     bug!("[invariant] inherent alias type should be normalized")
@@ -912,6 +920,19 @@ impl<'tcx> ExecBuilder<'tcx> {
 
         self.log_stack.pop();
         parsed
+    }
+
+    /// Record a pattern type
+    pub(crate) fn mk_ty_pat(&mut self, pat: Pattern<'tcx>) -> SolTyPat {
+        match *pat {
+            PatternKind::NotNull => SolTyPat::NotNull,
+            PatternKind::Range { start, end } => {
+                SolTyPat::Range(self.mk_const(start), self.mk_const(end))
+            }
+            PatternKind::Or(patterns) => {
+                SolTyPat::Or(patterns.iter().map(|sub_pat| self.mk_ty_pat(sub_pat)).collect())
+            }
+        }
     }
 
     /// Record a local variable identifier
@@ -1093,14 +1114,13 @@ impl<'tcx> ExecBuilder<'tcx> {
                     }
                     Err(EvaluateConstErr::HasGenericsOrInfers) => {
                         // we hit an associated item that can't be evaluated now
-                        let const_ty = self.tcx.normalize_erasing_regions(
-                            self.typing_env,
+                        let const_ty = self.tcx_normalize(
                             self.tcx.type_of(uneval.def).instantiate(self.tcx, uneval.args),
                         );
                         SolConst::Unevaluated(
                             self.mk_type(const_ty),
                             self.mk_ident(uneval.def),
-                            uneval.args.iter().map(|arg| self.mk_generic_arg(arg)).collect(),
+                            self.mk_generic_args(uneval.args),
                         )
                     }
                     Err(_) => bug!("[invariant] failed to evaluate const {cval}"),
@@ -1162,7 +1182,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::Float(FloatTy::F64) => SolValue::F64(scalar.to_f64().to_string()),
             ty::Float(FloatTy::F128) => SolValue::F128(scalar.to_f128().to_string()),
             ty::RawPtr(inner_ty, mutability) => {
-                // NOTE: we allow non-zero pointer values are meaningful (and nullptr) constant values
+                // NOTE: we allow non-zero pointer values as meaningful (and nullptr) constant values
                 let ptrval = scalar.to_target_usize(self.tcx) as usize;
                 let pointee_ty = self.mk_type(*inner_ty);
                 match mutability {
@@ -1170,6 +1190,9 @@ impl<'tcx> ExecBuilder<'tcx> {
                     Mutability::Mut => SolValue::MutPtrNull(pointee_ty, ptrval),
                 }
             }
+
+            // pattern type: delegate to base type
+            ty::Pat(base_ty, _) => self.mk_value_from_scalar(*base_ty, scalar),
 
             // reference
             ty::Ref(_, inner_ty, mutability) => {
@@ -1179,9 +1202,6 @@ impl<'tcx> ExecBuilder<'tcx> {
                     Mutability::Mut => SolValue::MutRef(Box::new(inner_val)),
                 }
             }
-
-            // pattern type: delegate to base type
-            ty::Pat(base_ty, _) => self.mk_value_from_scalar(*base_ty, scalar),
 
             // unexpected
             _ => bug!("[invariant] unhandled scalar value {scalar} for type {ty}"),
@@ -1366,10 +1386,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                         let variant = def.non_enum_variant();
                         let mut fields = vec![];
                         for (field_idx, field_def) in variant.fields.iter_enumerated() {
-                            let field_ty = self.tcx.normalize_erasing_regions(
-                                self.typing_env,
-                                field_def.ty(self.tcx, ty_args),
-                            );
+                            let field_ty = self.tcx_field_ty(field_def, ty_args);
                             let field_val = self.mk_value_when_zst(field_ty)?;
                             fields.push((
                                 SolFieldIndex(field_idx.index()),
@@ -1382,10 +1399,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                         // a union is a ZST if it has only one feasible field and the field is a ZST
                         let field_idx = self.get_uniquely_feasible_field(*def, ty_args)?;
                         let field_def = def.non_enum_variant().fields.get(field_idx).unwrap();
-                        let field_ty = self.tcx.normalize_erasing_regions(
-                            self.typing_env,
-                            field_def.ty(self.tcx, ty_args),
-                        );
+                        let field_ty = self.tcx_field_ty(field_def, ty_args);
                         let field_val = self.mk_value_when_zst(field_ty)?;
                         SolValue::Union(
                             adt_ident,
@@ -1402,10 +1416,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                         let variant_def = def.variant(variant_idx);
                         let mut fields = vec![];
                         for (field_idx, field_def) in variant_def.fields.iter_enumerated() {
-                            let field_ty = self.tcx.normalize_erasing_regions(
-                                self.typing_env,
-                                field_def.ty(self.tcx, ty_args),
-                            );
+                            let field_ty = self.tcx_field_ty(field_def, ty_args);
                             let field_val = self.mk_value_when_zst(field_ty)?;
                             fields.push((
                                 SolFieldIndex(field_idx.index()),
@@ -1435,7 +1446,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             },
             ty::Closure(def_id, ty_args) => {
                 let ident = self.mk_ident(*def_id);
-                let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+                let generic_args = self.mk_generic_args(ty_args);
                 SolValue::Closure(ident, generic_args)
             }
             ty::Ref(_, inner_ty, Mutability::Not) => {
@@ -1528,10 +1539,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 .iter_enumerated()
                                 .zip(consts)
                                 .map(|((field_idx, field_def), field_const)| {
-                                    let field_ty = self.tcx.normalize_erasing_regions(
-                                        self.typing_env,
-                                        field_def.ty(self.tcx, ty_args),
-                                    );
+                                    let field_ty = self.tcx_field_ty(field_def, ty_args);
                                     assert_eq!(
                                         self.type_of_const(&field_const),
                                         self.mk_type(field_ty),
@@ -1569,10 +1577,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 .iter_enumerated()
                                 .zip(&consts[1..])
                                 .map(|((field_idx, field_def), field_const)| {
-                                    let field_ty = self.tcx.normalize_erasing_regions(
-                                        self.typing_env,
-                                        field_def.ty(self.tcx, ty_args),
-                                    );
+                                    let field_ty = self.tcx_field_ty(field_def, ty_args);
                                     assert_eq!(
                                         self.type_of_const(field_const),
                                         self.mk_type(field_ty),
@@ -1834,7 +1839,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                         }
                     }
                     Scalar::Int(int) => {
-                        // NOTE: we allow non-zero pointer values are meaningful (and nullptr) constant values
+                        // NOTE: we allow non-zero pointer values as meaningful (and nullptr) constant values
                         let ptrval = int.to_target_usize(self.tcx) as usize;
                         let pointee_ty = self.mk_type(actual_sub_ty);
 
@@ -1858,7 +1863,9 @@ impl<'tcx> ExecBuilder<'tcx> {
                 };
 
                 // check whether the metadata should be a ZST
-                // NOTE: we only handle size-based metadata for now
+                // NOTE: we only handle size-based metadata for now. In addition, we know that the `actual_sub_ty`
+                //       must be sized if it comes from a dyn type (checked before), so if we need metadata here,
+                //       the metadata must hold a size value, not a vtable.
                 let need_metadata = !actual_sub_ty.is_sized(self.tcx, self.typing_env);
 
                 // switch by whether we need metadata
@@ -1954,11 +1961,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                         match self.tcx.global_alloc(prov.alloc_id()) {
                             GlobalAlloc::Function { instance } => {
                                 let ident = self.mk_ident(instance.def_id());
-                                let ty_args = instance
-                                    .args
-                                    .iter()
-                                    .map(|arg| self.mk_generic_arg(arg))
-                                    .collect();
+                                let ty_args = self.mk_generic_args(instance.args);
                                 SolValue::FnPtr(fn_sig, ident, ty_args)
                             }
                             _ => bug!("[invariant] unexpected allocation for function pointer"),
@@ -2084,14 +2087,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                             .fields
                             .iter_enumerated()
                             .map(|(field_idx, field_def)| {
-                                (
-                                    field_idx,
-                                    field_def.name,
-                                    self.tcx.normalize_erasing_regions(
-                                        self.typing_env,
-                                        field_def.ty(self.tcx, ty_args),
-                                    ),
-                                )
+                                (field_idx, field_def.name, self.tcx_field_ty(field_def, ty_args))
                             })
                             .collect::<Vec<_>>();
 
@@ -2140,13 +2136,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                             .fields
                             .iter_enumerated()
                             .map(|(field_idx, field_def)| {
-                                (
-                                    field_idx,
-                                    self.tcx.normalize_erasing_regions(
-                                        self.typing_env,
-                                        field_def.ty(self.tcx, ty_args),
-                                    ),
-                                )
+                                (field_idx, self.tcx_field_ty(field_def, ty_args))
                             })
                             .collect::<Vec<_>>();
 
@@ -2345,10 +2335,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                             let (_, elem) = self.read_const_from_memory_and_layout(
                                 memory,
                                 offset + field_offset,
-                                self.tcx.normalize_erasing_regions(
-                                    self.typing_env,
-                                    field_def.ty(self.tcx, ty_args),
-                                ),
+                                self.tcx_field_ty(field_def, ty_args),
                             );
                             elements
                                 .push((SolFieldIndex(field_idx.index()), SolConst::Value(elem)));
@@ -2364,10 +2351,9 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // closure
-            ty::Closure(def_id, ty_args) => SolValue::Closure(
-                self.mk_ident(*def_id),
-                ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect(),
-            ),
+            ty::Closure(def_id, ty_args) => {
+                SolValue::Closure(self.mk_ident(*def_id), self.mk_generic_args(ty_args))
+            }
 
             // unexpected
             _ => bug!(
@@ -2723,14 +2709,11 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
             ExprKind::NamedConst { def_id, args, user_ty: _ } => {
                 // MAYFIX: maybe record user type annotation as well?
-                let const_ident = self.mk_ident(*def_id);
-                let generic_args = args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
-                SolOp::NamedConst(const_ident, generic_args)
+                SolOp::NamedConst(self.mk_ident(*def_id), self.mk_generic_args(args))
             }
-            ExprKind::ConstBlock { did, args } => SolOp::ConstBlock(
-                self.mk_ident(*did),
-                args.iter().map(|arg| self.mk_generic_arg(arg)).collect(),
-            ),
+            ExprKind::ConstBlock { did, args } => {
+                SolOp::ConstBlock(self.mk_ident(*did), self.mk_generic_args(args))
+            }
             ExprKind::StaticRef { alloc_id, ty: ref_ty, def_id } => {
                 // sanity check
                 match self.tcx.global_alloc(*alloc_id) {
@@ -3006,9 +2989,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             }) => {
                 let closure_ident = self.mk_ident(closure_id.to_def_id());
                 let closure_ty_args = match args {
-                    UpvarArgs::Closure(ty_args) => {
-                        ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect()
-                    }
+                    UpvarArgs::Closure(ty_args) => self.mk_generic_args(ty_args),
                     UpvarArgs::Coroutine(..) | UpvarArgs::CoroutineClosure(..) => {
                         bug!("[unsupported] coroutine closure");
                     }
@@ -3239,7 +3220,7 @@ impl<'tcx> ExecBuilder<'tcx> {
         default: impl Fn(SolIdent, Vec<SolGenericArg>) -> ResolvedFunction,
     ) -> ResolvedFunction {
         let ident = self.mk_ident(def_id);
-        let generics = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
+        let generics = self.mk_generic_args(ty_args);
         match self.try_parse_function_origin(def_id) {
             None => default(ident, generics),
             Some(_) => ResolvedFunction::Libfunc(ident, generics),
@@ -3270,11 +3251,7 @@ impl<'tcx> ExecBuilder<'tcx> {
         let def_id = instance.def_id();
         if self.tcx.is_constructor(def_id) {
             let adt_ty = self
-                .tcx
-                .normalize_erasing_regions(
-                    self.typing_env,
-                    self.tcx.fn_sig(def_id).instantiate(self.tcx, instance.args),
-                )
+                .tcx_normalize(self.tcx.fn_sig(def_id).instantiate(self.tcx, instance.args))
                 .no_bound_vars()
                 .unwrap_or_else(|| bug!("[invariant] unable to instantiate constructor signature"))
                 .output();
@@ -3330,28 +3307,22 @@ impl<'tcx> ExecBuilder<'tcx> {
             ty::Pat(base_ty, _) => self.has_feasible_value(*base_ty),
             ty::Tuple(elems) => elems.iter().all(|e| self.has_feasible_value(e)),
             ty::Adt(adt_def, generics) => match adt_def.adt_kind() {
-                AdtKind::Struct => adt_def.non_enum_variant().fields.iter().all(|f| {
-                    self.has_feasible_value(
-                        self.tcx
-                            .normalize_erasing_regions(self.typing_env, f.ty(self.tcx, generics)),
-                    )
+                AdtKind::Struct => adt_def
+                    .non_enum_variant()
+                    .fields
+                    .iter()
+                    .all(|f| self.has_feasible_value(self.tcx_field_ty(f, generics))),
+                AdtKind::Union => adt_def
+                    .non_enum_variant()
+                    .fields
+                    .iter()
+                    .any(|f| self.has_feasible_value(self.tcx_field_ty(f, generics))),
+                AdtKind::Enum => adt_def.variants().iter().any(|variant| {
+                    variant
+                        .fields
+                        .iter()
+                        .all(|f| self.has_feasible_value(self.tcx_field_ty(f, generics)))
                 }),
-                AdtKind::Union => adt_def.non_enum_variant().fields.iter().any(|f| {
-                    self.has_feasible_value(
-                        self.tcx
-                            .normalize_erasing_regions(self.typing_env, f.ty(self.tcx, generics)),
-                    )
-                }),
-                AdtKind::Enum => {
-                    adt_def.variants().iter().any(|variant| {
-                        variant.fields.iter().all(|f| {
-                            self.has_feasible_value(self.tcx.normalize_erasing_regions(
-                                self.typing_env,
-                                f.ty(self.tcx, generics),
-                            ))
-                        })
-                    })
-                }
             },
             ty::Array(sub, _) | ty::Slice(sub) => self.has_feasible_value(*sub),
 
@@ -3371,10 +3342,7 @@ impl<'tcx> ExecBuilder<'tcx> {
     ) -> Option<FieldIdx> {
         let mut feasible_field = None;
         for (field_idx, field_def) in def.non_enum_variant().fields.iter_enumerated() {
-            if self.has_feasible_value(
-                self.tcx
-                    .normalize_erasing_regions(self.typing_env, field_def.ty(self.tcx, generics)),
-            ) {
+            if self.has_feasible_value(self.tcx_field_ty(field_def, generics)) {
                 if feasible_field.is_some() {
                     // found more than one feasible fields
                     return None;
@@ -3394,11 +3362,11 @@ impl<'tcx> ExecBuilder<'tcx> {
     ) -> Option<VariantIdx> {
         let mut feasible_variant = None;
         for (variant_idx, variant_def) in def.variants().iter_enumerated() {
-            if variant_def.fields.iter().all(|f| {
-                self.has_feasible_value(
-                    self.tcx.normalize_erasing_regions(self.typing_env, f.ty(self.tcx, generics)),
-                )
-            }) {
+            if variant_def
+                .fields
+                .iter()
+                .all(|f| self.has_feasible_value(self.tcx_field_ty(f, generics)))
+            {
                 if feasible_variant.is_some() {
                     // found more than one feasible variants
                     return None;
@@ -3435,11 +3403,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
         // skip coroutine-related owners
         if is_closure
             && matches!(
-                tcx.normalize_erasing_regions(
-                    typing_env,
-                    tcx.type_of(def_id).instantiate_identity()
-                )
-                .kind(),
+                tcx.type_of(def_id).instantiate_identity().skip_norm_wip().kind(),
                 ty::Coroutine(..) | ty::CoroutineClosure(..)
             )
         {
