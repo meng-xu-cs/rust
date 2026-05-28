@@ -39,7 +39,7 @@ use rustc_middle::ty::{
     GenericParamDefKind, Instance, InstanceKind, List, OutlivesPredicate, ParamConst, ParamTy,
     Pattern, PatternKind, PredicatePolarity, ProjectionPredicate, ScalarInt, Term, TermKind,
     TraitDef, TraitPredicate, Ty, TyCtxt, TypeFoldable, TypingEnv, UniverseIndex, Unnormalized,
-    UpvarArgs, ValTreeKind, Value, VariantDiscr, Visibility,
+    UpvarArgs, ValTreeKind, Value, Visibility,
 };
 use rustc_middle::{bug, ty};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, StableSourceFileId, Symbol};
@@ -527,25 +527,14 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
             AdtKind::Enum => {
                 let mut variants = vec![];
-                let mut last_discr_value = 0;
                 for (variant_idx, variant_def) in adt_def.variants().iter_enumerated() {
                     let variant_index = SolVariantIndex(variant_idx.index());
                     let variant_name = SolVariantName(variant_def.name.to_ident_string());
-                    let variant_descr = match variant_def.discr {
-                        VariantDiscr::Relative(pos) => {
-                            SolVariantDiscr(last_discr_value + pos as u128)
-                        }
-                        VariantDiscr::Explicit(did) => {
-                            let discr = adt_def.eval_explicit_discr(self.tcx, did).unwrap_or_else(|_| {
-                                    bug!("[invariant] failed to evaluate discriminant for enum {def_desc}")
-                                });
-                            if !matches!(discr.ty.kind(), ty::Int(_) | ty::Uint(_)) {
-                                bug!("[invariant] non-integral discriminant for enum {def_desc}");
-                            }
-                            last_discr_value = discr.val;
-                            SolVariantDiscr(discr.val)
-                        }
-                    };
+                    let discr = adt_def.discriminant_for_variant(self.tcx, variant_idx);
+                    if !matches!(discr.ty.kind(), ty::Int(_) | ty::Uint(_)) {
+                        bug!("[invariant] non-integral discriminant for enum {def_desc}");
+                    }
+                    let variant_descr = SolVariantDiscr(discr.val);
                     let fields = variant_def
                         .fields
                         .iter_enumerated()
@@ -1627,7 +1616,7 @@ impl<'tcx> ExecBuilder<'tcx> {
         let memory = alloc.inner();
 
         // process the constant value from memory
-        let (_, value) = self.read_const_from_memory_and_layout(memory, Size::ZERO, ty);
+        let (_, value) = self.read_const_from_memory_and_layout(memory, Size::ZERO, ty, None);
 
         // update the static initializer entry
         self.static_inits.insert(ident.clone(), Some(value));
@@ -1639,12 +1628,13 @@ impl<'tcx> ExecBuilder<'tcx> {
         ident
     }
 
-    /// Helper function to read a constant from memory with given type and offset
+    /// Helper function to read a constant from memory with optional wide-pointer metadata
     fn read_const_from_memory_and_layout(
         &mut self,
         memory: &Allocation,
         offset: Size,
         ty: Ty<'tcx>,
+        metadata: Option<usize>,
     ) -> (Size, SolValue) {
         // utility
         let read_primitive = |tcx: TyCtxt<'tcx>, start, size: Size, is_provenane: bool| {
@@ -1657,7 +1647,7 @@ impl<'tcx> ExecBuilder<'tcx> {
         match ty.kind() {
             ty::Alias(..) => bug!("[invariant] alias type should be normalized for const reading"),
             ty::Pat(base_ty, _) => {
-                return self.read_const_from_memory_and_layout(memory, offset, *base_ty);
+                return self.read_const_from_memory_and_layout(memory, offset, *base_ty, metadata);
             }
             _ => (), // all other types, continue to layout-based reading
         };
@@ -1759,6 +1749,69 @@ impl<'tcx> ExecBuilder<'tcx> {
                     *sub_ty
                 };
 
+                // preserve size metadata for slice/str and other unsized pointees
+                //
+                // NOTE: we only handle size-based metadata for now. In addition, we know that
+                //       the `actual_sub_ty` must be sized if it comes from a dyn type (checked above),
+                //       so if we need metadata here, the metadata must hold a size value, not a vtable.
+                let need_metadata = !actual_sub_ty.is_sized(self.tcx, self.typing_env);
+                let pointee_metadata = if need_metadata {
+                    // sanity check on the shape of the fields
+                    if pointer_size * 2 != layout.size {
+                        bug!(
+                            "[invariant] invalid layout size for {ty},
+                            expect metadata but got {}",
+                            layout.size.bytes_usize()
+                        );
+                    }
+
+                    // derive the metadata offset
+                    let offset_metadata = match &layout.fields {
+                        FieldsShape::Arbitrary { offsets, in_memory_order: _ } => {
+                            if offsets.len() != 2 {
+                                bug!("[invariant] expect two fields for {ty}");
+                            }
+                            let mut offsets_iter = offsets.into_iter();
+                            let off_pointer = *offsets_iter.next().unwrap();
+                            let off_metadata = *offsets_iter.next().unwrap();
+                            if off_pointer.bytes_usize() != 0 || off_metadata != pointer_size {
+                                bug!("[invariant] unexpected offsets for {ty}");
+                            }
+                            off_metadata
+                        }
+                        _ => bug!("[invariant] expect arbitrary layout for {ty}"),
+                    };
+
+                    // read the metadata
+                    let size_metadata = match read_primitive(
+                        self.tcx,
+                        offset + offset_metadata,
+                        pointer_size,
+                        false,
+                    ) {
+                        Scalar::Int(scalar_int) => scalar_int.to_target_usize(self.tcx) as usize,
+                        Scalar::Ptr(..) => {
+                            bug!("[invariant] unexpected scalar ptr metadata for {ty}")
+                        }
+                    };
+                    Some(size_metadata)
+                } else {
+                    // sanity check on the shape of the fields
+                    if !is_dyn_ty {
+                        if pointer_size != layout.size {
+                            bug!(
+                                "[invariant] invalid layout size for {ty},
+                                expect no more metadata behind dyn reference but got {}",
+                                layout.size.bytes_usize()
+                            );
+                        }
+                        if !matches!(layout.fields, FieldsShape::Primitive) {
+                            bug!("[invariant] expect a primitive field for {ty}");
+                        }
+                    }
+                    None
+                };
+
                 // read and parse the pointer
                 let const_val = match read_primitive(self.tcx, offset, pointer_size, true) {
                     Scalar::Ptr(ptr, _) => {
@@ -1775,6 +1828,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                                     inner_memory,
                                     offset,
                                     actual_sub_ty,
+                                    pointee_metadata,
                                 );
 
                                 // now construct the value
@@ -1793,7 +1847,13 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 }
                             }
                             GlobalAlloc::Static(def_id) => {
-                                let static_ident = self.mk_static_init(def_id, actual_sub_ty);
+                                // the provenance names the backing static allocation, here we read the static init
+                                // using its own type instead of `actual_sub_ty` because the latter may be the unsized
+                                // pointee reached through this reference, e.g. `&[u8]` pointing at a `[u8; N]` static.
+                                let static_ty = self.tcx_try_normalize(
+                                    self.tcx.type_of(def_id).instantiate_identity(),
+                                );
+                                let static_ident = self.mk_static_init(def_id, static_ty);
                                 let pointee_ty = self.mk_type(actual_sub_ty);
 
                                 // now construct the value
@@ -1858,72 +1918,6 @@ impl<'tcx> ExecBuilder<'tcx> {
                     }
                 };
 
-                // check whether the metadata should be a ZST
-                // NOTE: we only handle size-based metadata for now. In addition, we know that the `actual_sub_ty`
-                //       must be sized if it comes from a dyn type (checked before), so if we need metadata here,
-                //       the metadata must hold a size value, not a vtable.
-                let need_metadata = !actual_sub_ty.is_sized(self.tcx, self.typing_env);
-
-                // switch by whether we need metadata
-                if need_metadata {
-                    // sanity check on the shape of the fields
-                    if pointer_size * 2 != layout.size {
-                        bug!(
-                            "[invariant] invalid layout size for {ty},
-                            expect metadata but got {}",
-                            layout.size.bytes_usize()
-                        );
-                    }
-
-                    // derive the metadata offset
-                    let offset_metadata = match &layout.fields {
-                        FieldsShape::Arbitrary { offsets, in_memory_order: _ } => {
-                            if offsets.len() != 2 {
-                                bug!("[invariant] expect two fields for {ty}");
-                            }
-                            let mut offsets_iter = offsets.into_iter();
-                            let off_pointer = *offsets_iter.next().unwrap();
-                            let off_metadata = *offsets_iter.next().unwrap();
-                            if off_pointer.bytes_usize() != 0 || off_metadata != pointer_size {
-                                bug!("[invariant] unexpected offsets for {ty}");
-                            }
-                            off_metadata
-                        }
-                        _ => bug!("[invariant] expect arbitrary layout for {ty}"),
-                    };
-
-                    // read the metadata
-                    let metadata = match read_primitive(
-                        self.tcx,
-                        offset + offset_metadata,
-                        pointer_size,
-                        false,
-                    ) {
-                        Scalar::Int(scalar_int) => scalar_int.to_target_usize(self.tcx) as usize,
-                        Scalar::Ptr(..) => {
-                            bug!("[invariant] unexpected scalar ptr metadata for {ty}")
-                        }
-                    };
-
-                    // silently ignore the metadata for now
-                    // MAYFIX: we may want to record the metadata for future uses?
-                    let _ = metadata;
-                } else {
-                    // sanity check on the shape of the fields
-                    if !is_dyn_ty {
-                        if pointer_size != layout.size {
-                            bug!(
-                                "[invariant] invalid layout size for {ty},
-                                expect no more metadata behind dyn reference but got {}",
-                                layout.size.bytes_usize()
-                            );
-                        }
-                        if !matches!(layout.fields, FieldsShape::Primitive) {
-                            bug!("[invariant] expect a primitive field for {ty}");
-                        }
-                    }
-                }
-
                 // return the constructed constant value
                 const_val
             }
@@ -1987,6 +1981,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 memory,
                                 elem_offset,
                                 *elem_ty,
+                                None,
                             );
                             elements.push(SolConst::Value(elem));
                         }
@@ -2002,13 +1997,15 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
                 match &layout.fields {
                     FieldsShape::Array { stride, count } => {
+                        let count = metadata.map(|count| count as u64).unwrap_or(*count);
                         let mut elements = vec![];
-                        for i in 0..*count {
+                        for i in 0..count {
                             let elem_offset = offset + *stride * i;
                             let (_, elem) = self.read_const_from_memory_and_layout(
                                 memory,
                                 elem_offset,
                                 *elem_ty,
+                                None,
                             );
                             elements.push(SolConst::Value(elem));
                         }
@@ -2024,7 +2021,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
                 match &layout.fields {
                     FieldsShape::Array { stride, count } => {
-                        let range = AllocRange { start: offset, size: *stride * *count };
+                        let count = metadata.map(|count| count as u64).unwrap_or(*count);
+                        let range = AllocRange { start: offset, size: *stride * count };
                         let num_prov = memory.provenance().get_range(range, &self.tcx).count();
                         if num_prov != 0 {
                             bug!("[invariant] string memory contains provenance");
@@ -2061,10 +2059,13 @@ impl<'tcx> ExecBuilder<'tcx> {
                             let field_offset = *offsets.get(field_idx).unwrap_or_else(|| {
                                 bug!("[invariant] no offset for field {i} in {ty}");
                             });
+                            let elem_metadata =
+                                metadata.filter(|_| !elem_ty.is_sized(self.tcx, self.typing_env));
                             let (_, elem) = self.read_const_from_memory_and_layout(
                                 memory,
                                 offset + field_offset,
                                 elem_ty,
+                                elem_metadata,
                             );
                             elements.push(SolConst::Value(elem));
                         }
@@ -2102,11 +2103,15 @@ impl<'tcx> ExecBuilder<'tcx> {
                                     let field_offset = *offsets.get(field_idx).unwrap_or_else(|| {
                                     bug!("[invariant] no offset for field {field_name} in struct {ty}");
                                 });
-                                    let (_, elem) = self.read_const_from_memory_and_layout(
-                                        memory,
-                                        offset + field_offset,
-                                        field_ty,
-                                    );
+                                    let field_metadata = metadata
+                                        .filter(|_| !field_ty.is_sized(self.tcx, self.typing_env));
+                                    let (_, elem) = self
+                                        .read_const_from_memory_and_layout_with_metadata(
+                                            memory,
+                                            offset + field_offset,
+                                            field_ty,
+                                            field_metadata,
+                                        );
                                     elements.push((
                                         SolFieldIndex(field_idx.index()),
                                         SolConst::Value(elem),
@@ -2184,6 +2189,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 memory,
                                 offset,
                                 field_match_ty,
+                                None,
                             );
                             SolValue::Union(
                                 adt_ident,
@@ -2197,6 +2203,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 memory,
                                 offset,
                                 field_value_ty,
+                                None,
                             );
                             SolValue::Union(
                                 adt_ident,
@@ -2332,6 +2339,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 memory,
                                 offset + field_offset,
                                 self.tcx_field_ty(field_def, ty_args),
+                                None,
                             );
                             elements
                                 .push((SolFieldIndex(field_idx.index()), SolConst::Value(elem)));
