@@ -350,22 +350,19 @@ impl<'tcx> ExecBuilder<'tcx> {
 
     /// Utility to normalize a type foldable value by erasing regions and applying type normalization
     #[inline]
-    fn tcx_normalize<T>(&self, value: Unnormalized<'tcx, T>) -> T
+    fn tcx_try_normalize<T>(&self, value: Unnormalized<'tcx, T>) -> T
     where
-        T: TypeFoldable<TyCtxt<'tcx>>,
+        T: TypeFoldable<TyCtxt<'tcx>> + Copy,
     {
-        self.tcx.normalize_erasing_regions(self.typing_env, value)
+        self.tcx
+            .try_normalize_erasing_regions(self.typing_env, value)
+            .unwrap_or_else(|_| self.tcx.erase_and_anonymize_regions(value.skip_norm_wip()))
     }
 
     /// Utility to get the type of a field after instantiating it with the generic arguments.
     #[inline]
     fn tcx_field_ty(&self, field: &FieldDef, ty_args: GenericArgsRef<'tcx>) -> Ty<'tcx> {
-        let field_ty = field.ty(self.tcx, ty_args);
-        self.tcx
-            .try_normalize_erasing_regions(self.typing_env, field_ty)
-            // NOTE: some polymorphic field projections are valid but not normalizable in the current
-            // body's environment, so preserve the erased instantiated type on normalization failure.
-            .unwrap_or_else(|_| self.tcx.erase_and_anonymize_regions(field_ty.skip_norm_wip()))
+        self.tcx_try_normalize(field.ty(self.tcx, ty_args))
     }
 
     /// Get a generic parameter by index with cross-checking on name and kind
@@ -609,7 +606,7 @@ impl<'tcx> ExecBuilder<'tcx> {
         for (clause, _) in
             self.tcx.explicit_predicates_of(def_id).instantiate(self.tcx, ty_args).into_iter()
         {
-            parsed_clauses.push(self.mk_clause(self.tcx_normalize(clause)));
+            parsed_clauses.push(self.mk_clause(self.tcx_try_normalize(clause)));
         }
 
         // FIXME: check `TyCtxt::trait_explicit_predicates_and_bounds`,
@@ -889,10 +886,9 @@ impl<'tcx> ExecBuilder<'tcx> {
                     }
                 }
                 AliasTyKind::Opaque { def_id } => {
-                    let norm_ty = self.tcx_normalize(
-                        self.tcx.type_of(def_id).instantiate(self.tcx, alias_ty.args),
-                    );
-                    assert_ne!(norm_ty, ty, "[invariant] opaque alias type should be normalized");
+                    let hidden_ty = self.tcx.type_of(def_id).instantiate(self.tcx, alias_ty.args);
+                    let norm_ty = self.tcx_try_normalize(hidden_ty);
+                    assert_ne!(norm_ty, ty, "[invariant] opaque alias type should be revealed");
                     // MAYFIX: keep track of opaque alias types separately, i.e., SolType::Opaque(..)?
                     self.mk_type(norm_ty)
                 }
@@ -1114,7 +1110,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                     }
                     Err(EvaluateConstErr::HasGenericsOrInfers) => {
                         // we hit an associated item that can't be evaluated now
-                        let const_ty = self.tcx_normalize(
+                        let const_ty = self.tcx_try_normalize(
                             self.tcx.type_of(uneval.def).instantiate(self.tcx, uneval.args),
                         );
                         SolConst::Unevaluated(
@@ -3232,6 +3228,25 @@ impl<'tcx> ExecBuilder<'tcx> {
         // try to resolve the instance
         let instance = match ty.kind() {
             ty::FnDef(def_id, ty_args) => {
+                // instance resolution normalizes associated-item arguments internally using
+                // infallible normalization, and yet, THIR can contain valid projections that
+                // are not normalizable in the current body, so keep those calls symbolic.
+                let ty_args = match self
+                    .tcx
+                    .try_normalize_erasing_regions(self.typing_env, Unnormalized::new_wip(*ty_args))
+                {
+                    Ok(ty_args) => ty_args,
+                    Err(_) => {
+                        let ty_args = self.tcx.erase_and_anonymize_regions(*ty_args);
+                        return self.try_resolve_function_favor_stdlib(
+                            *def_id,
+                            ty_args,
+                            ResolvedFunction::FuncSym,
+                        );
+                    }
+                };
+
+                // NOTE: this `try_resolve` has to be after the normalization attempt above
                 match Instance::try_resolve(self.tcx, self.typing_env, *def_id, ty_args) {
                     Ok(None) => {
                         return self.try_resolve_function_favor_stdlib(
@@ -3251,7 +3266,7 @@ impl<'tcx> ExecBuilder<'tcx> {
         let def_id = instance.def_id();
         if self.tcx.is_constructor(def_id) {
             let adt_ty = self
-                .tcx_normalize(self.tcx.fn_sig(def_id).instantiate(self.tcx, instance.args))
+                .tcx_try_normalize(self.tcx.fn_sig(def_id).instantiate(self.tcx, instance.args))
                 .no_bound_vars()
                 .unwrap_or_else(|| bug!("[invariant] unable to instantiate constructor signature"))
                 .output();
