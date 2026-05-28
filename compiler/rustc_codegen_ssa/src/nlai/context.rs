@@ -357,10 +357,15 @@ impl<'tcx> ExecBuilder<'tcx> {
         self.tcx.normalize_erasing_regions(self.typing_env, value)
     }
 
-    /// Utility to get the type of a field by normalizing the field type after instantiating it with the generic arguments
+    /// Utility to get the type of a field after instantiating it with the generic arguments.
     #[inline]
     fn tcx_field_ty(&self, field: &FieldDef, ty_args: GenericArgsRef<'tcx>) -> Ty<'tcx> {
-        self.tcx_normalize(field.ty(self.tcx, ty_args))
+        let field_ty = field.ty(self.tcx, ty_args);
+        self.tcx
+            .try_normalize_erasing_regions(self.typing_env, field_ty)
+            // NOTE: some polymorphic field projections are valid but not normalizable in the current
+            // body's environment, so preserve the erased instantiated type on normalization failure.
+            .unwrap_or_else(|_| self.tcx.erase_and_anonymize_regions(field_ty.skip_norm_wip()))
     }
 
     /// Get a generic parameter by index with cross-checking on name and kind
@@ -883,7 +888,6 @@ impl<'tcx> ExecBuilder<'tcx> {
                         item_ty_args,
                     }
                 }
-                /* TODO: remove this
                 AliasTyKind::Opaque { def_id } => {
                     let norm_ty = self.tcx_normalize(
                         self.tcx.type_of(def_id).instantiate(self.tcx, alias_ty.args),
@@ -891,10 +895,6 @@ impl<'tcx> ExecBuilder<'tcx> {
                     assert_ne!(norm_ty, ty, "[invariant] opaque alias type should be normalized");
                     // MAYFIX: keep track of opaque alias types separately, i.e., SolType::Opaque(..)?
                     self.mk_type(norm_ty)
-                }
-                 */
-                AliasTyKind::Opaque { .. } => {
-                    bug!("[invariant] opaque alias type should be normalized")
                 }
                 AliasTyKind::Inherent { .. } => {
                     bug!("[invariant] inherent alias type should be normalized")
