@@ -1,0 +1,22 @@
+compiler/rustc_codegen_ssa/src/nlai/context.rs
+  04f85b5dc3e29e0d 1483,1900,1940,1950,1952,1956,1961,1967,1974,1981,1987
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e380852bac3c28fa2b59f5a3e16829a85ba6e326",
+  "prompts": {
+    "04f85b5dc3e29e0d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d798b-0e43-7923-987f-d351ebbf5704",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Meng Xu",
+      "total_additions": 46,
+      "total_deletions": 44,
+      "accepted_lines": 5,
+      "overriden_lines": 0
+    }
+  }
+}

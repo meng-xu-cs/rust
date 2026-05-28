@@ -1,0 +1,9 @@
+compiler/rustc_codegen_ssa/src/nlai/context.rs
+  04f85b5dc3e29e0d 2041,2602,2646,2656,2658,2662,2667,2673,2680,2687,2693,2709,2724,2731,2742,2760,2765,2768,2773,2794
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "55bbeee27bbc87599c45fd94ede14eb1dbc10612",
+  "prompts": {}
+}
