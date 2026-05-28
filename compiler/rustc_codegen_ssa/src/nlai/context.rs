@@ -35,7 +35,7 @@ use rustc_middle::ty::print::{
 use rustc_middle::ty::util::Discr;
 use rustc_middle::ty::{
     AdtDef, AdtKind, AliasTyKind, BoundTy, BoundTyKind, BoundVar, Clause, ClauseKind, Const,
-    ConstKind, FnHeader, FnSig, GenericArg, GenericArgKind, GenericArgsRef, GenericParamDef,
+    ConstKind, FieldDef, GenericArg, GenericArgKind, GenericArgsRef, GenericParamDef,
     GenericParamDefKind, Instance, InstanceKind, List, OutlivesPredicate, ParamConst, ParamTy,
     Pattern, PatternKind, PredicatePolarity, ProjectionPredicate, ScalarInt, Term, TermKind,
     TraitDef, TraitPredicate, Ty, TyCtxt, TypingEnv, UniverseIndex, UpvarArgs, ValTreeKind, Value,
@@ -278,7 +278,7 @@ impl<'tcx> BaseBuilder<'tcx> {
                 }
 
                 // traits
-                ItemKind::Trait(..) | ItemKind::TraitAlias(..) => {
+                ItemKind::Trait { .. } | ItemKind::TraitAlias(..) => {
                     // we don't dump trait definitions, instead we will dump the THIR function
                     // bodies with traits resolved
                     continue;
@@ -455,6 +455,24 @@ impl<'tcx> ExecBuilder<'tcx> {
         }
     }
 
+    /// Record the details of an ADT field
+    pub(crate) fn mk_adt_field(
+        &mut self,
+        ty_args: GenericArgsRef<'tcx>,
+        field_idx: FieldIdx,
+        field_def: &FieldDef,
+    ) -> SolField {
+        SolField {
+            index: SolFieldIndex(field_idx.index()),
+            name: SolFieldName(field_def.name.to_ident_string()),
+            ty: self.mk_type(
+                self.tcx
+                    .normalize_erasing_regions(self.typing_env, field_def.ty(self.tcx, ty_args)),
+            ),
+            default: field_def.value.map(|did| self.mk_ident(did)),
+        }
+    }
+
     /// Record the definition of an ADT
     pub(crate) fn mk_adt(
         &mut self,
@@ -489,12 +507,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                     .non_enum_variant()
                     .fields
                     .iter_enumerated()
-                    .map(|(field_idx, field_def)| SolField {
-                        index: SolFieldIndex(field_idx.index()),
-                        name: SolFieldName(field_def.name.to_ident_string()),
-                        ty: self.mk_type(field_def.ty(self.tcx, ty_args)),
-                        default: field_def.value.map(|did| self.mk_ident(did)),
-                    })
+                    .map(|(field_idx, field_def)| self.mk_adt_field(ty_args, field_idx, field_def))
                     .collect();
                 SolAdtDef::Struct { fields }
             }
@@ -506,12 +519,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                     .non_enum_variant()
                     .fields
                     .iter_enumerated()
-                    .map(|(field_idx, field_def)| SolField {
-                        index: SolFieldIndex(field_idx.index()),
-                        name: SolFieldName(field_def.name.to_ident_string()),
-                        ty: self.mk_type(field_def.ty(self.tcx, ty_args)),
-                        default: field_def.value.map(|did| self.mk_ident(did)),
-                    })
+                    .map(|(field_idx, field_def)| self.mk_adt_field(ty_args, field_idx, field_def))
                     .collect();
                 SolAdtDef::Union { fields }
             }
@@ -539,11 +547,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                     let fields = variant_def
                         .fields
                         .iter_enumerated()
-                        .map(|(field_idx, field_def)| SolField {
-                            index: SolFieldIndex(field_idx.index()),
-                            name: SolFieldName(field_def.name.to_ident_string()),
-                            ty: self.mk_type(field_def.ty(self.tcx, ty_args)),
-                            default: field_def.value.map(|did| self.mk_ident(did)),
+                        .map(|(field_idx, field_def)| {
+                            self.mk_adt_field(ty_args, field_idx, field_def)
                         })
                         .collect();
                     variants.push(SolVariant {
@@ -599,7 +604,8 @@ impl<'tcx> ExecBuilder<'tcx> {
         for (clause, _) in
             self.tcx.explicit_predicates_of(def_id).instantiate(self.tcx, ty_args).into_iter()
         {
-            parsed_clauses.push(self.mk_clause(clause));
+            parsed_clauses
+                .push(self.mk_clause(self.tcx.normalize_erasing_regions(self.typing_env, clause)));
         }
 
         // FIXME: check `TyCtxt::trait_explicit_predicates_and_bounds`,
@@ -776,10 +782,9 @@ impl<'tcx> ExecBuilder<'tcx> {
                 let generic_args = ty_args.iter().map(|arg| self.mk_generic_arg(arg)).collect();
                 SolType::Closure(ident, generic_args)
             }
-            ty::FnPtr(sig_binder, FnHeader { c_variadic, abi, safety }) => {
+            ty::FnPtr(sig_binder, header) => {
                 let sig = self.tcx.instantiate_bound_regions_with_erased(*sig_binder);
-                let abi = self.mk_abi(*abi, *c_variadic, *safety);
-
+                let abi = self.mk_abi(header.abi(), header.c_variadic(), header.safety());
                 let ret_ty = self.mk_type(sig.output());
                 let params: Vec<_> =
                     sig.inputs().iter().map(|input_ty| self.mk_type(*input_ty)).collect();
@@ -857,49 +862,37 @@ impl<'tcx> ExecBuilder<'tcx> {
             // alias
             ty::Alias(alias_ty) => match alias_ty.kind {
                 AliasTyKind::Projection { .. } => {
-                    match self.tcx.try_normalize_erasing_regions(self.typing_env, ty) {
-                        Ok(norm_ty) if norm_ty != ty => {
-                            // MAYFIX: keep track of projection types separately, i.e., SolType::Proj(..)?
-                            self.mk_type(norm_ty)
-                        }
-                        _ => {
-                            // It is possible that normalization does not change the type, for example,
-                            // when the projection comes from a type parameter (which implements a trait),
-                            // e.g., <P as Foo>::T, where P is the type parameter of the THIR definition.
-                            let (trait_ref, own_ty_args) =
-                                alias_ty.trait_ref_and_own_args(self.tcx);
-                            let (trait_ident, trait_ty_args) =
-                                self.mk_trait(self.tcx.trait_def(trait_ref.def_id), trait_ref.args);
-                            let item_ty_args =
-                                own_ty_args.iter().map(|arg| self.mk_generic_arg(*arg)).collect();
+                    // It is possible that normalization does not change the type, for example,
+                    // when the projection comes from a type parameter (which implements a trait),
+                    // e.g., <P as Foo>::T, where P is the type parameter of the THIR definition.
+                    let (trait_ref, own_ty_args) = alias_ty.trait_ref_and_own_args(self.tcx);
+                    let (trait_ident, trait_ty_args) =
+                        self.mk_trait(self.tcx.trait_def(trait_ref.def_id), trait_ref.args);
+                    let item_ty_args =
+                        own_ty_args.iter().map(|arg| self.mk_generic_arg(*arg)).collect();
 
-                            // construct the associated type
-                            SolType::Assoc {
-                                trait_ident,
-                                trait_ty_args,
-                                item_ident: self.mk_ident(alias_ty.kind.def_id()),
-                                item_ty_args,
-                            }
-                        }
+                    // construct the associated type
+                    SolType::Assoc {
+                        trait_ident,
+                        trait_ty_args,
+                        item_ident: self.mk_ident(alias_ty.kind.def_id()),
+                        item_ty_args,
                     }
                 }
-                AliasTyKind::Inherent { .. } => {
-                    let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
-                    assert_ne!(norm_ty, ty, "[invariant] inherent alias type should be normalized");
-                    // MAYFIX: keep track of inherent alias types separately, i.e., SolType::Alias(..)?
-                    self.mk_type(norm_ty)
-                }
                 AliasTyKind::Opaque { def_id } => {
-                    let norm_ty = self.tcx.type_of(def_id).instantiate(self.tcx, alias_ty.args);
+                    let norm_ty = self.tcx.normalize_erasing_regions(
+                        self.typing_env,
+                        self.tcx.type_of(def_id).instantiate(self.tcx, alias_ty.args),
+                    );
                     assert_ne!(norm_ty, ty, "[invariant] opaque alias type should be instantiated");
                     // MAYFIX: keep track of opaque alias types separately, i.e., SolType::Opaque(..)?
                     self.mk_type(norm_ty)
                 }
+                AliasTyKind::Inherent { .. } => {
+                    bug!("[invariant] inherent alias type should be normalized")
+                }
                 AliasTyKind::Free { .. } => {
-                    let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
-                    assert_ne!(norm_ty, ty, "[invariant] free alias type should be normalized");
-                    // MAYFIX: keep track of free alias types separately, i.e., SolType::Alias(..)?
-                    self.mk_type(norm_ty)
+                    bug!("[invariant] free alias type should be normalized")
                 }
             },
 
@@ -1015,7 +1008,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                     .collect();
                 SolPatRule::Leaf { fields: sub_pats }
             }
-            PatKind::Slice { box prefix, slice, box suffix } => {
+            PatKind::Slice { prefix, slice, suffix } => {
                 let prefix_pats = prefix.iter().map(|pat| self.mk_pat(pat)).collect();
                 let slice_pat = slice.as_ref().map(|pat| Box::new(self.mk_pat(pat)));
                 let suffix_pats = suffix.iter().map(|pat| self.mk_pat(pat)).collect();
@@ -1055,7 +1048,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                 SolPatRule::Range { lo: bound_lo, hi: bound_hi, end_inclusive }
             }
             PatKind::Constant { value } => SolPatRule::Constant(self.mk_value(*value)),
-            PatKind::Or { box pats } => {
+            PatKind::Or { pats } => {
                 SolPatRule::Or(pats.iter().map(|sub_pat| self.mk_pat(sub_pat)).collect())
             }
 
@@ -1373,8 +1366,11 @@ impl<'tcx> ExecBuilder<'tcx> {
                         let variant = def.non_enum_variant();
                         let mut fields = vec![];
                         for (field_idx, field_def) in variant.fields.iter_enumerated() {
-                            let field_val =
-                                self.mk_value_when_zst(field_def.ty(self.tcx, ty_args))?;
+                            let field_ty = self.tcx.normalize_erasing_regions(
+                                self.typing_env,
+                                field_def.ty(self.tcx, ty_args),
+                            );
+                            let field_val = self.mk_value_when_zst(field_ty)?;
                             fields.push((
                                 SolFieldIndex(field_idx.index()),
                                 SolConst::Value(field_val),
@@ -1384,9 +1380,13 @@ impl<'tcx> ExecBuilder<'tcx> {
                     }
                     AdtKind::Union => {
                         // a union is a ZST if it has only one feasible field and the field is a ZST
-                        let field_idx = get_uniquely_feasible_field(self.tcx, *def, ty_args)?;
+                        let field_idx = self.get_uniquely_feasible_field(*def, ty_args)?;
                         let field_def = def.non_enum_variant().fields.get(field_idx).unwrap();
-                        let field_val = self.mk_value_when_zst(field_def.ty(self.tcx, ty_args))?;
+                        let field_ty = self.tcx.normalize_erasing_regions(
+                            self.typing_env,
+                            field_def.ty(self.tcx, ty_args),
+                        );
+                        let field_val = self.mk_value_when_zst(field_ty)?;
                         SolValue::Union(
                             adt_ident,
                             adt_ty_args,
@@ -1396,14 +1396,17 @@ impl<'tcx> ExecBuilder<'tcx> {
                     }
                     AdtKind::Enum => {
                         // an enum is a ZST if it has only one feasible variant and all fields in that variant are ZSTs
-                        let variant_idx = get_uniquely_feasible_variant(self.tcx, *def, ty_args)?;
+                        let variant_idx = self.get_uniquely_feasible_variant(*def, ty_args)?;
 
                         // parse the fields in that feasible variant
                         let variant_def = def.variant(variant_idx);
                         let mut fields = vec![];
                         for (field_idx, field_def) in variant_def.fields.iter_enumerated() {
-                            let field_val =
-                                self.mk_value_when_zst(field_def.ty(self.tcx, ty_args))?;
+                            let field_ty = self.tcx.normalize_erasing_regions(
+                                self.typing_env,
+                                field_def.ty(self.tcx, ty_args),
+                            );
+                            let field_val = self.mk_value_when_zst(field_ty)?;
                             fields.push((
                                 SolFieldIndex(field_idx.index()),
                                 SolConst::Value(field_val),
@@ -1525,7 +1528,10 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 .iter_enumerated()
                                 .zip(consts)
                                 .map(|((field_idx, field_def), field_const)| {
-                                    let field_ty = field_def.ty(self.tcx, ty_args);
+                                    let field_ty = self.tcx.normalize_erasing_regions(
+                                        self.typing_env,
+                                        field_def.ty(self.tcx, ty_args),
+                                    );
                                     assert_eq!(
                                         self.type_of_const(&field_const),
                                         self.mk_type(field_ty),
@@ -1563,7 +1569,10 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 .iter_enumerated()
                                 .zip(&consts[1..])
                                 .map(|((field_idx, field_def), field_const)| {
-                                    let field_ty = field_def.ty(self.tcx, ty_args);
+                                    let field_ty = self.tcx.normalize_erasing_regions(
+                                        self.typing_env,
+                                        field_def.ty(self.tcx, ty_args),
+                                    );
                                     assert_eq!(
                                         self.type_of_const(field_const),
                                         self.mk_type(field_ty),
@@ -1645,16 +1654,11 @@ impl<'tcx> ExecBuilder<'tcx> {
 
         // special handlings before layout-based reading
         match ty.kind() {
-            ty::Alias(..) => {
-                let norm_ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
-                assert_ne!(norm_ty, ty, "[invariant] alias type should be normalized");
-                return self.read_const_from_memory_and_layout(memory, offset, norm_ty);
-            }
+            ty::Alias(..) => bug!("[invariant] alias type should be normalized for const reading"),
             ty::Pat(base_ty, _) => {
                 return self.read_const_from_memory_and_layout(memory, offset, *base_ty);
             }
-            // all other types, continue to layout-based reading
-            _ => (),
+            _ => (), // all other types, continue to layout-based reading
         };
 
         // get the layout of the type
@@ -2080,7 +2084,14 @@ impl<'tcx> ExecBuilder<'tcx> {
                             .fields
                             .iter_enumerated()
                             .map(|(field_idx, field_def)| {
-                                (field_idx, field_def.name, field_def.ty(self.tcx, ty_args))
+                                (
+                                    field_idx,
+                                    field_def.name,
+                                    self.tcx.normalize_erasing_regions(
+                                        self.typing_env,
+                                        field_def.ty(self.tcx, ty_args),
+                                    ),
+                                )
                             })
                             .collect::<Vec<_>>();
 
@@ -2129,7 +2140,13 @@ impl<'tcx> ExecBuilder<'tcx> {
                             .fields
                             .iter_enumerated()
                             .map(|(field_idx, field_def)| {
-                                (field_idx, field_def.ty(self.tcx, ty_args))
+                                (
+                                    field_idx,
+                                    self.tcx.normalize_erasing_regions(
+                                        self.typing_env,
+                                        field_def.ty(self.tcx, ty_args),
+                                    ),
+                                )
                             })
                             .collect::<Vec<_>>();
 
@@ -2204,10 +2221,21 @@ impl<'tcx> ExecBuilder<'tcx> {
                         }
                     }
                     AdtKind::Enum => {
-                        let (variant_idx, variant_layout) = match &layout.variants {
+                        let (variant_idx, field_offsets) = match layout.variants() {
                             Variants::Single { index } => {
                                 // the enum is known to be this single variant, maybe the other variants are all infeasible
-                                (*index, *layout)
+
+                                // get variant field offsets from layout
+                                let field_offsets = match layout.fields() {
+                                    FieldsShape::Arbitrary { offsets, in_memory_order: _ } => {
+                                        offsets
+                                    }
+                                    _ => bug!(
+                                        "[invariant] expect an arbitrary field for enum variant in {ty}"
+                                    ),
+                                };
+
+                                (*index, field_offsets)
                             }
                             Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
                                 // get the tag type
@@ -2285,17 +2313,8 @@ impl<'tcx> ExecBuilder<'tcx> {
                                         )
                                     });
 
-                                // sanity check on the variant layout
-                                if !matches!(variant_layout.variants, Variants::Single { index } if index == variant_idx)
-                                {
-                                    bug!(
-                                        "[invariant] expect an indexed({})-variant for enum variant in {ty}",
-                                        variant_idx.index()
-                                    );
-                                }
-
                                 // return both the index and the layout
-                                (variant_idx, variant_layout)
+                                (variant_idx, &variant_layout.field_offsets)
                             }
                             Variants::Empty => {
                                 bug!("[invariant] unexpected empty variants for {ty}")
@@ -2305,21 +2324,13 @@ impl<'tcx> ExecBuilder<'tcx> {
                         // get the variant definition from typing
                         let variant_def = def.variant(variant_idx);
 
-                        // get variant fields from layout
-                        let field_offsets = match &variant_layout.fields {
-                            FieldsShape::Arbitrary { offsets, in_memory_order: _ } => {
-                                if offsets.len() != variant_def.fields.len() {
-                                    bug!(
-                                        "[invariant] field count mismatch for variant {} in {ty}",
-                                        variant_def.name
-                                    );
-                                }
-                                offsets
-                            }
-                            _ => bug!(
-                                "[invariant] expect an arbitrary field for enum variant in {ty}"
-                            ),
-                        };
+                        // sanity check on the field offsets derivation
+                        if field_offsets.len() != variant_def.fields.len() {
+                            bug!(
+                                "[invariant] field count mismatch for variant {} in {ty}",
+                                variant_def.name
+                            );
+                        }
 
                         // construct values for the variant fields
                         let mut elements = vec![];
@@ -2334,7 +2345,10 @@ impl<'tcx> ExecBuilder<'tcx> {
                             let (_, elem) = self.read_const_from_memory_and_layout(
                                 memory,
                                 offset + field_offset,
-                                field_def.ty(self.tcx, ty_args),
+                                self.tcx.normalize_erasing_regions(
+                                    self.typing_env,
+                                    field_def.ty(self.tcx, ty_args),
+                                ),
                             );
                             elements
                                 .push((SolFieldIndex(field_idx.index()), SolConst::Value(elem)));
@@ -2376,15 +2390,13 @@ impl<'tcx> ExecBuilder<'tcx> {
         // switch-case on the body type
         match thir.body_type {
             BodyTy::Fn(sig) => {
-                let FnSig { abi, c_variadic, safety, inputs_and_output: _ } = sig;
-
                 // ignore unsupported case
-                if c_variadic {
+                if sig.c_variadic() {
                     bug!("[unsupported] variadic function");
                 }
 
                 // parse function signature
-                let parsed_abi = self.mk_abi(abi, c_variadic, safety);
+                let parsed_abi = self.mk_abi(sig.abi(), sig.c_variadic(), sig.safety());
                 let ret_ty = sig.output();
                 let params = sig.inputs();
 
@@ -2842,7 +2854,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             ExprKind::Tuple { fields } => {
                 SolOp::Tuple(fields.iter().map(|e| self.mk_expr(thir, *e)).collect())
             }
-            ExprKind::Adt(box AdtExpr {
+            ExprKind::Adt(AdtExpr {
                 adt_def,
                 variant_index,
                 args,
@@ -2863,11 +2875,11 @@ impl<'tcx> ExecBuilder<'tcx> {
                 // parse the base
                 let adt_base = match base_expr {
                     AdtExprBase::None => SolAdtBase::None,
-                    AdtExprBase::Base(FruInfo { base, box field_types }) => SolAdtBase::Overlay(
+                    AdtExprBase::Base(FruInfo { base, field_types }) => SolAdtBase::Overlay(
                         self.mk_expr(thir, *base),
                         field_types.iter().map(|field_ty| self.mk_type(*field_ty)).collect(),
                     ),
-                    AdtExprBase::DefaultFields(box default_field_tys) => SolAdtBase::Default(
+                    AdtExprBase::DefaultFields(default_field_tys) => SolAdtBase::Default(
                         default_field_tys.iter().map(|field_ty| self.mk_type(*field_ty)).collect(),
                     ),
                 };
@@ -2985,10 +2997,10 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // closure
-            ExprKind::Closure(box ClosureExpr {
+            ExprKind::Closure(ClosureExpr {
                 closure_id,
                 args,
-                box upvars,
+                upvars,
                 movability: _,
                 fake_reads: _,
             }) => {
@@ -3007,6 +3019,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
 
             // unsupported
+            ExprKind::Reborrow { .. } => bug!("[unsupported] reborrow"),
             ExprKind::ByUse { .. } => bug!("[unsupported] by-use"),
             ExprKind::LoopMatch { .. } => bug!("[unsupported] loop-match"),
             ExprKind::ConstContinue { .. } => bug!("[unsupported] const-continue"),
@@ -3235,34 +3248,14 @@ impl<'tcx> ExecBuilder<'tcx> {
 
     /// Try to resolve a function instance from a type
     fn try_resolve_instance(&mut self, ty: Ty<'tcx>) -> ResolvedFunction {
-        // first try to normalize the type
-        let norm_ty = match self.tcx.try_normalize_erasing_regions(self.typing_env, ty) {
-            Ok(n_ty) => n_ty,
-            Err(_) => {
-                // FIXME: not entirely sure why we need this but if normalization fails here,
-                // the subsequent instance resolution will also fail (and even worse, panic).
-                // To avoid the panic, we just mark it as a symbolic function here for now.
-                match ty.kind() {
-                    ty::FnDef(def_id, ty_args) => {
-                        return self.try_resolve_function_favor_stdlib(
-                            *def_id,
-                            *ty_args,
-                            ResolvedFunction::FuncSym,
-                        );
-                    }
-                    _ => bug!("[invariant] expect a function definition type for resolution"),
-                }
-            }
-        };
-
-        // then try to resolve the instance
-        let instance = match norm_ty.kind() {
+        // try to resolve the instance
+        let instance = match ty.kind() {
             ty::FnDef(def_id, ty_args) => {
                 match Instance::try_resolve(self.tcx, self.typing_env, *def_id, ty_args) {
                     Ok(None) => {
                         return self.try_resolve_function_favor_stdlib(
                             *def_id,
-                            *ty_args,
+                            ty_args,
                             ResolvedFunction::FuncSym,
                         );
                     }
@@ -3278,8 +3271,10 @@ impl<'tcx> ExecBuilder<'tcx> {
         if self.tcx.is_constructor(def_id) {
             let adt_ty = self
                 .tcx
-                .fn_sig(def_id)
-                .instantiate(self.tcx, instance.args)
+                .normalize_erasing_regions(
+                    self.typing_env,
+                    self.tcx.fn_sig(def_id).instantiate(self.tcx, instance.args),
+                )
                 .no_bound_vars()
                 .unwrap_or_else(|| bug!("[invariant] unable to instantiate constructor signature"))
                 .output();
@@ -3313,6 +3308,107 @@ impl<'tcx> ExecBuilder<'tcx> {
             }
         })
     }
+
+    /// Check whether a type has any feasible value
+    fn has_feasible_value(&self, ty: Ty<'tcx>) -> bool {
+        match ty.kind() {
+            // infeasible
+            ty::Never => false,
+
+            // feasible
+            ty::Bool
+            | ty::Char
+            | ty::Int(_)
+            | ty::Uint(_)
+            | ty::Float(_)
+            | ty::Str
+            | ty::FnDef(..)
+            | ty::Closure(..)
+            | ty::FnPtr(..) => true,
+
+            // conditional
+            ty::Pat(base_ty, _) => self.has_feasible_value(*base_ty),
+            ty::Tuple(elems) => elems.iter().all(|e| self.has_feasible_value(e)),
+            ty::Adt(adt_def, generics) => match adt_def.adt_kind() {
+                AdtKind::Struct => adt_def.non_enum_variant().fields.iter().all(|f| {
+                    self.has_feasible_value(
+                        self.tcx
+                            .normalize_erasing_regions(self.typing_env, f.ty(self.tcx, generics)),
+                    )
+                }),
+                AdtKind::Union => adt_def.non_enum_variant().fields.iter().any(|f| {
+                    self.has_feasible_value(
+                        self.tcx
+                            .normalize_erasing_regions(self.typing_env, f.ty(self.tcx, generics)),
+                    )
+                }),
+                AdtKind::Enum => {
+                    adt_def.variants().iter().any(|variant| {
+                        variant.fields.iter().all(|f| {
+                            self.has_feasible_value(self.tcx.normalize_erasing_regions(
+                                self.typing_env,
+                                f.ty(self.tcx, generics),
+                            ))
+                        })
+                    })
+                }
+            },
+            ty::Array(sub, _) | ty::Slice(sub) => self.has_feasible_value(*sub),
+
+            // unsupported
+            ty::Dynamic(..) => bug!("[unsupported] feasibility query for dynamic type"),
+
+            // should not appear
+            _ => bug!("[invariant] unexpected type in feasibility query: {ty}"),
+        }
+    }
+
+    /// Get a uniquely feasible field for a union
+    fn get_uniquely_feasible_field(
+        &self,
+        def: AdtDef<'tcx>,
+        generics: GenericArgsRef<'tcx>,
+    ) -> Option<FieldIdx> {
+        let mut feasible_field = None;
+        for (field_idx, field_def) in def.non_enum_variant().fields.iter_enumerated() {
+            if self.has_feasible_value(
+                self.tcx
+                    .normalize_erasing_regions(self.typing_env, field_def.ty(self.tcx, generics)),
+            ) {
+                if feasible_field.is_some() {
+                    // found more than one feasible fields
+                    return None;
+                }
+                feasible_field = Some(field_idx);
+            }
+        }
+        // return the uniquely feasible field, if any
+        feasible_field
+    }
+
+    /// Get a uniquely feasible variant for an enum
+    fn get_uniquely_feasible_variant(
+        &self,
+        def: AdtDef<'tcx>,
+        generics: GenericArgsRef<'tcx>,
+    ) -> Option<VariantIdx> {
+        let mut feasible_variant = None;
+        for (variant_idx, variant_def) in def.variants().iter_enumerated() {
+            if variant_def.fields.iter().all(|f| {
+                self.has_feasible_value(
+                    self.tcx.normalize_erasing_regions(self.typing_env, f.ty(self.tcx, generics)),
+                )
+            }) {
+                if feasible_variant.is_some() {
+                    // found more than one feasible variants
+                    return None;
+                }
+                feasible_variant = Some(variant_idx);
+            }
+        }
+        // return the uniquely feasible variant, if any
+        feasible_variant
+    }
 }
 
 /// Build the crate
@@ -3330,13 +3426,20 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
         let def_id = owner_id.to_def_id();
         let def_desc = util_debug_symbol(tcx, def_id, &List::empty());
 
+        // build typing env
+        let typing_env = tcx.typing_env_normalized_for_post_analysis(def_id);
+
         // check if the owner is a closure
         let is_closure = tcx.is_closure_like(def_id);
 
         // skip coroutine-related owners
         if is_closure
             && matches!(
-                tcx.type_of(def_id).instantiate_identity().kind(),
+                tcx.normalize_erasing_regions(
+                    typing_env,
+                    tcx.type_of(def_id).instantiate_identity()
+                )
+                .kind(),
                 ty::Coroutine(..) | ty::CoroutineClosure(..)
             )
         {
@@ -3382,7 +3485,10 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
                 }
                 GenericParamDefKind::Const { has_default: _ } => {
                     // pre-collect the types of const parameters
-                    let const_ty = tcx.type_of(*param_def_id).instantiate_identity();
+                    let const_ty = tcx.normalize_erasing_regions(
+                        typing_env,
+                        tcx.type_of(*param_def_id).instantiate_identity(),
+                    );
                     const_param_types.push((param_ident.clone(), const_ty));
 
                     // still return the proper generic kind
@@ -4353,94 +4459,6 @@ fn util_values_to_string(bytes: &[SolConst]) -> String {
             .collect(),
     )
     .unwrap_or_else(|_| bug!("[unsupported] non utf-8 string"))
-}
-
-/// Check whether a type has any feasible value
-#[inline]
-fn has_feasible_value<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
-    match ty.kind() {
-        // infeasible
-        ty::Never => false,
-
-        // feasible
-        ty::Bool
-        | ty::Char
-        | ty::Int(_)
-        | ty::Uint(_)
-        | ty::Float(_)
-        | ty::Str
-        | ty::FnDef(..)
-        | ty::Closure(..)
-        | ty::FnPtr(..) => true,
-
-        // conditional
-        ty::Pat(base_ty, _) => has_feasible_value(tcx, *base_ty),
-        ty::Tuple(elems) => elems.iter().all(|e| has_feasible_value(tcx, e)),
-        ty::Adt(adt_def, generics) => match adt_def.adt_kind() {
-            AdtKind::Struct => adt_def
-                .non_enum_variant()
-                .fields
-                .iter()
-                .all(|f| has_feasible_value(tcx, f.ty(tcx, generics))),
-            AdtKind::Union => adt_def
-                .non_enum_variant()
-                .fields
-                .iter()
-                .any(|f| has_feasible_value(tcx, f.ty(tcx, generics))),
-            AdtKind::Enum => adt_def.variants().iter().any(|variant| {
-                variant.fields.iter().all(|f| has_feasible_value(tcx, f.ty(tcx, generics)))
-            }),
-        },
-        ty::Array(sub, _) | ty::Slice(sub) => has_feasible_value(tcx, *sub),
-
-        // unsupported
-        ty::Dynamic(..) => bug!("[unsupported] feasibility query for dynamic type"),
-
-        // should not appear
-        _ => bug!("[invariant] unexpected type in feasibility query: {ty}"),
-    }
-}
-
-/// Get a uniquely feasible field for a union
-#[inline]
-fn get_uniquely_feasible_field<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def: AdtDef<'tcx>,
-    generics: GenericArgsRef<'tcx>,
-) -> Option<FieldIdx> {
-    let mut feasible_field = None;
-    for (field_idx, field_def) in def.non_enum_variant().fields.iter_enumerated() {
-        if has_feasible_value(tcx, field_def.ty(tcx, generics)) {
-            if feasible_field.is_some() {
-                // found more than one feasible fields
-                return None;
-            }
-            feasible_field = Some(field_idx);
-        }
-    }
-    // return the uniquely feasible field, if any
-    feasible_field
-}
-
-/// Get a uniquely feasible variant for an enum
-#[inline]
-fn get_uniquely_feasible_variant<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def: AdtDef<'tcx>,
-    generics: GenericArgsRef<'tcx>,
-) -> Option<VariantIdx> {
-    let mut feasible_variant = None;
-    for (variant_idx, variant_def) in def.variants().iter_enumerated() {
-        if variant_def.fields.iter().all(|f| has_feasible_value(tcx, f.ty(tcx, generics))) {
-            if feasible_variant.is_some() {
-                // found more than one feasible variants
-                return None;
-            }
-            feasible_variant = Some(variant_idx);
-        }
-    }
-    // return the uniquely feasible variant, if any
-    feasible_variant
 }
 
 /// Lookup the variant index by discriminant value
