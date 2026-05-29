@@ -1273,7 +1273,7 @@ impl<'tcx> ExecBuilder<'tcx> {
             (LitKind::Str(v, _), ty::Ref(_, inner_ty, Mutability::Not))
                 if matches!(inner_ty.kind(), ty::Str) =>
             {
-                SolValue::ImmRef(Box::new(SolValue::Str(v.to_ident_string())))
+                SolValue::ImmRef(Box::new(SolValue::Str(v.as_str().to_string())))
             }
             (LitKind::ByteStr(v, _), ty::Ref(_, inner_ty, Mutability::Not)) => {
                 let inner_val = match inner_ty.kind() {
@@ -1642,10 +1642,10 @@ impl<'tcx> ExecBuilder<'tcx> {
         mut metadata: Option<usize>,
     ) -> (Size, SolValue) {
         // utility
-        let read_primitive = |tcx: TyCtxt<'tcx>, start, size: Size, is_provenane: bool| {
-            memory.read_scalar(&tcx, AllocRange { start, size }, is_provenane).unwrap_or_else(|e| {
-                bug!("[invariant] failed to read a primitive in memory allocation: {e:?}")
-            })
+        let read_primitive = |tcx: TyCtxt<'tcx>, start, size: Size, is_provenance: bool| {
+            memory.read_scalar(&tcx, AllocRange { start, size }, is_provenance).unwrap_or_else(
+                |e| bug!("[invariant] failed to read a primitive in memory allocation: {e:?}"),
+            )
         };
 
         // special handlings before layout-based reading
@@ -1863,7 +1863,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                                     // synthetic, so `type_of` is not available. Reconstruct the sized backing
                                     // array type from pointer metadata when the pointer view is unsized.
                                     DefKind::Static { nested: true, .. } => {
-                                        match (actual_sub_ty.kind(), metadata) {
+                                        match (actual_sub_ty.kind(), pointee_metadata) {
                                             (ty::Slice(elem_ty), Some(len)) => {
                                                 Ty::new_array(self.tcx, *elem_ty, len as u64)
                                             }
@@ -3413,7 +3413,15 @@ impl<'tcx> ExecBuilder<'tcx> {
                         .all(|f| self.has_feasible_value(self.tcx_field_ty(f, generics)))
                 }),
             },
-            ty::Array(sub, _) | ty::Slice(sub) => self.has_feasible_value(*sub),
+            ty::Array(sub, len) => {
+                // a zero-length array is always inhabited regardless of the element type.
+                // only require a feasible element when the length is non-zero or symbolic.
+                match len.try_to_target_usize(self.tcx) {
+                    Some(0) => true,
+                    None | Some(_) => self.has_feasible_value(*sub),
+                }
+            }
+            ty::Slice(sub) => self.has_feasible_value(*sub),
 
             // unsupported
             ty::Dynamic(..) => bug!("[unsupported] feasibility query for dynamic type"),
@@ -4475,7 +4483,7 @@ impl LogStack {
     fn push(&mut self, tag: &'static str, msg: String) {
         let indent = "  ".repeat(self.stack.len());
         info!("{indent}-> |{tag}| {msg}");
-        self.stack.push_back((tag, msg.to_string()));
+        self.stack.push_back((tag, msg));
     }
 
     /// Decrement the depth context
