@@ -371,6 +371,15 @@ impl<'tcx> ExecBuilder<'tcx> {
         let param_def = self.generics.get(index as usize).unwrap_or_else(|| {
             bug!("[invariant] generic parameter {name} index out of bounds: {index}",)
         });
+
+        // FIXME: ideally the right lookup is to filter the generics by index and extract the unique one.
+        // The current workaround is fragile but will fail-early so we can detect and fix if it happens.
+        if param_def.index.0 != index as usize {
+            bug!(
+                "[invariant] generic parameter {name} index mismatch: {} vs {index}",
+                param_def.index.0,
+            )
+        }
         if param_def.kind != kind {
             bug!("[invariant] generic parameter {name} at index {index} is not a {kind:?}")
         }
@@ -3535,7 +3544,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
 
             // construct the generic parameter
             let param_ident = base_builder.mk_ident(*param_def_id);
-            let param_name = SolParamName(param_symbol.to_ident_string());
+            let param_name = SolGenericName(param_symbol.to_ident_string());
             let param_kind = match param_def_kind {
                 GenericParamDefKind::Lifetime => SolGenericKind::Lifetime,
                 GenericParamDefKind::Type { has_default: _, synthetic: _ } => {
@@ -3568,6 +3577,7 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             };
             bundle_generics.push(SolGenericParam {
                 ident: param_ident,
+                index: SolGenericIndex(*param_index as usize),
                 name: param_name,
                 kind: param_kind,
             });
@@ -3751,7 +3761,7 @@ pub(crate) struct SolCrate {
 /// A complete execution context
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolBundle {
-    pub(crate) generics: Vec<(SolIdent, SolParamName, SolGenericMeta)>,
+    pub(crate) generics: Vec<(SolIdent, SolGenericName, SolGenericMeta)>,
     pub(crate) adt_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolAdtDef)>,
     pub(crate) trait_defs: Vec<(SolIdent, Vec<SolGenericArg>, SolTraitDef)>,
     pub(crate) dyn_types: Vec<(SolDynTypeIndex, Vec<SolClause>)>,
@@ -3946,7 +3956,8 @@ pub(crate) enum SolGenericMeta {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolGenericParam {
     pub(crate) ident: SolIdent,
-    pub(crate) name: SolParamName,
+    pub(crate) index: SolGenericIndex,
+    pub(crate) name: SolGenericName,
     pub(crate) kind: SolGenericKind,
 }
 
@@ -4374,13 +4385,17 @@ pub(crate) struct SolHash64(pub(crate) u64);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolHash128(pub(crate) u128);
 
-/// A parameter name
+/// A module name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct SolModuleName(pub(crate) String);
 
-/// A parameter name
+/// A generic parameter name
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub(crate) struct SolParamName(pub(crate) String);
+pub(crate) struct SolGenericName(pub(crate) String);
+
+/// A generic parameter name
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub(crate) struct SolGenericIndex(pub(crate) usize);
 
 /// A uniquely identifier for a dynamic type
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
