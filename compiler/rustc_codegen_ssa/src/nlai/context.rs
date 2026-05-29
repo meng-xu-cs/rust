@@ -3487,13 +3487,17 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
         let typing_env = tcx.typing_env_normalized_for_post_analysis(def_id);
 
         // check if the owner is a closure
-        let is_closure = tcx.is_closure_like(def_id);
+        let is_closure = match tcx.def_kind(def_id) {
+            DefKind::SyntheticCoroutineBody => continue,
+            DefKind::Closure => true,
+            _ => false,
+        };
 
         // skip coroutine-related owners
         if is_closure
             && matches!(
                 tcx.type_of(def_id).instantiate_identity().skip_norm_wip().kind(),
-                ty::Coroutine(..) | ty::CoroutineClosure(..)
+                ty::Coroutine(..) | ty::CoroutineClosure(..) | ty::CoroutineWitness(..)
             )
         {
             continue;
@@ -3527,12 +3531,17 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             let param_kind = match param_def_kind {
                 GenericParamDefKind::Lifetime => SolGenericKind::Lifetime,
                 GenericParamDefKind::Type { has_default: _, synthetic: _ } => {
-                    // skip injected type parameters in closures, they used to be named as
+                    // skip injected closure-related type parameters, which are not `synthetic`
+                    // they used to be named as below, but is unnamed now.
                     // * <closure_kind>: I16,
                     // * <closure_signature>: fn(..) -> ..
                     // * <upvars>: (..) (a.k.a, a tuple)
-                    // but now they are not named anymore
-                    if is_closure && param_symbol.is_empty() {
+                    //
+                    // FIXME: we should ideally have a more robust way to identify these parameters
+                    // instead of relying on the naming convention, and these parameters also appear
+                    // in nested bodies (e.g., a constant in a closure also carries these parameters),
+                    // so we may need to track the parent-child relationships of bodies as well.
+                    if param_symbol.is_empty() {
                         continue;
                     }
                     SolGenericKind::Type
