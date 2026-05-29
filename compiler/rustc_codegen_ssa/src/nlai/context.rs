@@ -1603,8 +1603,13 @@ impl<'tcx> ExecBuilder<'tcx> {
         // first update the entry to mark that static initialization in progress
         self.static_inits.insert(ident.clone(), None);
 
-        // externally defined statics are unsupported
-        if !self.tcx.is_mir_available(def_id) {
+        let static_kind = self.tcx.def_kind(def_id);
+
+        // Externally defined statics are unsupported. Nested backing statics do
+        // not have MIR available, but they are still const-evaluable allocations.
+        if !self.tcx.is_mir_available(def_id)
+            && !matches!(static_kind, DefKind::Static { nested: true, .. })
+        {
             bug!("[unsupported] static without MIR");
         }
 
@@ -1847,12 +1852,33 @@ impl<'tcx> ExecBuilder<'tcx> {
                                 }
                             }
                             GlobalAlloc::Static(def_id) => {
-                                // the provenance names the backing static allocation, here we read the static init
-                                // using its own type instead of `actual_sub_ty` because the latter may be the unsized
-                                // pointee reached through this reference, e.g. `&[u8]` pointing at a `[u8; N]` static.
-                                let static_ty = self.tcx_try_normalize(
-                                    self.tcx.type_of(def_id).instantiate_identity(),
-                                );
+                                let static_ty = match self.tcx.def_kind(def_id) {
+                                    // named statics should be decoded with their declared type. `actual_sub_ty`
+                                    // may be an unsized view reached through a fat pointer to the static.
+                                    DefKind::Static { nested: false, .. } => self
+                                        .tcx_try_normalize(
+                                            self.tcx.type_of(def_id).instantiate_identity(),
+                                        ),
+                                    // nested statics are anonymous backing allocations; their HIR owner is
+                                    // synthetic, so `type_of` is not available. Reconstruct the sized backing
+                                    // array type from pointer metadata when the pointer view is unsized.
+                                    DefKind::Static { nested: true, .. } => {
+                                        match (actual_sub_ty.kind(), metadata) {
+                                            (ty::Slice(elem_ty), Some(len)) => {
+                                                Ty::new_array(self.tcx, *elem_ty, len as u64)
+                                            }
+                                            (ty::Str, Some(len)) => Ty::new_array(
+                                                self.tcx,
+                                                self.tcx.types.u8,
+                                                len as u64,
+                                            ),
+                                            _ => actual_sub_ty,
+                                        }
+                                    }
+                                    kind => {
+                                        bug!("[invariant] expected static allocation, got {kind:?}")
+                                    }
+                                };
                                 let static_ident = self.mk_static_init(def_id, static_ty);
                                 let pointee_ty = self.mk_type(actual_sub_ty);
 
@@ -1997,7 +2023,18 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
                 match &layout.fields {
                     FieldsShape::Array { stride, count } => {
-                        let count = metadata.map(|count| count as u64).unwrap_or(*count);
+                        // unsized slice layouts use count 0, the fat-ptr carries the real length.
+                        // if layout ever provides a concrete count too, they must agree.
+                        let count = match metadata {
+                            Some(len) => {
+                                let len = len as u64;
+                                if *count != 0 && *count != len {
+                                    bug!("[invariant] conflicting slice lengths for {ty}");
+                                }
+                                len
+                            }
+                            None => *count,
+                        };
                         let mut elements = vec![];
                         for i in 0..count {
                             let elem_offset = offset + *stride * i;
@@ -2021,7 +2058,18 @@ impl<'tcx> ExecBuilder<'tcx> {
                 }
                 match &layout.fields {
                     FieldsShape::Array { stride, count } => {
-                        let count = metadata.map(|count| count as u64).unwrap_or(*count);
+                        // unsized str layouts use count 0, the fat-ptr carries the real byte length.
+                        // if layout ever provides a concrete count too, it must agree.
+                        let count = match metadata {
+                            Some(len) => {
+                                let len = len as u64;
+                                if *count != 0 && *count != len {
+                                    bug!("[invariant] conflicting str lengths");
+                                }
+                                len
+                            }
+                            None => *count,
+                        };
                         let range = AllocRange { start: offset, size: *stride * count };
                         let num_prov = memory.provenance().get_range(range, &self.tcx).count();
                         if num_prov != 0 {
