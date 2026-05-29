@@ -20,6 +20,7 @@ use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{
     Attribute, CRATE_HIR_ID, HirId, Item, ItemKind, MatchSource, Mod, OwnerId, RangeEnd, Safety,
 };
+use rustc_middle::hir::place::PlaceBase as HirPlaceBase;
 use rustc_middle::middle::region::{Scope, ScopeData};
 use rustc_middle::mir::interpret::{AllocRange, Allocation, GlobalAlloc, Scalar};
 use rustc_middle::mir::{AssignOp, BinOp, BorrowKind, UnOp};
@@ -2541,65 +2542,92 @@ impl<'tcx> ExecBuilder<'tcx> {
                         "[invariant] closure abi mismatch",
                     );
 
-                    // check the names and types of the upvars
-                    let upvar_tys: Vec<_> = match closure_ty_args.last().and_then(|t| t.as_type()) {
-                        None => bug!("[invariant] unable to get closure upvar types"),
-                        Some(packed_ty) => match packed_ty.kind() {
-                            ty::Tuple(tys) => tys.iter().map(|t| self.mk_type(t)).collect(),
-                            _ => bug!("[invariant] expect tuple type for closure upvars"),
-                        },
-                    };
-                    let upvar_names =
-                        self.tcx.closure_saved_names_of_captured_variables(closure_id);
-                    assert_eq!(
-                        upvar_names.len(),
-                        upvar_tys.len(),
-                        "[invariant] closure upvar names/types count mismatch",
-                    );
+                    // get the upvar captures and types
+                    let closure_local_id = closure_id.as_local().unwrap_or_else(|| {
+                        bug!("[invariant] closure definition should be local: {closure_id:?}")
+                    });
+                    let upvar_captures = self.tcx.closure_captures(closure_local_id);
 
-                    let upvar_mention =
-                        self.tcx.upvars_mentioned(closure_id).cloned().unwrap_or_default();
-
-                    // collect the upvars used from the perspective of the compiler after feature "disjoint capture in closures"
-                    // FIXME: right now we are not using them, instead this is just for sanity check
-                    let _upvar_origins: Vec<_> = upvar_names
-                        .iter_enumerated()
-                        .zip(upvar_tys.into_iter().enumerate())
-                        .map(|((idx, symbol), (i, ty))| {
-                            assert_eq!(idx.index(), i, "[invariant] closure upvar index mismatch");
-
-                            // look for variable id
-                            let upvar_name = symbol.to_ident_string();
-                            let upvar_name_no_ref = upvar_name.trim_start_matches("_ref__");
-                            let upvar_name_no_ref_and_fields = upvar_name_no_ref
-                                .split_once("__")
-                                .map(|(v, _)| v)
-                                .unwrap_or(upvar_name_no_ref);
-
-                            let var_id = upvar_mention
-                                .keys()
-                                .find(|&hir_id| {
-                                    self.tcx
-                                        .hir_name(*hir_id)
-                                        .to_ident_string()
-                                        .starts_with(upvar_name_no_ref_and_fields)
-                                })
-                                .map(|i| self.mk_local_var_id(LocalVarId(*i)))
-                                .unwrap_or_else(|| {
-                                    bug!("[invariant] unable to find upvar id for {symbol}",)
-                                });
-
-                            (var_id, ty, SolLocalVarName(upvar_name))
-                        })
-                        .collect();
-
-                    // collect the upvars that will actually appear in the closure definition
-                    for &hir_id in upvar_mention.keys() {
-                        let var_id = self.mk_local_var_id(LocalVarId(hir_id));
-                        self.upvar_decls.insert(
-                            var_id,
-                            (SolLocalVarName(self.tcx.hir_name(hir_id).to_ident_string()), None),
+                    // NOTE: `upvar_tys` are the types of the captured *places* (with disjoint closure
+                    // captures, possibly field/by-ref views of a root variable), so they are at a
+                    // different granularity than the root-keyed `SolClosure::upvars` and are used here
+                    // only as a count cross-check.
+                    let upvar_tys = UpvarArgs::Closure(closure_ty_args).upvar_tys();
+                    if upvar_captures.len() != upvar_tys.len() {
+                        bug!(
+                            "[invariant] closure upvar captures/types count mismatch: {} vs {}",
+                            upvar_captures.len(),
+                            upvar_tys.len(),
                         );
+                    }
+
+                    let upvar_mention = self.tcx.upvars_mentioned(closure_id);
+
+                    // collect the root variables that may appear as `ExprKind::UpvarRef` in the body.
+                    //
+                    // NOTE: We should NOT seed the upvar type from the capture metadata: a capture's
+                    // `base_ty` is normalized independently of THIR, so for an HRTB GAT projection such as
+                    // `<() as Container>::Item<'a>` it is resolved to the concrete type (`()`) while the
+                    // THIR expression type keeps it symbolic. Seeding it would disagree with the type
+                    // recorded from `UpvarRef` (tripping the equality check in `mk_expr`) and with how the
+                    // same type is represented elsewhere in the IR. The type is therefore taken from the
+                    // body's `UpvarRef`, keeping a single, consistent source of truth.
+                    //
+                    // NOTE: there may be multiple captured places for the same root variable, but
+                    // `SolClosure::upvars` is keyed by the root HIR id that `ExprKind::UpvarRef` uses;
+                    // duplicate roots collapse to one declaration, and equal keys carry equal `hir_id`s.
+                    let mut declared_roots = BTreeMap::new();
+                    for captured_place in upvar_captures.iter() {
+                        let hir_id = match captured_place.place.base {
+                            HirPlaceBase::Upvar(upvar_id) => upvar_id.var_path.hir_id,
+                            ref base => {
+                                bug!("[invariant] expected captured upvar, found {base:?}");
+                            }
+                        };
+
+                        // consistency check
+                        if let Some(upvars) = upvar_mention {
+                            if !upvars.contains_key(&hir_id) {
+                                bug!(
+                                    "[invariant] captured upvar {} is not mentioned",
+                                    self.tcx.hir_name(hir_id)
+                                );
+                            }
+                        }
+
+                        let var_id = self.mk_local_var_id(LocalVarId(hir_id));
+                        declared_roots.insert(var_id, hir_id);
+
+                        // NOTE: we intentionally do not check for duplicated root variables, as
+                        // the same root variable can be captured multiple times (e.g., by nested
+                        // closures or by capturing multiple fields of the same struct), and they
+                        // will all share the same declaration in `SolClosure::upvars`.
+                        //
+                        // In addition, if two keys are the same, their values, `hir_id`, must
+                        // also be the same, hence we don't check for value-equality.
+                    }
+
+                    // THIR classifies `ExprKind::UpvarRef` by lexical enclosing-body membership, not by
+                    // the disjoint-capture set, so a mentioned variable can be referenced in the body
+                    // without appearing in `closure_captures` (e.g. via infallible non-binding patterns).
+                    // Declare those roots too so body refs find a declaration. A declared root that is
+                    // never referenced gets no type and is dropped when packing the closure (see below).
+                    if let Some(upvars) = upvar_mention {
+                        for &hir_id in upvars.keys() {
+                            let var_id = self.mk_local_var_id(LocalVarId(hir_id));
+                            declared_roots.insert(var_id, hir_id);
+                            // see above note for reasons not to check for duplicates here
+                        }
+                    }
+
+                    // add to upvar declarations, the type is filled later from the body's `UpvarRef`
+                    for (var_id, hir_id) in declared_roots {
+                        let var_name = SolLocalVarName(self.tcx.hir_name(hir_id).to_ident_string());
+                        if let Some((existing, _)) =
+                            self.upvar_decls.insert(var_id, (var_name, None))
+                        {
+                            bug!("[invariant] duplicate upvar declaration for {}", existing.0);
+                        }
                     }
                 } else {
                     // make sure this is a function or an associated function
