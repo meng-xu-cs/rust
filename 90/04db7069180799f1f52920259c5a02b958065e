@@ -1,0 +1,28 @@
+compiler/rustc_codegen_ssa/src/nlai/context.rs
+  04f85b5dc3e29e0d 15,20,36,42,49,53,57,326,332,339,355,363,458,466,470,312,320,141,245,286,304,367,432,436,443,75,79,88,95,100,106,116,290,295,462,480,61,145,154,193,226,234,237,241,299,317,375,397,404,411,417,422,426
+  h_5b53606353e0f5 41,56,331,303,311,133,136,139-140,310,74,87,99,105,114-115,60,144,150,153,165,168,172,175,178,181-182,190,205,208,211,225,231,233,240
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "9004db7069180799f1f52920259c5a02b958065e",
+  "prompts": {
+    "04f85b5dc3e29e0d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d798b-0e43-7923-987f-d351ebbf5704",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Meng Xu",
+      "total_additions": 46,
+      "total_deletions": 44,
+      "accepted_lines": 7,
+      "overriden_lines": 0
+    }
+  },
+  "humans": {
+    "h_5b53606353e0f5": {
+      "author": "Meng Xu <meng.xu.cs@uwaterloo.ca>"
+    }
+  }
+}
