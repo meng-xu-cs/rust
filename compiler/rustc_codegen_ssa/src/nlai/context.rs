@@ -3527,11 +3527,12 @@ pub(crate) fn build<'tcx>(tcx: TyCtxt<'tcx>, src_dir: PathBuf) -> SolCrate {
             let param_kind = match param_def_kind {
                 GenericParamDefKind::Lifetime => SolGenericKind::Lifetime,
                 GenericParamDefKind::Type { has_default: _, synthetic: _ } => {
-                    // skip injected type parameters in closures
-                    if matches!(
-                        param_name.0.as_str(),
-                        "<closure_kind>" | "<closure_signature>" | "<upvars>"
-                    ) {
+                    // skip injected type parameters in closures, they used to be named as
+                    // * <closure_kind>: I16,
+                    // * <closure_signature>: fn(..) -> ..
+                    // * <upvars>: (..) (a.k.a, a tuple)
+                    // but now they are not named anymore
+                    if is_closure && param_symbol.is_empty() {
                         continue;
                     }
                     SolGenericKind::Type
