@@ -1,0 +1,37 @@
+compiler/rustc_codegen_ssa/src/nlai/context.rs
+  s_8b9324be2c97b7::t_4f30ad4e878efa 2621,2625
+  s_8b9324be2c97b7::t_f66c724cd4f475 2608-2609,2615-2617,2620
+  h_5b53606353e0f5 2545,2550,2566-2568,2588,2600-2607,2619,2623,2628-2630
+  s_05a1126a532f17::t_b2666cab7fbcda 2551-2554,2569-2575,2577-2578,2599,2613-2614,2618,2624,2626-2627
+  s_8b9324be2c97b7::t_18b9977421aff5 23,2546-2549,2555-2562,2564,2581-2586,2589-2596
+  s_05a1126a532f17::t_1f5d2ac85bfa24 2576,2579-2580,2610-2612
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "70ed6027fc2a82ecd8467b1f33f7571646d8f423",
+  "prompts": {},
+  "humans": {
+    "h_5b53606353e0f5": {
+      "author": "Meng Xu <meng.xu.cs@uwaterloo.ca>"
+    }
+  },
+  "sessions": {
+    "s_05a1126a532f17": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ce70f900-392f-4795-91c6-2b8c98c7c090",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    },
+    "s_8b9324be2c97b7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e74a6-f067-79c2-a8e8-f59a5a9c961a",
+        "model": "gpt-5.5"
+      },
+      "human_author": null
+    }
+  }
+}
