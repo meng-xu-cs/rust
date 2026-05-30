@@ -1,0 +1,14 @@
+compiler/rustc_codegen_ssa/src/nlai/context.rs
+  h_5b53606353e0f5 2359
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "551bb5eb0ec843daee3a2c476466e58eb9036c37",
+  "prompts": {},
+  "humans": {
+    "h_5b53606353e0f5": {
+      "author": "Meng Xu <meng.xu.cs@uwaterloo.ca>"
+    }
+  }
+}
