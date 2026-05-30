@@ -2356,7 +2356,7 @@ impl<'tcx> ExecBuilder<'tcx> {
                                                     .to_bits_unchecked()
                                                     .wrapping_sub(*niche_start)
                                                     .wrapping_add(
-                                                        niche_variants.start().index() as u128
+                                                        niche_variants.start.index() as u128
                                                     );
 
                                                 if tag_index >= def.variants().len() as u128 {
