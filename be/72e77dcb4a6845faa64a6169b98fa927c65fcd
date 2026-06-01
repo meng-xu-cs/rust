@@ -1,0 +1,22 @@
+compiler/rustc_codegen_ssa/src/nlai/CLAUDE.md
+  s_9a2dfc539169a0::t_601ad7d6203bc1 3
+compiler/rustc_codegen_ssa/src/nlai/AGENTS.md
+  s_9a2dfc539169a0::t_601ad7d6203bc1 1-60,62-181
+  s_9a2dfc539169a0::t_3a65daaf0d9030 61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "be72e77dcb4a6845faa64a6169b98fa927c65fcd",
+  "prompts": {},
+  "sessions": {
+    "s_9a2dfc539169a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e6fa0-50f6-7ec0-b1f5-703d1f960a8f",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Meng Xu <meng.xu.cs@uwaterloo.ca>"
+    }
+  }
+}

@@ -1,0 +1,39 @@
+compiler/rustc_codegen_ssa/src/nlai/context.rs
+  04f85b5dc3e29e0d 16,21,31,37,43,50,54,58,332,338,345,375,382,496,504,508,230,310,156,201,222,386,474,481,72,76,85,92,97,103,113,207,500,518,150,218,394,398,136,141,349,361,404,257,261,267,275,284,293,296,303,320,326,408,415,423,429,437,441,470
+  h_5b53606353e0f5 42,49,57,337,221,229,126,129,132-133,228,71,79,84,96,102,111-112,149,135,140,148,232,246,253,255-256,260,287,299,301-302,325
+  s_05a1126a532f17::t_d71bf8f1a1795c 168,177,216,187,194,200,206,241,245,251,274,283,292
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "8919c8b71c681b2aca24e59f4ead1f908264b8dd",
+  "prompts": {
+    "04f85b5dc3e29e0d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d798b-0e43-7923-987f-d351ebbf5704",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Meng Xu",
+      "total_additions": 46,
+      "total_deletions": 44,
+      "accepted_lines": 17,
+      "overriden_lines": 0
+    }
+  },
+  "humans": {
+    "h_5b53606353e0f5": {
+      "author": "Meng Xu <meng.xu.cs@uwaterloo.ca>"
+    }
+  },
+  "sessions": {
+    "s_05a1126a532f17": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ce70f900-392f-4795-91c6-2b8c98c7c090",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Meng Xu <meng.xu.cs@uwaterloo.ca>"
+    }
+  }
+}
