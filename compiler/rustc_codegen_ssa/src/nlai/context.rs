@@ -3079,11 +3079,11 @@ impl<'tcx> ExecBuilder<'tcx> {
             ),
             ExprKind::NonHirLiteral { lit, user_ty: _ } => {
                 // MAYFIX: record user type annotation as well?
-                SolOp::ScalarLiteral(self.mk_value_from_scalar(*ty, *lit))
+                SolOp::ConstValue(self.mk_value_from_scalar(*ty, *lit))
             }
             ExprKind::ZstLiteral { user_ty: _ } => {
                 // MAYFIX: record user type annotation as well?
-                SolOp::ZstLiteral(self.mk_value_from_zst(*ty))
+                SolOp::ConstValue(self.mk_value_from_zst(*ty))
             }
 
             // closure
@@ -4267,8 +4267,7 @@ pub(crate) enum SolOp {
     Block(SolBlock),
     // literals
     BaseLiteral(bool, SolValue, SolSpan),
-    ScalarLiteral(SolValue),
-    ZstLiteral(SolValue),
+    ConstValue(SolValue),
     // closure
     Closure(SolIdent, Vec<SolGenericArg>, Vec<SolExpr>),
 }
