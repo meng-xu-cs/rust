@@ -7,10 +7,12 @@ edition = "2024"
 # tidy-alphabetical-start
 ar_archive_writer = "0.5"
 bitflags = "2.4.1"
+blake3 = "1.5.2"
 bstr = "1.11.3"
 find-msvc-tools = "0.1.2"
 itertools = "0.12"
 pathdiff = "0.2.0"
+proc-macro2 = { version = "1", features = ["span-locations"] }
 regex = "1.4"
 rustc_abi = { path = "../rustc_abi" }
 rustc_arena = { path = "../rustc_arena" }
@@ -36,6 +38,7 @@ rustc_trait_selection = { path = "../rustc_trait_selection" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.59"
 smallvec = { version = "1.8.1", features = ["union", "may_dangle"] }
+syn = { version = "2.0.9", features = ["full", "parsing"] }
 tempfile = "3.2"
 thorin-dwp = "0.9"
 tracing = "0.1"

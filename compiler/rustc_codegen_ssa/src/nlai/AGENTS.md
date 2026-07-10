@@ -12,8 +12,8 @@ needed.
 - `rustc_codegen_ssa::nlai` is declared in `../lib.rs`.
 - `codegen_crate()` calls `crate::nlai::entrypoint(tcx)` in `../base.rs` before
   monomorphization collection and normal codegen-unit partitioning.
-- The compiler-side module currently consists of `mod.rs`, `common.rs`, and
-  `context.rs`. `context.rs` is intentionally large and marked with
+- The compiler-side module currently consists of `mod.rs`, `common.rs`, `context.rs`, and
+  `schema.rs`. `context.rs` is intentionally large and marked with
   `// ignore-tidy-filelength`.
 - The synchronized output schema is in `context.rs` between
   `/* --- BEGIN OF SYNC --- */` and `/* --- END OF SYNC --- */`.
@@ -58,7 +58,9 @@ Invalid `NLAI` values and a missing `NLAI_OUTPUT_DIR` are treated as
 subdirectories under the output directory:
 
 - `s<N>/` stores source-file snapshots.
-- `f<N>/crate.json` stores the serialized `SolCrate`.
+- `f<N>/crate.json` currently stores the serialized `SolCrate`. U1.2b1 also validates and logs the
+  BLAKE3 fingerprint of the canonical schema bytes compiled into rustc, without changing this wire
+  format. U1.2b2 is the atomic producer/consumer cutover to `SolArtifactEnvelope<SolCrate>`.
 
 `SolEnv` also records the canonical local crate input path for diagnostics.
 
@@ -71,6 +73,8 @@ subdirectories under the output directory:
   management.
 - `context.rs` owns extraction. It contains the builders, conversion logic, and
   all `Sol*` IR data types.
+- `schema.rs` structurally parses and fingerprints the synchronized schema source compiled into
+  rustc, rejecting textual decoys and protocol-shape drift before extraction.
 
 Two builders drive extraction:
 
@@ -102,6 +106,32 @@ Two builders drive extraction:
 All synchronized `Sol*` types derive `Debug`, `Clone`, ordering/equality,
 `Hash`, `Serialize`, and `Deserialize`. `SolIR` is the shared trait alias for
 types that can appear inside `SolHIR<T>` or `SolMIR<T>`.
+
+The synchronized section also defines protocol/schema versions, the canonicalization and BLAKE3
+derive-key identifiers, and `SolArtifactEnvelope<T>`. A nested artifact-protocol partition owns the
+protocol version, canonicalization/hash identifiers, and envelope grammar; the following payload
+partition owns the IR-schema version and all `Sol*` payload definitions. Sync fingerprints the two
+version-normalized partitions separately, so a protocol change must advance the protocol version
+and a payload change must advance the schema version; version-only bumps fail. Its items use plain
+`pub`; the enclosing producer modules remain crate-private, while the consumer copies the exact
+canonical bytes without a textual visibility rewrite or consumer-local rustfmt transformation.
+`nlai::context` therefore carries one narrowly scoped `unreachable_pub` allowance; do not broaden
+the module's visibility or the allowance. Restricted visibility and ambiguous trivia after `pub`
+are forbidden anywhere in the section.
+The outer sync markers and nested protocol markers must be standalone lexical block comments
+between module items. Identical marker text inside an enclosing comment, literal, item, or macro
+token tree is identity-bearing input, never a delimiter.
+Partition governance is intentionally positional: moving a payload declaration into the protocol
+partition is itself a protocol-design change and must not be used to evade the payload-schema
+version. The complete supported envelope item—including its derive/serde attributes, fields, and
+closing brace—must remain wholly inside the protocol partition. The committed consumer schema is
+the sync ratchet; sync refuses to recreate it when its framing, footer, metadata, canonical bytes,
+or self-attestation are missing or inconsistent, and the consumer serializes validation and atomic
+publication with a stable sidecar lock.
+LF and CRLF are equivalent, but every other in-section byte—including whitespace inside literals
+and at physical line ends—remains identity-bearing. Bare CR fails closed, comments remain
+identity-bearing, and each logical section line ends in LF.
+The generated consumer fingerprint constant is outside the hashed section to avoid self-reference.
 
 Important root types:
 
