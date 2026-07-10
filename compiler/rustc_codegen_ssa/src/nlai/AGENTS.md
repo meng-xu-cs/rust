@@ -17,8 +17,10 @@ needed.
   `// ignore-tidy-filelength`.
 - The synchronized output schema is in `context.rs` between
   `/* --- BEGIN OF SYNC --- */` and `/* --- END OF SYNC --- */`.
-- The sibling consumer crate at `/Users/mengxu/Sec3/nlai` syncs that schema into
-  `src/rustc/ir.rs` with `cargo run -- dev sync`.
+- The consumer crate is normally a sibling checkout at `../nlai`. Its `RUST_SRC`
+  setting must resolve to this repository's canonical Git root before
+  `cargo run -- dev sync`, extraction, or the rustc-suite harness proceeds.
+  Sync writes the schema into the consumer's `src/rustc/ir.rs`.
 - The default downstream analysis path in the sibling crate is still the local
   self-test pipeline: context construction, bundle display, control-flow
   ordering, and the basic abstract interpreter. The LLM-backed analysis code is
@@ -27,7 +29,7 @@ needed.
 ## Build Commands
 
 This directory lives inside a Rust compiler checkout. Run compiler builds from
-the repository root, `/Users/mengxu/Sec3/rust`.
+the canonical repository root (`<rust-root>`).
 
 ```bash
 ./x.py check compiler
@@ -35,8 +37,12 @@ the repository root, `/Users/mengxu/Sec3/rust`.
 ./x.py build compiler --stage 2
 ```
 
-The bootstrap config is `/Users/mengxu/Sec3/rust/bootstrap.toml`, currently
-using `profile = "compiler"`.
+The local bootstrap config is `<rust-root>/bootstrap.toml`, normally using
+`profile = "compiler"`.
+
+The consumer rejects a configured custom compiler whose canonical path is not
+under the same `<rust-root>`. Commit attestation additionally requires a build
+with Git hashes enabled; see the consumer's U1.2 protocol documentation.
 
 ## Activation
 
@@ -137,11 +143,11 @@ creation is also where identifier descriptions get source locations.
 
 ## Testing And Consumer Crate
 
-Compiler-side extraction is normally tested through the sibling crate at
-`/Users/mengxu/Sec3/nlai`.
+Compiler-side extraction is normally tested through the sibling consumer
+checkout (`<nlai-root>`, conventionally `../nlai` from this repository).
 
 ```bash
-cd /Users/mengxu/Sec3/nlai
+cd ../nlai
 cargo run -- dev sync
 cargo run -- dev check
 cargo run -- dev check --summary
@@ -157,7 +163,7 @@ and runs the downstream analysis pipeline. Summary files are written under
 For one-off downstream runs:
 
 ```bash
-cd /Users/mengxu/Sec3/nlai
+cd ../nlai
 cargo run -- cargo build --output .nlai -- <cargo build args>
 cargo run -- cargo analyze --build-dir .nlai -v
 ```
@@ -176,6 +182,7 @@ cargo run -- cargo analyze --build-dir .nlai -v
 - Prefer `BTreeMap` and `BTreeSet` for serialized or otherwise deterministic
   output ordering.
 - Keep the synchronized schema block self-contained and serde-friendly. After
-  changing it, run `cargo run -- dev sync` in `/Users/mengxu/Sec3/nlai`.
-- Do not edit `/Users/mengxu/Sec3/nlai/src/rustc/ir.rs` manually; it is
+  changing it, run `cargo run -- dev sync` in `<nlai-root>` with `RUST_SRC`
+  resolving to this canonical repository root.
+- Do not edit `<nlai-root>/src/rustc/ir.rs` manually; it is
   generated from the synchronized block in this compiler fork.
