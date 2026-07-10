@@ -6,6 +6,9 @@ use rustc_middle::bug;
 use rustc_middle::ty::TyCtxt;
 use serde::Serialize;
 
+use super::context::{NLAI_ARTIFACT_PROTOCOL_VERSION, NLAI_IR_SCHEMA_VERSION, SolArtifactEnvelope};
+use super::schema;
+
 /// The name of the component
 pub(crate) const COMPONENT_NAME: &str = "nlai";
 
@@ -108,7 +111,8 @@ impl SolEnv {
 
     /// Serialize a crate to a file
     pub(crate) fn serialize_crate<T: Serialize>(&self, data: &T) -> PathBuf {
-        self.serialize_to_file("f", "crate", data)
+        let envelope = artifact_envelope(data);
+        self.serialize_to_file("f", "crate", &envelope)
     }
 
     /// Prepare source directory
@@ -119,3 +123,15 @@ impl SolEnv {
         path
     }
 }
+
+fn artifact_envelope<T>(payload: T) -> SolArtifactEnvelope<T> {
+    SolArtifactEnvelope {
+        protocol_version: NLAI_ARTIFACT_PROTOCOL_VERSION,
+        schema_version: NLAI_IR_SCHEMA_VERSION,
+        schema_fingerprint: schema::fingerprint().to_owned(),
+        payload,
+    }
+}
+
+#[cfg(test)]
+mod tests;

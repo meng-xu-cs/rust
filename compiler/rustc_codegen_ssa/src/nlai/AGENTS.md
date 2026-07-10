@@ -58,9 +58,9 @@ Invalid `NLAI` values and a missing `NLAI_OUTPUT_DIR` are treated as
 subdirectories under the output directory:
 
 - `s<N>/` stores source-file snapshots.
-- `f<N>/crate.json` currently stores the serialized `SolCrate`. U1.2b1 also validates and logs the
-  BLAKE3 fingerprint of the canonical schema bytes compiled into rustc, without changing this wire
-  format. U1.2b2 is the atomic producer/consumer cutover to `SolArtifactEnvelope<SolCrate>`.
+- `f<N>/crate.json` stores `SolArtifactEnvelope<SolCrate>` with the exact protocol version,
+  IR-schema version, and BLAKE3 fingerprint of the canonical schema bytes compiled into this rustc.
+  The consumer validates that metadata before deserializing the raw payload.
 
 `SolEnv` also records the canonical local crate input path for diagnostics.
 
@@ -70,7 +70,7 @@ subdirectories under the output directory:
   context, calls `build(tcx, env.prepare_source_directory())`, and serializes
   the returned crate.
 - `common.rs` owns environment parsing and JSON/source output directory
-  management.
+  management, including construction of the versioned artifact envelope.
 - `context.rs` owns extraction. It contains the builders, conversion logic, and
   all `Sol*` IR data types.
 - `schema.rs` structurally parses and fingerprints the synchronized schema source compiled into

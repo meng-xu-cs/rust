@@ -67,8 +67,7 @@ static SCHEMA_FINGERPRINT: LazyLock<String> = LazyLock::new(|| {
     if NLAI_ARTIFACT_PROTOCOL_VERSION == 0 || NLAI_IR_SCHEMA_VERSION == 0 {
         bug!("[invariant] NLAI artifact protocol and IR schema versions must be nonzero");
     }
-    // Keep the synchronized generic envelope type checked by the compiler before the U1.2b2 wire
-    // cutover starts constructing it.
+    // Keep the synchronized generic envelope type checked at the producer boundary.
     let _ = std::mem::size_of::<SolArtifactEnvelope<()>>();
     if NLAI_SCHEMA_CANONICALIZATION != SUPPORTED_CANONICALIZATION {
         bug!(
