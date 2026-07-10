@@ -38,11 +38,18 @@ the canonical repository root (`<rust-root>`).
 ```
 
 The local bootstrap config is `<rust-root>/bootstrap.toml`, normally using
-`profile = "compiler"`.
+`profile = "compiler"`. Rust's `dev` channel omits Git identity by default; NLAI builds must opt in
+explicitly so consumer preflight can bind the binary to the canonical source HEAD:
+
+```toml
+[rust]
+omit-git-hash = false
+```
 
 The consumer rejects a configured custom compiler whose canonical path is not
-under the same `<rust-root>`. Commit attestation additionally requires a build
-with Git hashes enabled; see the consumer's U1.2 protocol documentation.
+under the same `<rust-root>`. It also rejects missing, duplicate, `unknown`, malformed, or
+nonmatching `commit-hash` metadata from `rustc -vV`; see the consumer's U1.2 protocol
+documentation.
 
 ## Activation
 

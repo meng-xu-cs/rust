@@ -72,7 +72,9 @@ impl GitInfo {
         let mut git_hash_cmd = helpers::git(Some(dir));
         let ver_hash = git_hash_cmd
             .arg("rev-parse")
-            .arg("HEAD")
+            // HEAD may legally name an annotated tag object. Compiler identity is commit identity,
+            // so embed the peeled commit exactly like downstream source attestation does.
+            .arg("HEAD^{commit}")
             .run_in_dry_run()
             .start_capture_stdout(&exec_ctx);
 
@@ -80,7 +82,7 @@ impl GitInfo {
         let short_ver_hash = git_short_hash_cmd
             .arg("rev-parse")
             .arg("--short=9")
-            .arg("HEAD")
+            .arg("HEAD^{commit}")
             .run_in_dry_run()
             .start_capture_stdout(&exec_ctx);
 
@@ -172,4 +174,27 @@ pub fn write_commit_info_file(root: &Path, info: &Info) {
 /// Write the commit hash to the `git-commit-hash` file given the project root.
 pub fn write_commit_hash_file(root: &Path, sha: &str) {
     t!(fs::write(root.join("git-commit-hash"), sha));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GitInfo;
+    use crate::utils::exec::ExecutionContext;
+    use crate::utils::tests::git::git_test;
+
+    #[test]
+    fn git_identity_peels_an_annotated_tag_head_to_its_commit() {
+        git_test(|git| {
+            let expected_commit = git.get_current_commit();
+            git.run_git(&["tag", "--annotate", "--message", "fixture", "fixture-tag"]);
+            git.run_git(&["symbolic-ref", "HEAD", "refs/tags/fixture-tag"]);
+            assert_ne!(git.run_git(&["rev-parse", "HEAD"]), expected_commit);
+            let expected_short = git.run_git(&["rev-parse", "--short=9", "HEAD^{commit}"]);
+
+            let context = ExecutionContext::new(0, true);
+            let identity = GitInfo::new(false, git.get_path(), &context);
+            assert_eq!(identity.sha(), Some(expected_commit.as_str()));
+            assert_eq!(identity.sha_short(), Some(expected_short.as_str()));
+        });
+    }
 }
