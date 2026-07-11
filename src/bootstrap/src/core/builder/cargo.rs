@@ -97,6 +97,10 @@ impl HostFlags {
 pub struct Cargo {
     command: BootstrapCommand,
     args: Vec<OsString>,
+    /// Environment values that must not be replaceable by workspace or user Cargo configuration.
+    /// The complete entries are retained until every inherited Cargo argument is known, so their
+    /// trusted CLI configuration can be appended at the highest precedence.
+    forced_env: Vec<(String, String)>,
     compiler: Compiler,
     mode: Mode,
     target: TargetSelection,
@@ -208,6 +212,31 @@ impl Cargo {
         assert_ne!(key.as_ref(), "RUSTFLAGS");
         assert_ne!(key.as_ref(), "RUSTDOCFLAGS");
         self.command.env(key.as_ref(), value.as_ref());
+        self
+    }
+
+    /// Set an environment value after every Cargo configuration layer.
+    ///
+    /// A plain process environment variable can be replaced by an `[env]` entry with `force =
+    /// true`. Retain a trusted table-shaped CLI configuration and append it after every bootstrap,
+    /// user, and workspace argument when this command is materialized. An incompatible hostile
+    /// scalar then makes Cargo fail before compilation rather than silently changing the value.
+    ///
+    /// On Windows, also configure the lexicographically greatest Unicode-equivalent spelling.
+    /// Cargo materializes its case-sensitive map through a sorted process-environment map, so that
+    /// trusted spelling wins after Windows folds every equivalent key. The literal spelling remains
+    /// present as well because Cargo uses the literal key in its build-script freshness map.
+    pub fn force_env(&mut self, key: &str, value: &str) -> &mut Cargo {
+        assert!(
+            !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+            "forced Cargo environment key must be a nonempty ASCII identifier: {key:?}"
+        );
+        assert!(
+            self.forced_env.iter().all(|(existing, _)| !existing.eq_ignore_ascii_case(key)),
+            "forced Cargo environment key or an ASCII case alias was configured more than once: {key}"
+        );
+        self.command.env(key, value);
+        self.forced_env.extend(forced_env_entries(key, value));
         self
     }
 
@@ -455,6 +484,10 @@ impl From<Cargo> for BootstrapCommand {
             cargo.args(s.split_whitespace());
         }
 
+        // Keep this after every Cargo argument, including inherited CARGOFLAGS and caller-supplied
+        // tail arguments, but before Cargo's `--` separator when one exists. Later CLI
+        // configuration has Cargo's highest precedence.
+        insert_forced_env_config_args(&mut cargo.args, &cargo.forced_env);
         cargo.command.args(cargo.args);
 
         let rustflags = &cargo.rustflags.0;
@@ -1444,6 +1477,7 @@ impl Builder<'_> {
         Cargo {
             command: cargo,
             args: vec![],
+            forced_env: vec![],
             compiler,
             mode,
             target,
@@ -1457,6 +1491,47 @@ impl Builder<'_> {
         }
     }
 }
+
+fn forced_env_entries(key: &str, value: &str) -> Vec<(String, String)> {
+    let entries = vec![(key.to_owned(), value.to_owned())];
+
+    #[cfg(windows)]
+    let entries = {
+        let mut entries = entries;
+        let alias = crate::utils::exec::maximal_windows_environment_alias(key);
+        if alias != key {
+            entries.push((alias, value.to_owned()));
+        }
+        entries
+    };
+
+    entries
+}
+
+fn forced_env_config_args(key: &str, value: &str) -> [String; 6] {
+    let key = toml::Value::String(key.to_owned()).to_string();
+    let value = toml::Value::String(value.to_owned()).to_string();
+    [
+        "--config".to_owned(),
+        format!("env.{key}.value={value}"),
+        "--config".to_owned(),
+        format!("env.{key}.force=true"),
+        "--config".to_owned(),
+        format!("env.{key}.relative=false"),
+    ]
+}
+
+fn insert_forced_env_config_args(args: &mut Vec<OsString>, forced_env: &[(String, String)]) {
+    let separator = args.iter().position(|arg| arg == "--").unwrap_or(args.len());
+    let mut config_args = Vec::with_capacity(forced_env.len() * 6);
+    for (key, value) in forced_env {
+        config_args.extend(forced_env_config_args(key, value).map(OsString::from));
+    }
+    args.splice(separator..separator, config_args);
+}
+
+#[cfg(test)]
+mod tests;
 
 pub fn cargo_profile_var(name: &str, config: &Config, mode: Mode) -> String {
     let profile = match (mode, config.rust_optimize.is_release()) {

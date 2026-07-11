@@ -28,6 +28,109 @@ use build_helper::exit;
 use crate::core::config::DryRun;
 use crate::{PathBuf, t};
 
+/// Test whether an environment-variable name begins with `prefix` under the host operating
+/// system's key-comparison rules.
+///
+/// Windows uses an invariant Unicode case mapping for environment keys. Rust's Unicode mapping and
+/// ASCII-only folding are both observably different from that mapping, so Windows must delegate the
+/// comparison to the same OS primitive used by `std::process::Command`.
+pub(crate) fn environment_key_has_prefix(name: &OsStr, prefix: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        let name = name.encode_wide().collect::<Vec<_>>();
+        let prefix = prefix.encode_utf16().collect::<Vec<_>>();
+        name.len() >= prefix.len()
+            && compare_windows_environment_keys(&name[..prefix.len()], &prefix)
+                == std::cmp::Ordering::Equal
+    }
+
+    #[cfg(not(windows))]
+    {
+        name.as_encoded_bytes()
+            .get(..prefix.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix.as_bytes()))
+    }
+}
+
+#[cfg(all(windows, test))]
+fn windows_environment_keys_equal(left: &OsStr, right: &OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    let left = left.encode_wide().collect::<Vec<_>>();
+    let right = right.encode_wide().collect::<Vec<_>>();
+    compare_windows_environment_keys(&left, &right) == std::cmp::Ordering::Equal
+}
+
+/// Return the lexicographically greatest valid Unicode spelling that Windows treats as the same
+/// environment key as the supplied ASCII identifier.
+///
+/// Cargo stores `[env]` entries in a Rust `BTreeMap<String, _>` before materializing a Windows
+/// process environment. Supplying this greatest spelling last-wins against every hostile
+/// Unicode-equivalent spelling when `std::process::Command` folds those keys.
+#[cfg(windows)]
+pub(crate) fn maximal_windows_environment_alias(key: &str) -> String {
+    assert!(key.is_ascii(), "Windows environment alias source must be ASCII: {key:?}");
+    let mut maxima = Vec::<(u16, u16)>::new();
+    for unit in key.encode_utf16() {
+        if !maxima.iter().any(|(canonical, _)| *canonical == unit) {
+            maxima.push((unit, unit));
+        }
+    }
+
+    for candidate in (1_u16..=0xd7ff).chain(0xe000..=u16::MAX) {
+        for (canonical, maximum) in &mut maxima {
+            if candidate > *maximum
+                && compare_windows_environment_keys(&[candidate], &[*canonical])
+                    == std::cmp::Ordering::Equal
+            {
+                *maximum = candidate;
+            }
+        }
+    }
+
+    let maximal = key
+        .encode_utf16()
+        .map(|unit| {
+            maxima
+                .iter()
+                .find_map(|(canonical, maximum)| (*canonical == unit).then_some(*maximum))
+                .expect("every source key unit must have a computed Windows maximum")
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&maximal)
+        .expect("surrogate code points were excluded from the Windows environment alias")
+}
+
+#[cfg(windows)]
+fn compare_windows_environment_keys(left: &[u16], right: &[u16]) -> std::cmp::Ordering {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CompareStringOrdinal(
+            left: *const u16,
+            left_len: i32,
+            right: *const u16,
+            right_len: i32,
+            ignore_case: i32,
+        ) -> i32;
+    }
+
+    let left_len = i32::try_from(left.len()).expect("environment key is too long for Windows");
+    let right_len = i32::try_from(right.len()).expect("environment key is too long for Windows");
+    // SAFETY: both pointers address `left_len`/`right_len` initialized UTF-16 code units for the
+    // duration of the call. CompareStringOrdinal does not retain either pointer.
+    match unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) } {
+        1 => std::cmp::Ordering::Less,
+        2 => std::cmp::Ordering::Equal,
+        3 => std::cmp::Ordering::Greater,
+        result => panic!("CompareStringOrdinal failed with result {result}"),
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
 /// What should be done when the command fails.
 #[derive(Debug, Copy, Clone)]
 pub enum BehaviorOnFailure {
@@ -252,6 +355,7 @@ pub struct BootstrapCommand {
     // to avoid forgetting to execute a command.
     drop_bomb: DropBomb,
     should_cache: bool,
+    bypass_cache: bool,
 }
 
 impl<'a> BootstrapCommand {
@@ -269,6 +373,18 @@ impl<'a> BootstrapCommand {
     /// loaded from memory.
     pub fn cached(&mut self) -> &mut Self {
         self.should_cache = true;
+        self.bypass_cache = false;
+        self
+    }
+
+    /// Execute the command without reading or populating bootstrap's command cache.
+    ///
+    /// This is required for probes whose answer reflects mutable external state. Merely declining
+    /// to populate the cache is insufficient because an equivalent earlier command may already
+    /// have populated it.
+    pub fn uncached(&mut self) -> &mut Self {
+        self.should_cache = false;
+        self.bypass_cache = true;
         self
     }
 
@@ -417,6 +533,7 @@ impl From<Command> for BootstrapCommand {
         let program = command.get_program().to_owned();
         Self {
             should_cache: false,
+            bypass_cache: false,
             command,
             failure_behavior: BehaviorOnFailure::Exit,
             run_in_dry_run: false,
@@ -509,6 +626,15 @@ impl CommandOutput {
         .expect("Cannot parse process stdout as UTF-8")
     }
 
+    /// Return captured stdout without imposing a text encoding.
+    ///
+    /// Git's `-z` path-oriented plumbing deliberately emits raw path bytes on Unix, so callers
+    /// that attest repository state must not round-trip that output through UTF-8.
+    #[must_use]
+    pub fn stdout_bytes(&self) -> &[u8] {
+        self.stdout.as_deref().expect("Accessing stdout of a command that did not capture stdout")
+    }
+
     #[must_use]
     pub fn stdout_if_present(&self) -> Option<String> {
         self.stdout.as_ref().and_then(|s| String::from_utf8(s.clone()).ok())
@@ -525,6 +651,12 @@ impl CommandOutput {
             self.stderr.clone().expect("Accessing stderr of a command that did not capture stderr"),
         )
         .expect("Cannot parse process stderr as UTF-8")
+    }
+
+    /// Return captured stderr without imposing a text encoding.
+    #[must_use]
+    pub fn stderr_bytes(&self) -> &[u8] {
+        self.stderr.as_deref().expect("Accessing stderr of a command that did not capture stderr")
     }
 
     #[must_use]
@@ -672,7 +804,9 @@ impl ExecutionContext {
     ) -> DeferredCommand<'a> {
         let fingerprint = command.fingerprint();
 
-        if let Some(cached_output) = self.command_cache.get(&fingerprint) {
+        if !command.bypass_cache
+            && let Some(cached_output) = self.command_cache.get(&fingerprint)
+        {
             command.mark_as_executed();
             self.do_if_verbose(|| println!("Cache hit: {command:?}"));
             self.profiler.record_cache_hit(fingerprint);

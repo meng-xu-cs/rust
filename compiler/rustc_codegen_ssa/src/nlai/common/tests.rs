@@ -6,6 +6,23 @@ use serde_json::json;
 use super::*;
 
 #[test]
+fn u1_2c2a_extractor_uses_canonical_compile_time_source_identity() {
+    let Some(compiled) = rustc_session::nlai_rust_source_state_fingerprint() else {
+        return;
+    };
+    // Plain source tarballs and ordinary non-NLAI compiler builds have no Git worktree to attest.
+    // Their explicit sentinel remains visible through `rustc -vV`, while extractor activation
+    // still rejects it. Exercise the compiled-identity invariant only for provenance-aware builds.
+    if compiled == "unknown" {
+        return;
+    }
+    let fingerprint = compiled_source_state_fingerprint();
+    assert_eq!(fingerprint, compiled);
+    assert_eq!(fingerprint.len(), 64);
+    assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+}
+
+#[test]
 fn u1_2b2_producer_envelope_binds_compiled_schema_identity() {
     let envelope = artifact_envelope("payload");
 

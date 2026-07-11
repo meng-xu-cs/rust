@@ -905,6 +905,10 @@ pub fn version_at_macro_invocation(
         safe_println!("binary: {binary}");
         safe_println!("commit-hash: {commit_hash}");
         safe_println!("commit-date: {commit_date}");
+        safe_println!(
+            "nlai-source-state-fingerprint: {}",
+            rustc_session::nlai_rust_source_state_fingerprint().unwrap_or("unknown")
+        );
         safe_println!("host: {}", config::host_tuple());
         safe_println!("release: {release}");
 

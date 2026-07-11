@@ -48,8 +48,13 @@ omit-git-hash = false
 
 The consumer rejects a configured custom compiler whose canonical path is not
 under the same `<rust-root>`. It also rejects missing, duplicate, `unknown`, malformed, or
-nonmatching `commit-hash` metadata from `rustc -vV`; see the consumer's U1.2 protocol
-documentation.
+nonmatching `commit-hash` metadata from `rustc -vV`. Rust bootstrap additionally fingerprints the
+canonical commit, complete index, tracked worktree contents and executable/symlink state,
+nonignored untracked inputs, and recursively initialized submodules. It compiles that fingerprint
+into shared `rustc_session` state so separately built NLAI-capable codegen backends and the driver
+observe one value, then exposes exactly one `nlai-source-state-fingerprint` version field; missing,
+duplicate, `unknown`, or malformed values fail consumer preflight. See the consumer's U1.2
+protocol documentation.
 
 ## Activation
 

@@ -17,6 +17,15 @@ pub use lint::{declare_lint, declare_lint_pass, declare_tool_lint, impl_lint_pas
 pub use rustc_lint_defs as lint;
 pub use session::*;
 
+/// Return the Rust source-state identity compiled into the shared compiler session crate.
+///
+/// Codegen backends are built in separate Cargo invocations but link this crate from the compiler
+/// sysroot. Keeping the token here makes the version surface and every NLAI-capable backend observe
+/// one compiler-build identity rather than whichever environment built the backend later.
+pub fn nlai_rust_source_state_fingerprint() -> Option<&'static str> {
+    option_env!("NLAIRUSTSOURCESTATEFINGERPRINT")
+}
+
 pub mod code_stats;
 pub mod errors;
 pub mod parse;

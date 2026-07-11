@@ -12,6 +12,7 @@ pub(crate) mod helpers;
 pub(crate) mod job;
 pub(crate) mod render_tests;
 pub(crate) mod shared_helpers;
+pub(crate) mod source_state;
 pub(crate) mod tarball;
 
 pub(crate) mod tracing;

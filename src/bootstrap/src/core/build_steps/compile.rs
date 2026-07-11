@@ -30,12 +30,12 @@ use crate::core::config::toml::target::DefaultLinuxLinkerOverride;
 use crate::core::config::{
     CompilerBuiltins, DebuginfoLevel, LlvmLibunwind, RustcLto, TargetSelection,
 };
-use crate::utils::build_stamp;
 use crate::utils::build_stamp::BuildStamp;
 use crate::utils::exec::command;
 use crate::utils::helpers::{
     exe, get_clang_cl_resource_dir, is_debug_info, is_dylib, symlink_dir, t, up_to_date,
 };
+use crate::utils::{build_stamp, source_state};
 use crate::{
     CLang, CodegenBackendKind, Compiler, DependencyType, FileType, GitRepo, LLVM_TOOLS, Mode,
     debug, trace,
@@ -1145,6 +1145,11 @@ impl Step for Rustc {
         );
 
         rustc_cargo(builder, &mut cargo, target, &build_compiler, &self.crates);
+        // Snapshot only after rustc's standard-library/LLVM setup and the remaining lazily prepared
+        // compiler inputs, but immediately before materializing the Cargo command that builds it.
+        prepare_rustc_source_inputs(builder, target);
+        let source_state_fingerprint = rustc_source_state_fingerprint(builder);
+        cargo.force_env("NLAIRUSTSOURCESTATEFINGERPRINT", &source_state_fingerprint);
 
         // NB: all RUSTFLAGS should be added to `rustc_cargo()` so they will be
         // consistently applied by check/doc/test modes too.
@@ -1341,6 +1346,48 @@ pub fn rustc_cargo(
     rustc_cargo_env(builder, cargo, target);
 }
 
+/// Prepare source inputs that bootstrap otherwise initializes only after building rustc.
+///
+/// The GCC backend is assembled after the compiler crates, and its local-build fallback lazily
+/// initializes `src/gcc`. Do that before the source snapshot whenever GCC is enabled so the
+/// compiler cannot attest a pre-initialization tree while shipping a backend built from the
+/// initialized submodule. This is intentionally conservative when a prebuilt GCC is available:
+/// recording one additional initialized submodule is safe, while predicting every later fallback
+/// here would duplicate the GCC build policy.
+fn prepare_rustc_source_inputs(builder: &Builder<'_>, target: TargetSelection) {
+    if !builder.config.dry_run()
+        && builder.config.enabled_codegen_backends(target).contains(&CodegenBackendKind::Gcc)
+    {
+        builder.config.update_submodule("src/gcc");
+    }
+}
+
+fn rustc_source_state_fingerprint(builder: &Builder<'_>) -> String {
+    // Bootstrap graph tests use dry-run builders without a complete Rust checkout. Keep this
+    // shortcut test-binary-only: a real `x.py --dry-run` must still validate and fingerprint the
+    // actual source tree.
+    #[cfg(test)]
+    if builder.config.dry_run() {
+        return "0".repeat(64);
+    }
+
+    if !builder.rust_info().is_managed_git_subrepository() {
+        return "unknown".to_owned();
+    }
+
+    let source_state =
+        source_state::fingerprint(&builder.src, builder.as_ref()).unwrap_or_else(|error| {
+            panic!("failed to fingerprint Rust source state at {:?}: {error}", builder.src)
+        });
+    if let Some(commit) = builder.rust_info().sha() {
+        assert_eq!(
+            source_state.commit, commit,
+            "Rust source HEAD changed while bootstrap was collecting compiler provenance"
+        );
+    }
+    source_state.value
+}
+
 pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelection) {
     // Set some configuration variables picked up by build scripts and
     // the compiler alike
@@ -1369,6 +1416,10 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
     if let Some(ref ver_hash) = builder.rust_info().sha() {
         cargo.env("CFG_VER_HASH", ver_hash);
     }
+    // Always override the invocation environment. `rustc_cargo` replaces this sentinel only at the
+    // actual compiler build boundary; other Cargo invocations must never compile an inherited or
+    // stale provenance token.
+    cargo.env("NLAIRUSTSOURCESTATEFINGERPRINT", "unknown");
     if !builder.unstable_features() {
         cargo.env("CFG_DISABLE_UNSTABLE_FEATURES", "1");
     }
@@ -2823,12 +2874,10 @@ pub fn run_cargo(
 
 pub fn stream_cargo(
     builder: &Builder<'_>,
-    cargo: Cargo,
+    mut cargo: Cargo,
     tail_args: Vec<String>,
     cb: &mut dyn FnMut(CargoMessage<'_>),
 ) -> bool {
-    let mut cmd = cargo.into_cmd();
-
     // Instruct Cargo to give us json messages on stdout, critically leaving
     // stderr as piped so we can get those pretty colors.
     let mut message_format = if builder.config.json_output {
@@ -2840,11 +2889,11 @@ pub fn stream_cargo(
         message_format.push_str(",json-diagnostic-");
         message_format.push_str(s);
     }
-    cmd.arg("--message-format").arg(message_format);
-
-    for arg in tail_args {
-        cmd.arg(arg);
-    }
+    // Add every caller-controlled argument before materializing the command. `Cargo::force_env`
+    // deliberately installs its trusted CLI configuration during that final conversion, after
+    // these arguments and immediately before any `--` separator.
+    cargo.arg("--message-format").arg(message_format).args(tail_args);
+    let mut cmd = cargo.into_cmd();
 
     builder.do_if_verbose(|| println!("running: {cmd:?}"));
 

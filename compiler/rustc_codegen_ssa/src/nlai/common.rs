@@ -12,6 +12,21 @@ use super::schema;
 /// The name of the component
 pub(crate) const COMPONENT_NAME: &str = "nlai";
 
+/// Return the canonical source-state fingerprint embedded by Rust bootstrap into this extractor.
+/// Invocation environment variables cannot influence `option_env!` after compilation.
+pub(crate) fn compiled_source_state_fingerprint() -> &'static str {
+    let fingerprint = rustc_session::nlai_rust_source_state_fingerprint()
+        .unwrap_or_else(|| bug!("[invariant] rustc was built without NLAI source-state identity"));
+    if fingerprint.len() != 64
+        || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bug!(
+            "[invariant] rustc was built with noncanonical NLAI source-state identity {fingerprint:?}"
+        );
+    }
+    fingerprint
+}
+
 /// Context for nlai information collection
 pub(crate) struct SolEnv {
     input_path: PathBuf,
@@ -38,6 +53,9 @@ pub(crate) fn retrieve_env(tcx: TyCtxt<'_>) -> Option<SolEnv> {
             bug!("[user-input] unexpected value for {env_prefix}: {others}");
         }
     };
+    // Fail at extractor activation rather than after THIR traversal if bootstrap omitted or
+    // corrupted the compile-time source identity.
+    let _ = compiled_source_state_fingerprint();
 
     // grab information from the environment variables
     let output_dir = match env::var_os(format!("{env_prefix}_OUTPUT_DIR")) {
