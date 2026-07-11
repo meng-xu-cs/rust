@@ -121,6 +121,32 @@ fn main() {
     let baseline = read_observation(&baseline_marker);
     assert_eq!(baseline.current_path_len, launcher_len);
 
+    // Logger initialization is environment-driven and may open/truncate an arbitrary path. Point
+    // it at a distinct copy of the launcher itself: the driver must have captured the original
+    // image identity before the logger truncates that vnode.
+    let logger_launcher = test_dir.join("rustc-logger-target");
+    std::fs::copy(&rustc, &logger_launcher).unwrap();
+    let logger_dir = test_dir.join("logger-target");
+    std::fs::create_dir(&logger_dir).unwrap();
+    let logger_marker = logger_dir.join("backend-observation");
+    let logger = configured_rustc(
+        &logger_launcher,
+        &backend,
+        &sysroot,
+        &rustc_runtime_libdir,
+        &input,
+        &logger_dir,
+        &logger_marker,
+    )
+    .env("RUSTC_LOG_OUTPUT_TARGET", &logger_launcher)
+    .output()
+    .expect("run copied rustc with its launcher as logger target");
+    require_success("copied rustc with its launcher as logger target", &logger);
+    let logger = read_observation(&logger_marker);
+    assert_eq!(logger.identity, baseline.identity);
+    assert_eq!(logger.current_path_len, 0);
+    assert_eq!(std::fs::metadata(&logger_launcher).unwrap().len(), 0);
+
     let fifo = test_dir.join("blocked-input.rs");
     let mkfifo = Command::new("mkfifo").arg(&fifo).output().expect("create source FIFO");
     require_success("create source FIFO", &mkfifo);

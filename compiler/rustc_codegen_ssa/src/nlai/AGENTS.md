@@ -61,7 +61,8 @@ Procfs hosts open the kernel's loaded-image link; macOS requires the opened hand
 the vnode backing dyld's mapped main Mach-O header. Hosts without either primitive, including
 Windows, fail closed when extraction is activated. Discovery, identity, stability, exact-length
 read, and unsupported-host failures are fatal invariants. Rustc driver entry points force this
-snapshot before argument or input processing and carry the resulting value through
+snapshot as the first normal-driver operation, before environment-configured logger setup, argument
+processing, or input handling, and carry the resulting value through
 `rustc_interface::Config` into the immutable `rustc_session::Session`. Artifact production reads
 only that session value, so a separately loaded SSA backend cannot fall back to its own late lazy
 snapshot; an embedding that reaches NLAI codegen without the explicit handoff fails loudly. A later

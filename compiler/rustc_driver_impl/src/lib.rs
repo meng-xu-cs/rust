@@ -1672,6 +1672,11 @@ pub fn install_ctrlc_handler() {
 }
 
 pub fn main() -> ExitCode {
+    // Snapshot before any environment-configured subsystem can open or mutate a filesystem path.
+    // In particular, rustc's logger may truncate `RUSTC_LOG_OUTPUT_TARGET` during initialization.
+    // `run_compiler` retrieves the same process-wide value and carries it into the session.
+    let _ = rustc_codegen_ssa::initialize_nlai_producer_identity();
+
     let start_time = Instant::now();
     let start_rss = get_resident_set_size();
 
@@ -1681,7 +1686,6 @@ pub fn main() -> ExitCode {
     signal_handler::install();
     let mut callbacks = TimePassesCallbacks::default();
     install_ice_hook(DEFAULT_BUG_REPORT_URL, |_| ());
-    let _ = rustc_codegen_ssa::initialize_nlai_producer_identity();
     install_ctrlc_handler();
 
     let exit_code =
