@@ -7,13 +7,22 @@ use rustc_middle::ty::TyCtxt;
 use serde::Serialize;
 
 use super::context::{NLAI_ARTIFACT_PROTOCOL_VERSION, NLAI_IR_SCHEMA_VERSION, SolArtifactEnvelope};
-use super::identity::producer_identity;
 use super::{Activation, COMPONENT_NAME, activation_from_environment, schema};
+use crate::NlaiProducerIdentity;
 
 /// Context for nlai information collection
 pub(crate) struct SolEnv {
     input_path: PathBuf,
     output_dir: PathBuf,
+}
+
+const MISSING_PRODUCER_IDENTITY_HANDOFF: &str = "NLAI extraction reached codegen without a \
+compatible driver-captured producer-identity handoff";
+
+fn require_producer_identity_handoff(
+    identity: Option<&NlaiProducerIdentity>,
+) -> Result<&NlaiProducerIdentity, &'static str> {
+    identity.ok_or(MISSING_PRODUCER_IDENTITY_HANDOFF)
 }
 
 /// Obtain nlai context from environment variables
@@ -28,7 +37,10 @@ pub(crate) fn retrieve_env(tcx: TyCtxt<'_>) -> Option<SolEnv> {
     };
     // Fail at extractor activation rather than after THIR traversal if bootstrap omitted or
     // corrupted either compile-time identity or if the running executable cannot be measured.
-    let _ = producer_identity();
+    let _ = require_producer_identity_handoff(
+        tcx.sess.nlai_producer_identity::<NlaiProducerIdentity>(),
+    )
+    .unwrap_or_else(|cause| bug!("[invariant] {cause}"));
 
     // grab information from the environment variables
     let output_dir = match env::var_os(format!("{env_prefix}_OUTPUT_DIR")) {

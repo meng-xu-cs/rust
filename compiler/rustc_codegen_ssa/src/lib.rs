@@ -58,14 +58,19 @@ pub mod traits;
 // encapsulates the nlai logic
 pub(crate) mod nlai;
 
+#[doc(hidden)]
+pub use nlai::identity::NlaiProducerIdentity;
+
 /// Snapshot NLAI producer identity at process startup when extraction was requested.
 ///
 /// Rustc drivers call this before processing compiler input. The cached snapshot therefore
 /// continues to identify the image that started the process even if its directory entry or vnode
-/// contents are changed later. Extractor activation validates the same snapshot again by access.
+/// contents are changed later. The returned value must be carried in
+/// `rustc_interface::Config::nlai_producer_identity`; extraction deliberately cannot recover it
+/// from a backend-local static.
 #[doc(hidden)]
-pub fn initialize_nlai_producer_identity() {
-    nlai::identity::initialize_if_requested();
+pub fn initialize_nlai_producer_identity() -> Option<NlaiProducerIdentity> {
+    nlai::identity::initialize_if_requested()
 }
 
 pub struct ModuleCodegen<M> {

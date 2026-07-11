@@ -1,4 +1,5 @@
 #![allow(rustc::bad_opt_access)]
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::num::NonZero;
 use std::path::PathBuf;
@@ -35,6 +36,16 @@ use crate::interface::{initialize_checked_jobserver, parse_cfg};
 
 fn sess_and_cfg<F>(args: &[&'static str], f: F)
 where
+    F: FnOnce(Session, Cfg),
+{
+    sess_and_cfg_with_nlai_identity(args, None, f);
+}
+
+fn sess_and_cfg_with_nlai_identity<F>(
+    args: &[&'static str],
+    nlai_producer_identity: Option<Box<dyn Any + Send + Sync>>,
+    f: F,
+) where
     F: FnOnce(Session, Cfg),
 {
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
@@ -74,12 +85,28 @@ where
             Default::default(),
             target,
             "",
+            nlai_producer_identity,
             None,
             &USING_INTERNAL_FEATURES,
         );
         let cfg = parse_cfg(sess.dcx(), matches.opt_strs("cfg"));
         let cfg = build_configuration(&sess, cfg);
         f(sess, cfg)
+    });
+}
+
+#[test]
+fn u1_2c2b1b1_session_carries_the_exact_opaque_driver_snapshot() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestIdentity(&'static str);
+
+    let identity = Box::new(TestIdentity("driver snapshot"));
+    let expected_address = std::ptr::from_ref(identity.as_ref());
+    sess_and_cfg_with_nlai_identity(&[], Some(identity), move |sess, _| {
+        let stored = sess.nlai_producer_identity::<TestIdentity>().unwrap();
+        assert_eq!(stored, &TestIdentity("driver snapshot"));
+        assert_eq!(std::ptr::from_ref(stored), expected_address);
+        assert!(sess.nlai_producer_identity::<String>().is_none());
     });
 }
 
@@ -713,7 +740,7 @@ fn test_unstable_options_tracking_hash() {
     untracked!(no_analysis, true);
     untracked!(no_leak_check, true);
     untracked!(no_parallel_backend, true);
-    untracked!(no_steal_thir, true);
+    untracked!(no_steal_thir, false);
     untracked!(parse_crate_root_only, true);
     // `pre_link_arg` is omitted because it just forwards to `pre_link_args`.
     untracked!(pre_link_args, vec![String::from("abc"), String::from("def")]);
@@ -893,7 +920,7 @@ fn test_unstable_options_tracking_hash() {
         };
     }
     tracked_no_crate_hash!(no_codegen, true);
-    tracked_no_crate_hash!(verbose_internals, true);
+    tracked_no_crate_hash!(verbose_internals, false);
 }
 
 #[test]

@@ -363,6 +363,14 @@ pub struct Config {
     /// (See #102759.)
     pub make_codegen_backend: Option<Box<dyn FnOnce(&Session) -> Box<dyn CodegenBackend> + Send>>,
 
+    /// NLAI producer identity measured before input handling by the embedding driver.
+    ///
+    /// Leave this as `None` unless the embedding called
+    /// `rustc_codegen_ssa::initialize_nlai_producer_identity` at process startup. NLAI extraction
+    /// fails closed when the handoff is absent.
+    #[doc(hidden)]
+    pub nlai_producer_identity: Option<rustc_codegen_ssa::NlaiProducerIdentity>,
+
     /// The inner atomic value is set to true when a feature marked as `internal` is
     /// enabled. Makes it so that "please report a bug" is hidden, as ICEs with
     /// internal features are wontfix, and they are usually the cause of the ICEs.
@@ -430,6 +438,9 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
                 config.lint_caps,
                 target,
                 util::rustc_version_str().unwrap_or("unknown"),
+                config
+                    .nlai_producer_identity
+                    .map(|identity| Box::new(identity) as Box<dyn std::any::Any + Send + Sync>),
                 config.ice_file,
                 config.using_internal_features,
             );

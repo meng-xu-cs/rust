@@ -169,7 +169,7 @@ impl Callbacks for TimePassesCallbacks {
 
 /// This is the primary entry point for rustc.
 pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) {
-    rustc_codegen_ssa::initialize_nlai_producer_identity();
+    let nlai_producer_identity = rustc_codegen_ssa::initialize_nlai_producer_identity();
     let mut default_early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     // Throw away the first argument, the name of the binary.
@@ -221,10 +221,16 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) 
         override_queries: None,
         extra_symbols: Vec::new(),
         make_codegen_backend: None,
+        nlai_producer_identity: nlai_producer_identity.clone(),
         using_internal_features: &USING_INTERNAL_FEATURES,
     };
 
     callbacks.config(&mut config);
+    if config.nlai_producer_identity != nlai_producer_identity {
+        rustc_middle::bug!(
+            "[invariant] rustc callbacks modified the driver-captured NLAI producer identity"
+        );
+    }
 
     let registered_lints = config.register_lints.is_some();
 
@@ -1675,7 +1681,7 @@ pub fn main() -> ExitCode {
     signal_handler::install();
     let mut callbacks = TimePassesCallbacks::default();
     install_ice_hook(DEFAULT_BUG_REPORT_URL, |_| ());
-    rustc_codegen_ssa::initialize_nlai_producer_identity();
+    let _ = rustc_codegen_ssa::initialize_nlai_producer_identity();
     install_ctrlc_handler();
 
     let exit_code =

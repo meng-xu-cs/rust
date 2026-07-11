@@ -6,6 +6,18 @@ use serde_json::json;
 use super::*;
 
 #[test]
+fn u1_2c2b1b1_backend_requires_the_session_handoff_without_remeasurement() {
+    let identity = NlaiProducerIdentity::for_test(
+        "0123456789abcdef0123456789abcdef01234567",
+        "1".repeat(64),
+        "2".repeat(64),
+    );
+
+    assert!(std::ptr::eq(require_producer_identity_handoff(Some(&identity)).unwrap(), &identity));
+    assert_eq!(require_producer_identity_handoff(None), Err(MISSING_PRODUCER_IDENTITY_HANDOFF));
+}
+
+#[test]
 fn u1_2b2_producer_envelope_binds_compiled_schema_identity() {
     let envelope = artifact_envelope("payload");
 

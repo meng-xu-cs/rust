@@ -48,6 +48,7 @@ fn main() {
         // The second parameter is local providers and the third parameter is external providers.
         override_queries: None, // Option<fn(&Session, &mut ty::query::Providers<'_>, &mut ty::query::Providers<'_>)>
         make_codegen_backend: None,
+        nlai_producer_identity: None,
         expanded_args: Vec::new(),
         ice_file: None,
         track_state: None,

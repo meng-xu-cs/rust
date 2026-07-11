@@ -61,10 +61,14 @@ Procfs hosts open the kernel's loaded-image link; macOS requires the opened hand
 the vnode backing dyld's mapped main Mach-O header. Hosts without either primitive, including
 Windows, fail closed when extraction is activated. Discovery, identity, stability, exact-length
 read, and unsupported-host failures are fatal invariants. Rustc driver entry points force this
-snapshot before argument or input processing, then artifact production reuses the immutable
-process-wide result so a later same-inode overwrite cannot retag the running image. Rustdoc's
-direct `rustc_interface` paths do not emit these artifacts; rustc processes that it launches still
-cross the rustc driver boundary.
+snapshot before argument or input processing and carry the resulting value through
+`rustc_interface::Config` into the immutable `rustc_session::Session`. Artifact production reads
+only that session value, so a separately loaded SSA backend cannot fall back to its own late lazy
+snapshot; an embedding that reaches NLAI codegen without the explicit handoff fails loudly. A later
+same-inode overwrite therefore cannot retag the measured launcher. Rustdoc's direct
+`rustc_interface` paths do not emit these artifacts; rustc processes that it launches still cross
+the rustc driver boundary. The launcher digest alone is not yet the complete producer-code closure:
+the loaded driver image and any in-scope dynamic backend are tracked by U1.2c2b1b2.
 
 ## Activation
 

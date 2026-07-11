@@ -329,6 +329,7 @@ pub(crate) fn create_config(
         }),
         extra_symbols: Vec::new(),
         make_codegen_backend: None,
+        nlai_producer_identity: None,
         ice_file: None,
         using_internal_features: &USING_INTERNAL_FEATURES,
     }

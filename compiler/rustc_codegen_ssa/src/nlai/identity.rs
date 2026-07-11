@@ -8,18 +8,49 @@ use rustc_middle::bug;
 
 use super::{Activation, activation_from_environment};
 
+/// Validated identity of the rustc image that started this process.
+///
+/// Construction is deliberately confined to this module: an embedding can carry or inspect a
+/// genuine startup snapshot, but cannot manufacture one from caller-controlled strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NlaiProducerIdentity {
+    commit: String,
+    source_state_fingerprint: String,
+    executable_fingerprint: String,
+}
+
+impl NlaiProducerIdentity {
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    pub fn source_state_fingerprint(&self) -> &str {
+        &self.source_state_fingerprint
+    }
+
+    pub fn executable_fingerprint(&self) -> &str {
+        &self.executable_fingerprint
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        commit: impl Into<String>,
+        source_state_fingerprint: impl Into<String>,
+        executable_fingerprint: impl Into<String>,
+    ) -> Self {
+        Self {
+            commit: commit.into(),
+            source_state_fingerprint: source_state_fingerprint.into(),
+            executable_fingerprint: executable_fingerprint.into(),
+        }
+    }
+}
+
 /// BLAKE3 derive-key context for fingerprints of the exact rustc executable bytes.
 pub(crate) const RUSTC_EXECUTABLE_FINGERPRINT_CONTEXT: &str = "nlai.rustc-executable.blake3.v1";
 
 const FINGERPRINT_LENGTH: usize = 64;
 const READ_BUFFER_SIZE: usize = 64 * 1024;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProducerIdentity {
-    pub(crate) commit: String,
-    pub(crate) source_state_fingerprint: String,
-    pub(crate) executable_fingerprint: String,
-}
 
 #[derive(Debug)]
 enum ProducerIdentityError {
@@ -530,7 +561,7 @@ fn derive_producer_identity<P: ExecutableProbe>(
     probe: &mut P,
     compiled_commit: Option<&str>,
     compiled_source_state: Option<&str>,
-) -> Result<ProducerIdentity, ProducerIdentityError> {
+) -> Result<NlaiProducerIdentity, ProducerIdentityError> {
     let commit = canonical_compiled_identity("Rust commit", compiled_commit, &[40, 64])?;
     let source_state_fingerprint = canonical_compiled_identity(
         "NLAI source-state fingerprint",
@@ -538,14 +569,14 @@ fn derive_producer_identity<P: ExecutableProbe>(
         &[FINGERPRINT_LENGTH],
     )?;
     let executable_fingerprint = executable_fingerprint_with(probe)?;
-    Ok(ProducerIdentity {
+    Ok(NlaiProducerIdentity {
         commit: commit.to_owned(),
         source_state_fingerprint: source_state_fingerprint.to_owned(),
         executable_fingerprint,
     })
 }
 
-static PRODUCER_IDENTITY: LazyLock<ProducerIdentity> = LazyLock::new(|| {
+static PRODUCER_IDENTITY: LazyLock<NlaiProducerIdentity> = LazyLock::new(|| {
     derive_producer_identity(
         &mut FileSystemProbe,
         rustc_session::nlai_rust_commit_hash(),
@@ -556,15 +587,17 @@ static PRODUCER_IDENTITY: LazyLock<ProducerIdentity> = LazyLock::new(|| {
 
 /// Force the process-wide snapshot before compiler inputs are observed when NLAI is enabled.
 /// Invalid or non-Unicode values fail as user input before any identity operation.
-pub(crate) fn initialize_if_requested() {
+pub(crate) fn initialize_if_requested() -> Option<NlaiProducerIdentity> {
     if activation_from_environment() == Some(Activation::Enabled) {
-        let _ = producer_identity();
+        Some(producer_identity().clone())
+    } else {
+        None
     }
 }
 
 /// Return the validated compile-time identity and measured bytes of this exact rustc process.
 /// Invocation environment variables cannot influence any field.
-pub(crate) fn producer_identity() -> &'static ProducerIdentity {
+fn producer_identity() -> &'static NlaiProducerIdentity {
     &PRODUCER_IDENTITY
 }
 

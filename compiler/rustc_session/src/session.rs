@@ -7,6 +7,7 @@ use std::{env, io};
 
 use rustc_data_structures::flock;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
+use rustc_data_structures::marker::IntoDynSyncSend;
 use rustc_data_structures::profiling::{SelfProfiler, SelfProfilerRef};
 use rustc_data_structures::sync::{
     AppendOnlyVec, DynSend, DynSync, Lock, MappedReadGuard, ReadGuard, RwLock,
@@ -146,6 +147,10 @@ pub struct Session {
     /// The version of the rustc process, possibly including a commit hash and description.
     pub cfg_version: &'static str,
 
+    /// Driver-captured producer identity. `None` means the embedding did not perform the required
+    /// early NLAI handoff; extraction must fail rather than measure a backend-local image late.
+    nlai_producer_identity: Option<IntoDynSyncSend<Box<dyn Any + Send + Sync>>>,
+
     /// The inner atomic value is set to true when a feature marked as `internal` is
     /// enabled. Makes it so that "please report a bug" is hidden, as ICEs with
     /// internal features are wontfix, and they are usually the cause of the ICEs.
@@ -211,6 +216,14 @@ pub struct LintGroup {
 }
 
 impl Session {
+    /// Read the immutable driver-captured NLAI identity as its codegen-owned concrete type.
+    ///
+    /// A missing value or a type from an incompatible compiler image returns `None`; extraction
+    /// treats either case as an invariant violation instead of remeasuring in the backend.
+    pub fn nlai_producer_identity<T: Any>(&self) -> Option<&T> {
+        self.nlai_producer_identity.as_ref()?.0.downcast_ref()
+    }
+
     pub fn miri_unleashed_feature(&self, span: Span, feature_gate: Option<Symbol>) {
         self.miri_unleashed_features.lock().push((span, feature_gate));
     }
@@ -1011,6 +1024,7 @@ pub fn build_session(
     driver_lint_caps: FxHashMap<lint::LintId, lint::Level>,
     target: Target,
     cfg_version: &'static str,
+    nlai_producer_identity: Option<Box<dyn Any + Send + Sync>>,
     ice_file: Option<PathBuf>,
     using_internal_features: &'static AtomicBool,
 ) -> Session {
@@ -1121,6 +1135,7 @@ pub fn build_session(
         target_features: Default::default(),
         unstable_target_features: Default::default(),
         cfg_version,
+        nlai_producer_identity: nlai_producer_identity.map(IntoDynSyncSend),
         using_internal_features,
         env_depinfo: Default::default(),
         file_depinfo: Default::default(),
