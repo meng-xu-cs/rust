@@ -7,25 +7,8 @@ use rustc_middle::ty::TyCtxt;
 use serde::Serialize;
 
 use super::context::{NLAI_ARTIFACT_PROTOCOL_VERSION, NLAI_IR_SCHEMA_VERSION, SolArtifactEnvelope};
-use super::schema;
-
-/// The name of the component
-pub(crate) const COMPONENT_NAME: &str = "nlai";
-
-/// Return the canonical source-state fingerprint embedded by Rust bootstrap into this extractor.
-/// Invocation environment variables cannot influence `option_env!` after compilation.
-pub(crate) fn compiled_source_state_fingerprint() -> &'static str {
-    let fingerprint = rustc_session::nlai_rust_source_state_fingerprint()
-        .unwrap_or_else(|| bug!("[invariant] rustc was built without NLAI source-state identity"));
-    if fingerprint.len() != 64
-        || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        bug!(
-            "[invariant] rustc was built with noncanonical NLAI source-state identity {fingerprint:?}"
-        );
-    }
-    fingerprint
-}
+use super::identity::producer_identity;
+use super::{Activation, COMPONENT_NAME, activation_from_environment, schema};
 
 /// Context for nlai information collection
 pub(crate) struct SolEnv {
@@ -37,25 +20,15 @@ pub(crate) struct SolEnv {
 pub(crate) fn retrieve_env(tcx: TyCtxt<'_>) -> Option<SolEnv> {
     // enable the component is explicitly enabled via environment variable
     let env_prefix = COMPONENT_NAME.to_uppercase();
-    match env::var_os(&env_prefix)?
-        .into_string()
-        .unwrap_or_else(|_| {
-            bug!("[user-input] environment variable {env_prefix} is not a valid utf-8 string")
-        })
-        .as_str()
-    {
-        "0" | "false" | "no" | "off" => {
+    match activation_from_environment()? {
+        Activation::Disabled => {
             return None;
         }
-
-        "1" | "true" | "yes" | "on" => (),
-        others => {
-            bug!("[user-input] unexpected value for {env_prefix}: {others}");
-        }
+        Activation::Enabled => (),
     };
     // Fail at extractor activation rather than after THIR traversal if bootstrap omitted or
-    // corrupted the compile-time source identity.
-    let _ = compiled_source_state_fingerprint();
+    // corrupted either compile-time identity or if the running executable cannot be measured.
+    let _ = producer_identity();
 
     // grab information from the environment variables
     let output_dir = match env::var_os(format!("{env_prefix}_OUTPUT_DIR")) {

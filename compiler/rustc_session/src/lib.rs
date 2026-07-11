@@ -17,6 +17,14 @@ pub use lint::{declare_lint, declare_lint_pass, declare_tool_lint, impl_lint_pas
 pub use rustc_lint_defs as lint;
 pub use session::*;
 
+/// Return the canonical Rust commit identity compiled into the shared compiler session crate.
+///
+/// Keeping this beside the NLAI source-state token makes the driver and separately built codegen
+/// backends consume one build identity instead of independently trusting their Cargo environment.
+pub fn nlai_rust_commit_hash() -> Option<&'static str> {
+    option_env!("CFG_VER_HASH")
+}
+
 /// Return the Rust source-state identity compiled into the shared compiler session crate.
 ///
 /// Codegen backends are built in separate Cargo invocations but link this crate from the compiler

@@ -169,6 +169,7 @@ impl Callbacks for TimePassesCallbacks {
 
 /// This is the primary entry point for rustc.
 pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) {
+    rustc_codegen_ssa::initialize_nlai_producer_identity();
     let mut default_early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     // Throw away the first argument, the name of the binary.
@@ -872,7 +873,7 @@ pub macro version($early_dcx: expr, $binary: literal, $matches: expr) {
         $binary,
         $matches,
         unw(option_env!("CFG_VERSION")),
-        unw(option_env!("CFG_VER_HASH")),
+        unw(rustc_session::nlai_rust_commit_hash()),
         unw(option_env!("CFG_VER_DATE")),
         unw(option_env!("CFG_RELEASE")),
     )
@@ -1674,6 +1675,7 @@ pub fn main() -> ExitCode {
     signal_handler::install();
     let mut callbacks = TimePassesCallbacks::default();
     install_ice_hook(DEFAULT_BUG_REPORT_URL, |_| ());
+    rustc_codegen_ssa::initialize_nlai_producer_identity();
     install_ctrlc_handler();
 
     let exit_code =

@@ -12,8 +12,8 @@ needed.
 - `rustc_codegen_ssa::nlai` is declared in `../lib.rs`.
 - `codegen_crate()` calls `crate::nlai::entrypoint(tcx)` in `../base.rs` before
   monomorphization collection and normal codegen-unit partitioning.
-- The compiler-side module currently consists of `mod.rs`, `common.rs`, `context.rs`, and
-  `schema.rs`. `context.rs` is intentionally large and marked with
+- The compiler-side module currently consists of `mod.rs`, `common.rs`, `context.rs`, `identity.rs`,
+  and `schema.rs`. `context.rs` is intentionally large and marked with
   `// ignore-tidy-filelength`.
 - The synchronized output schema is in `context.rs` between
   `/* --- BEGIN OF SYNC --- */` and `/* --- END OF SYNC --- */`.
@@ -55,6 +55,16 @@ into shared `rustc_session` state so separately built NLAI-capable codegen backe
 observe one value, then exposes exactly one `nlai-source-state-fingerprint` version field; missing,
 duplicate, `unknown`, or malformed values fail consumer preflight. See the consumer's U1.2
 protocol documentation.
+Extractor activation also validates the shared compiled commit and source-state values and hashes
+the exact running rustc image under the derive-key context `nlai.rustc-executable.blake3.v1`.
+Procfs hosts open the kernel's loaded-image link; macOS requires the opened handle and path to match
+the vnode backing dyld's mapped main Mach-O header. Hosts without either primitive, including
+Windows, fail closed when extraction is activated. Discovery, identity, stability, exact-length
+read, and unsupported-host failures are fatal invariants. Rustc driver entry points force this
+snapshot before argument or input processing, then artifact production reuses the immutable
+process-wide result so a later same-inode overwrite cannot retag the running image. Rustdoc's
+direct `rustc_interface` paths do not emit these artifacts; rustc processes that it launches still
+cross the rustc driver boundary.
 
 ## Activation
 
@@ -85,6 +95,8 @@ subdirectories under the output directory:
   management, including construction of the versioned artifact envelope.
 - `context.rs` owns extraction. It contains the builders, conversion logic, and
   all `Sol*` IR data types.
+- `identity.rs` owns compile-time producer-identity validation and stable measurement of the exact
+  running rustc executable.
 - `schema.rs` structurally parses and fingerprints the synchronized schema source compiled into
   rustc, rejecting textual decoys and protocol-shape drift before extraction.
 
